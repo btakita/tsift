@@ -18,9 +18,17 @@ use crate::{
     maybe_apply_search_worker_test_hooks, precheck_search_indexes, print_json_or_envelope,
     print_search_budget_human, relativize, relativize_index_summary, relativize_json_paths,
     relativize_symbol_hits, resolve_search_strategy, run_exact_search_with_timeout,
-    run_index_update, run_search_with_timeout, run_sift_search, should_collapse_search_hits,
-    to_json_schema,
+    run_index_update, run_index_update_excluding, run_search_with_timeout, run_sift_search,
+    should_collapse_search_hits, to_json_schema,
 };
+
+struct IndexCommandTarget {
+    name: String,
+    source_root: PathBuf,
+    db_path: PathBuf,
+    workspace_scope: Option<config::WorkspaceScope>,
+    excluded_roots: Vec<PathBuf>,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_index(
@@ -78,87 +86,124 @@ pub(crate) fn cmd_index(
 
     if (workspace || submodule.is_some()) && !fall_back_to_root {
         let cfg = config::Config::load(&root)?;
-        let targets: Vec<(String, PathBuf, PathBuf, Option<config::WorkspaceScope>)> =
-            if let Some(name) = submodule {
-                if let Some(scope) = config::Config::find_submodule(&root, name)? {
-                    let db_path = cfg.db_path_for(&root, &scope.id);
-                    vec![(
-                        scope.id.clone(),
-                        scope.source_root.clone(),
-                        db_path,
-                        Some(scope),
-                    )]
-                } else if let Some(package) = multiplicity::find_cargo_package(&root, name)? {
-                    let db_path = multiplicity::cargo_package_db_path(&root, &package.scope_id);
-                    vec![(
-                        package.scope_id.clone(),
-                        package.package_root.clone(),
-                        db_path,
-                        None,
-                    )]
-                } else {
-                    config::Config::resolve_submodule(&root, name)?;
-                    Vec::new()
-                }
+        let targets: Vec<IndexCommandTarget> = if let Some(name) = submodule {
+            if let Some(scope) = config::Config::find_submodule(&root, name)? {
+                let db_path = cfg.db_path_for(&root, &scope.id);
+                vec![IndexCommandTarget {
+                    name: scope.id.clone(),
+                    source_root: scope.source_root.clone(),
+                    db_path,
+                    workspace_scope: Some(scope),
+                    excluded_roots: Vec::new(),
+                }]
+            } else if let Some(package) = multiplicity::find_cargo_package(&root, name)? {
+                let db_path = multiplicity::cargo_package_db_path(&root, &package.scope_id);
+                vec![IndexCommandTarget {
+                    name: package.scope_id.clone(),
+                    source_root: package.package_root.clone(),
+                    db_path,
+                    workspace_scope: None,
+                    excluded_roots: Vec::new(),
+                }]
+            } else {
+                config::Config::resolve_submodule(&root, name)?;
+                Vec::new()
+            }
         } else {
-            match workspace_discovery.as_ref() {
+            let scopes = match workspace_discovery.as_ref() {
                 Some(discovery) => discovery.scopes.clone(),
                 None => config::Config::submodule_dirs(&root)?,
-            }
-                .into_iter()
-                .map(|scope| {
-                        let db_path = cfg.db_path_for(&root, &scope.id);
-                        (
-                            scope.id.clone(),
-                            scope.source_root.clone(),
-                            db_path,
-                            Some(scope),
-                        )
-                    })
-                    .collect()
             };
+            let mut targets = Vec::with_capacity(scopes.len() + 1);
+            if workspace {
+                targets.push(IndexCommandTarget {
+                    name: config::WORKSPACE_ROOT_SCOPE_ID.to_string(),
+                    source_root: root.clone(),
+                    db_path: root.join(".tsift/index.db"),
+                    workspace_scope: None,
+                    excluded_roots: scopes
+                        .iter()
+                        .map(|scope| scope.source_root.clone())
+                        .collect(),
+                });
+            }
+            targets.extend(scopes.into_iter().map(|scope| {
+                let db_path = cfg.db_path_for(&root, &scope.id);
+                IndexCommandTarget {
+                    name: scope.id.clone(),
+                    source_root: scope.source_root.clone(),
+                    db_path,
+                    workspace_scope: Some(scope),
+                    excluded_roots: Vec::new(),
+                }
+            }));
+            targets
+        };
 
         if targets.is_empty() {
             bail!("no submodules found in {}", root.display());
         }
 
         let mut any_stale = false;
-        for (name, sub_path, db_path, scope) in &targets {
+        for IndexCommandTarget {
+            name,
+            source_root: sub_path,
+            db_path,
+            workspace_scope: scope,
+            excluded_roots,
+        } in &targets
+        {
             if !sub_path.exists() {
                 eprintln!("  skip {} (not found: {})", name, sub_path.display());
                 continue;
             }
+            let root_scope = name == config::WORKSPACE_ROOT_SCOPE_ID;
+            let action_target = if root_scope {
+                "workspace root".to_string()
+            } else {
+                format!("submodule `{name}`")
+            };
+            let scope_arg = (!root_scope).then_some(name.as_str());
             let mut summary = if rebuild {
-                run_index_update(
+                run_index_update_excluding(
                     db_path,
                     sub_path,
-                    format!("rebuilding submodule `{}` index", name),
+                    format!("rebuilding {action_target} index"),
                     &root,
-                    Some(name.as_str()),
+                    scope_arg,
                     true,
                     false,
+                    excluded_roots,
                 )?
             } else if check {
-                index::IndexDb::inspect_read_only(db_path, sub_path, prune)?.summary
-            } else if prune {
-                run_index_update(
+                index::IndexDb::inspect_read_only_excluding(
                     db_path,
                     sub_path,
-                    format!("pruning submodule `{}` index", name),
+                    prune,
+                    excluded_roots,
+                )?
+                .summary
+            } else if prune {
+                run_index_update_excluding(
+                    db_path,
+                    sub_path,
+                    format!("pruning {action_target} index"),
                     &root,
-                    Some(name.as_str()),
+                    scope_arg,
                     false,
                     true,
+                    excluded_roots,
                 )?
             } else {
-                run_index_update(
+                run_index_update_excluding(
                     db_path,
                     sub_path,
-                    format!("indexing submodule `{}`", name),
+                    format!("indexing {action_target}"),
                     &root,
-                    Some(name.as_str()),
+                    scope_arg,
                     false,
                     false,
+                    excluded_roots,
                 )?
             };
             if !absolute {

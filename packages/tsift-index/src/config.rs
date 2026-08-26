@@ -4,6 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Synthetic scope id for files owned by a workspace root rather than one of
+/// its configured submodule scopes.
+pub const WORKSPACE_ROOT_SCOPE_ID: &str = "<root>";
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum IsolationTier {

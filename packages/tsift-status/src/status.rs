@@ -460,9 +460,48 @@ fn check_single_index(root: &Path, cache: &StatusCheckCache) -> Result<IndexStat
 
 fn check_workspace_index(root: &Path, cache: &StatusCheckCache) -> Result<IndexStatus> {
     let cfg = config::Config::load(root)?;
+    let workspace_scopes = config::Config::submodule_dirs(root)?;
+    if workspace_scopes.is_empty() {
+        return Ok(IndexStatus::Missing {
+            missing_scopes: Vec::new(),
+        });
+    }
+    let excluded_roots = workspace_scopes
+        .iter()
+        .map(|scope| scope.source_root.clone())
+        .collect::<Vec<_>>();
     let mut scopes = Vec::new();
     let mut missing_scopes = Vec::new();
-    for scope in config::Config::submodule_dirs(root)? {
+
+    let root_db_path = root.join(".tsift/index.db");
+    if root_db_path.exists() {
+        let last_indexed_secs_ago = root_db_path
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| SystemTime::now().duration_since(t).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let inspection =
+            IndexDb::inspect_read_only_excluding(&root_db_path, root, false, &excluded_roots)?;
+        let stale_files =
+            inspection.summary.new + inspection.summary.modified + inspection.summary.deleted;
+        scopes.push(WorkspaceScopeStatus {
+            scope: config::WORKSPACE_ROOT_SCOPE_ID.to_string(),
+            db_path: root_db_path,
+            total_files: inspection.total_files,
+            stale_files,
+            last_indexed_secs_ago,
+            recovery: inspection.recovery,
+        });
+    } else {
+        missing_scopes.push(MissingWorkspaceScopeStatus {
+            scope: config::WORKSPACE_ROOT_SCOPE_ID.to_string(),
+            db_path: root_db_path,
+        });
+    }
+
+    for scope in workspace_scopes {
         let db_path = cfg.db_path_for(root, &scope.id);
         if !scope.source_root.exists() || !db_path.exists() {
             missing_scopes.push(MissingWorkspaceScopeStatus {
@@ -1581,6 +1620,23 @@ mod tests {
         dir
     }
 
+    fn index_workspace(root: &Path) {
+        let scopes = Config::submodule_dirs(root).unwrap();
+        let excluded_roots = scopes
+            .iter()
+            .map(|scope| scope.source_root.clone())
+            .collect::<Vec<_>>();
+        let root_db = IndexDb::open(&root.join(".tsift/index.db")).unwrap();
+        root_db
+            .apply_changes_excluding(root, &excluded_roots)
+            .unwrap();
+        let cfg = Config::load(root).unwrap();
+        for scope in scopes {
+            let db = IndexDb::open(&cfg.db_path_for(root, &scope.id)).unwrap();
+            db.apply_changes(&scope.source_root).unwrap();
+        }
+    }
+
     // #wsinit regression: `status` collapsed every scope into one
     // `instructions:` line, so submodules left two releases behind by
     // `init --workspace` were invisible from the workspace root — and the
@@ -1842,11 +1898,7 @@ mod tests {
     #[test]
     fn status_workspace_scoped_indexes_report_fresh() {
         let dir = setup_workspace();
-        let cfg = Config::load(dir.path()).unwrap();
-        for scope in Config::submodule_dirs(dir.path()).unwrap() {
-            let db = IndexDb::open(&cfg.db_path_for(dir.path(), &scope.id)).unwrap();
-            db.apply_changes(&scope.source_root).unwrap();
-        }
+        index_workspace(dir.path());
 
         let report = check_status(dir.path()).unwrap();
         match &report.index {
@@ -1856,9 +1908,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(*total_files, 2);
-                assert_eq!(workspace_scopes.len(), 2);
-                assert_eq!(workspace_scopes[0].scope, "alpha");
-                assert_eq!(workspace_scopes[1].scope, "beta");
+                assert_eq!(workspace_scopes.len(), 3);
+                assert_eq!(workspace_scopes[0].scope, config::WORKSPACE_ROOT_SCOPE_ID);
+                assert_eq!(workspace_scopes[1].scope, "alpha");
+                assert_eq!(workspace_scopes[2].scope, "beta");
             }
             other => panic!("expected fresh workspace status, got {other:?}"),
         }
@@ -1896,11 +1949,7 @@ mod tests {
         )
         .unwrap();
 
-        let cfg = Config::load(dir.path()).unwrap();
-        for scope in Config::submodule_dirs(dir.path()).unwrap() {
-            let db = IndexDb::open(&cfg.db_path_for(dir.path(), &scope.id)).unwrap();
-            db.apply_changes(&scope.source_root).unwrap();
-        }
+        index_workspace(dir.path());
 
         let report = check_status(dir.path()).unwrap();
         assert_eq!(
@@ -1916,15 +1965,16 @@ mod tests {
         let report = check_status(dir.path()).unwrap();
         match &report.index {
             IndexStatus::Missing { missing_scopes } => {
-                assert_eq!(missing_scopes.len(), 2);
-                assert_eq!(missing_scopes[0].scope, "alpha");
-                assert_eq!(missing_scopes[1].scope, "beta");
+                assert_eq!(missing_scopes.len(), 3);
+                assert_eq!(missing_scopes[0].scope, config::WORKSPACE_ROOT_SCOPE_ID);
+                assert_eq!(missing_scopes[1].scope, "alpha");
+                assert_eq!(missing_scopes[2].scope, "beta");
             }
             other => panic!("expected missing workspace status, got {other:?}"),
         }
         assert_eq!(
             report.recommendations.run.as_deref(),
-            Some("tsift init --workspace && tsift index --workspace .  (2 missing scopes)")
+            Some("tsift init --workspace && tsift index --workspace .  (3 missing scopes)")
         );
     }
 
@@ -1949,22 +1999,27 @@ mod tests {
                 assert_eq!(*stale_files, 0);
                 assert_eq!(workspace_scopes.len(), 1);
                 assert_eq!(workspace_scopes[0].scope, "alpha");
-                assert_eq!(missing_scopes.len(), 1);
-                assert_eq!(missing_scopes[0].scope, "beta");
+                assert_eq!(missing_scopes.len(), 2);
+                assert_eq!(missing_scopes[0].scope, config::WORKSPACE_ROOT_SCOPE_ID);
+                assert_eq!(missing_scopes[1].scope, "beta");
             }
             other => panic!("expected partial workspace status, got {other:?}"),
         }
         assert_eq!(
             report.recommendations.run.as_deref(),
-            Some("tsift init --workspace && tsift index --workspace .  (1 missing scope)")
+            Some("tsift init --workspace && tsift index --workspace .  (2 missing scopes)")
         );
     }
 
     #[test]
-    fn status_workspace_prefers_scoped_indexes_when_root_index_also_exists() {
+    fn status_workspace_reports_filtered_root_and_scoped_indexes() {
         let dir = setup_workspace();
+        std::fs::write(dir.path().join("root.rs"), "fn root_helper() {}\n").unwrap();
+        let excluded_roots = [dir.path().join("src/alpha"), dir.path().join("src/beta")];
         let root_db = IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
-        root_db.apply_changes(dir.path()).unwrap();
+        root_db
+            .apply_changes_excluding(dir.path(), &excluded_roots)
+            .unwrap();
 
         let cfg = Config::load(dir.path()).unwrap();
         let alpha = Config::resolve_submodule(dir.path(), "alpha").unwrap();
@@ -1980,10 +2035,12 @@ mod tests {
                 missing_scopes,
                 ..
             } => {
-                assert_eq!(*total_files, 1);
+                assert_eq!(*total_files, 2);
                 assert_eq!(*stale_files, 0);
-                assert_eq!(workspace_scopes.len(), 1);
-                assert_eq!(workspace_scopes[0].scope, "alpha");
+                assert_eq!(workspace_scopes.len(), 2);
+                assert_eq!(workspace_scopes[0].scope, config::WORKSPACE_ROOT_SCOPE_ID);
+                assert_eq!(workspace_scopes[0].total_files, 1);
+                assert_eq!(workspace_scopes[1].scope, "alpha");
                 assert_eq!(missing_scopes.len(), 1);
                 assert_eq!(missing_scopes[0].scope, "beta");
             }
@@ -1998,11 +2055,7 @@ mod tests {
     #[test]
     fn status_workspace_scoped_indexes_report_stale() {
         let dir = setup_workspace();
-        let cfg = Config::load(dir.path()).unwrap();
-        for scope in Config::submodule_dirs(dir.path()).unwrap() {
-            let db = IndexDb::open(&cfg.db_path_for(dir.path(), &scope.id)).unwrap();
-            db.apply_changes(&scope.source_root).unwrap();
-        }
+        index_workspace(dir.path());
         std::fs::write(dir.path().join("src/beta/new.rs"), "fn late() {}\n").unwrap();
 
         let report = check_status(dir.path()).unwrap();
@@ -2015,7 +2068,7 @@ mod tests {
             } => {
                 assert_eq!(*total_files, 2);
                 assert_eq!(*stale_files, 1);
-                assert_eq!(workspace_scopes.len(), 2);
+                assert_eq!(workspace_scopes.len(), 3);
                 assert_eq!(
                     workspace_scopes
                         .iter()

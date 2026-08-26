@@ -372,27 +372,6 @@ pub fn resolve_project_dir(path: &Path) -> Result<PathBuf> {
 }
 
 pub fn resolve_workspace_dir(path: &Path) -> Result<PathBuf> {
-    let dir = input_dir(path)?;
-
-    let output = Command::new("git")
-        .args([
-            "-C",
-            &dir.to_string_lossy(),
-            "rev-parse",
-            "--show-superproject-working-tree",
-        ])
-        .output();
-
-    match output {
-        Ok(o) if o.status.success() => {
-            let root = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if !root.is_empty() {
-                return Ok(PathBuf::from(root));
-            }
-        }
-        _ => {}
-    }
-
     resolve_project_dir(path)
 }
 
@@ -1678,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_workspace_dir_falls_back_to_project_dir() {
+    fn resolve_workspace_dir_uses_current_project_dir() {
         let dir = TempDir::new().unwrap();
         Command::new("git")
             .args(["init", &dir.path().to_string_lossy()])
@@ -1688,6 +1667,71 @@ mod tests {
         assert_eq!(
             resolved.canonicalize().unwrap(),
             dir.path().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_dir_does_not_escape_a_git_submodule() {
+        let dir = TempDir::new().unwrap();
+        let child_source = TempDir::new().unwrap();
+        Command::new("git")
+            .args(["init", &child_source.path().to_string_lossy()])
+            .output()
+            .unwrap();
+        std::fs::write(child_source.path().join("tracked.txt"), "child\n").unwrap();
+        Command::new("git")
+            .args([
+                "-C",
+                &child_source.path().to_string_lossy(),
+                "-c",
+                "user.name=tsift test",
+                "-c",
+                "user.email=tsift@example.invalid",
+                "add",
+                ".",
+            ])
+            .output()
+            .unwrap();
+        let commit = Command::new("git")
+            .args([
+                "-C",
+                &child_source.path().to_string_lossy(),
+                "-c",
+                "user.name=tsift test",
+                "-c",
+                "user.email=tsift@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ])
+            .output()
+            .unwrap();
+        assert!(commit.status.success());
+
+        Command::new("git")
+            .args(["init", &dir.path().to_string_lossy()])
+            .output()
+            .unwrap();
+        let child = dir.path().join("nested");
+        let add = Command::new("git")
+            .args([
+                "-C",
+                &dir.path().to_string_lossy(),
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &child_source.path().to_string_lossy(),
+                "nested",
+            ])
+            .output()
+            .unwrap();
+        assert!(add.status.success());
+
+        let resolved = resolve_workspace_dir(&child).unwrap();
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            child.canonicalize().unwrap()
         );
     }
 

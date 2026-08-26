@@ -650,47 +650,71 @@ impl IndexDb {
         Self::inspect_read_only_uncached(db_path, root, prune)
     }
 
+    /// Inspect an index whose source tree deliberately excludes nested
+    /// workspace scopes. This path is intentionally uncached because the
+    /// exclusion set is workspace-discovery state rather than part of the
+    /// legacy inspect cache key.
+    pub fn inspect_read_only_excluding(
+        db_path: &Path,
+        root: &Path,
+        prune: bool,
+        excluded_roots: &[PathBuf],
+    ) -> Result<ReadOnlyInspectResult> {
+        Self::inspect_read_only_uncached_excluding(db_path, root, prune, excluded_roots)
+    }
+
     fn inspect_read_only_uncached(
         db_path: &Path,
         root: &Path,
         prune: bool,
     ) -> Result<ReadOnlyInspectResult> {
-        let result = match Self::inspect_read_only_once(db_path, root, prune) {
-            Ok(result) => result,
-            Err(err) => {
-                let Some(recovery) = read_only_snapshot_recovery(db_path, &err) else {
-                    return Err(err);
-                };
-                let db = Self::open_read_only_snapshot(db_path)?;
-                let total_files = db.file_count()?;
-                let summary = if prune {
-                    db.compute_changes_pruned(root)?
-                } else {
-                    db.compute_changes(root)?
-                };
-                let tracked_file_paths = db.file_paths()?;
-                ReadOnlyInspectResult {
-                    total_files,
-                    summary,
-                    tracked_file_paths,
-                    recovery: Some(recovery),
-                }
-            }
-        };
-        Ok(result)
+        Self::inspect_read_only_uncached_excluding(db_path, root, prune, &[])
     }
 
-    fn inspect_read_only_once(
+    fn inspect_read_only_uncached_excluding(
         db_path: &Path,
         root: &Path,
         prune: bool,
+        excluded_roots: &[PathBuf],
+    ) -> Result<ReadOnlyInspectResult> {
+        let result =
+            match Self::inspect_read_only_once_excluding(db_path, root, prune, excluded_roots) {
+                Ok(result) => result,
+                Err(err) => {
+                    let Some(recovery) = read_only_snapshot_recovery(db_path, &err) else {
+                        return Err(err);
+                    };
+                    let db = Self::open_read_only_snapshot(db_path)?;
+                    let total_files = db.file_count()?;
+                    let summary = if prune {
+                        db.compute_changes_pruned_excluding(root, excluded_roots)?
+                    } else {
+                        db.compute_changes_excluding(root, excluded_roots)?
+                    };
+                    let tracked_file_paths = db.file_paths()?;
+                    ReadOnlyInspectResult {
+                        total_files,
+                        summary,
+                        tracked_file_paths,
+                        recovery: Some(recovery),
+                    }
+                }
+            };
+        Ok(result)
+    }
+
+    fn inspect_read_only_once_excluding(
+        db_path: &Path,
+        root: &Path,
+        prune: bool,
+        excluded_roots: &[PathBuf],
     ) -> Result<ReadOnlyInspectResult> {
         let db = Self::open_read_only(db_path)?;
         let total_files = db.file_count()?;
         let summary = if prune {
-            db.compute_changes_pruned(root)?
+            db.compute_changes_pruned_excluding(root, excluded_roots)?
         } else {
-            db.compute_changes(root)?
+            db.compute_changes_excluding(root, excluded_roots)?
         };
         let tracked_file_paths = db.file_paths()?;
         Ok(ReadOnlyInspectResult {
@@ -856,19 +880,40 @@ impl IndexDb {
     }
 
     pub fn compute_changes(&self, root: &Path) -> Result<IndexSummary> {
-        self.compute_changes_inner(root, false)
+        self.compute_changes_inner(root, false, &[])
     }
 
     pub fn compute_changes_pruned(&self, root: &Path) -> Result<IndexSummary> {
-        self.compute_changes_inner(root, true)
+        self.compute_changes_inner(root, true, &[])
     }
 
-    fn compute_changes_inner(&self, root: &Path, prune: bool) -> Result<IndexSummary> {
+    pub fn compute_changes_excluding(
+        &self,
+        root: &Path,
+        excluded_roots: &[PathBuf],
+    ) -> Result<IndexSummary> {
+        self.compute_changes_inner(root, false, excluded_roots)
+    }
+
+    pub fn compute_changes_pruned_excluding(
+        &self,
+        root: &Path,
+        excluded_roots: &[PathBuf],
+    ) -> Result<IndexSummary> {
+        self.compute_changes_inner(root, true, excluded_roots)
+    }
+
+    fn compute_changes_inner(
+        &self,
+        root: &Path,
+        prune: bool,
+        excluded_roots: &[PathBuf],
+    ) -> Result<IndexSummary> {
         let stored = self.load_stored_files()?;
 
         let (entries, pruned_dirs, prune_stats, skipped) = if prune {
             let stored_dirs = self.load_dir_state().unwrap_or_default();
-            let walk_result = walk::walk_files_pruned(root, stored_dirs)?;
+            let walk_result = walk::walk_files_pruned_excluding(root, stored_dirs, excluded_roots)?;
             let mut stats = walk_result.stats;
             let pruned_file_count = stored
                 .keys()
@@ -882,7 +927,7 @@ impl IndexDb {
                 walk_result.skips,
             )
         } else {
-            let (entries, skips) = walk::walk_files_with_skips(root)?;
+            let (entries, skips) = walk::walk_files_with_skips_excluding(root, excluded_roots)?;
             (entries, HashSet::new(), None, skips)
         };
 
@@ -912,19 +957,40 @@ impl IndexDb {
     }
 
     pub fn apply_changes(&self, root: &Path) -> Result<IndexSummary> {
-        self.apply_changes_inner(root, false)
+        self.apply_changes_inner(root, false, &[])
     }
 
     pub fn apply_changes_pruned(&self, root: &Path) -> Result<IndexSummary> {
-        self.apply_changes_inner(root, true)
+        self.apply_changes_inner(root, true, &[])
     }
 
-    fn apply_changes_inner(&self, root: &Path, prune: bool) -> Result<IndexSummary> {
+    pub fn apply_changes_excluding(
+        &self,
+        root: &Path,
+        excluded_roots: &[PathBuf],
+    ) -> Result<IndexSummary> {
+        self.apply_changes_inner(root, false, excluded_roots)
+    }
+
+    pub fn apply_changes_pruned_excluding(
+        &self,
+        root: &Path,
+        excluded_roots: &[PathBuf],
+    ) -> Result<IndexSummary> {
+        self.apply_changes_inner(root, true, excluded_roots)
+    }
+
+    fn apply_changes_inner(
+        &self,
+        root: &Path,
+        prune: bool,
+        excluded_roots: &[PathBuf],
+    ) -> Result<IndexSummary> {
         let stored = self.load_stored_files()?;
 
         let (entries, pruned_dirs, dir_mtimes, prune_stats, skipped) = if prune {
             let stored_dirs = self.load_dir_state().unwrap_or_default();
-            let walk_result = walk::walk_files_pruned(root, stored_dirs)?;
+            let walk_result = walk::walk_files_pruned_excluding(root, stored_dirs, excluded_roots)?;
             let mut stats = walk_result.stats;
             let pruned_file_count = stored
                 .keys()
@@ -939,7 +1005,7 @@ impl IndexDb {
                 walk_result.skips,
             )
         } else {
-            let (entries, skips) = walk::walk_files_with_skips(root)?;
+            let (entries, skips) = walk::walk_files_with_skips_excluding(root, excluded_roots)?;
             (entries, HashSet::new(), None, None, skips)
         };
 
@@ -1207,6 +1273,14 @@ impl IndexDb {
     }
 
     pub fn rebuild(&self, root: &Path) -> Result<IndexSummary> {
+        self.rebuild_excluding(root, &[])
+    }
+
+    pub fn rebuild_excluding(
+        &self,
+        root: &Path,
+        excluded_roots: &[PathBuf],
+    ) -> Result<IndexSummary> {
         self.conn.execute_batch("SAVEPOINT sp_rebuild")?;
         let result: Result<IndexSummary> = (|| {
             self.conn.execute("DELETE FROM file_state", [])?;
@@ -1217,7 +1291,7 @@ impl IndexDb {
             self.conn.execute("DELETE FROM route_nodes", [])?;
             self.conn.execute("DELETE FROM dir_state", [])?;
             maybe_fail_rebuild_after_clear()?;
-            self.apply_changes(root)
+            self.apply_changes_excluding(root, excluded_roots)
         })();
         match result {
             Ok(summary) => {

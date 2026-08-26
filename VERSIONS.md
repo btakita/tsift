@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **Complete workspace ownership and symbol reads** ([#16](https://github.com/btakita/tsift/issues/16)). `init --workspace` now stays in the current repository, `index --workspace` indexes root-owned files into a filtered `<root>` database alongside submodule scopes, and `symbol-read` federates from workspace roots (with explicit `--federated`, root-owned `--file`, and fail-closed ambiguity diagnostics).
+
 ## 0.1.87
 
 - **Effective Git ignores and resolvable workspace discovery** ([#15](https://github.com/btakita/tsift/issues/15)). `init` now respects `.tsift/` ignores from `.git/info/exclude`, global excludes, parent rules, and broader tracked patterns without re-dirtying `.gitignore`, and names the effective ignore source. Workspace discovery separates present directories and real gitlinks from stale `.gitmodules` declarations; when none resolve, `index --workspace` and `status` fall back to the root tree instead of reporting an unfixable empty workspace.

@@ -97,6 +97,7 @@ tsift --compact search <query>  # terse human output across commands
 
 Default behavior:
 
+- `tsift index --workspace` writes a filtered `.tsift/index.db` for files owned by the workspace root alongside the per-submodule databases. Status and federated queries report that database as `<root>`; submodule paths are excluded from it so results are neither duplicated nor allowed to bypass isolation tiers.
 - fresh index: search proceeds normally
 - stale index: search incrementally refreshes the local or scoped index before running
 - missing index: search builds the local or scoped index before running when a concrete index target can be resolved
@@ -164,6 +165,8 @@ The default JSON and envelope forms (`tsift --envelope source-read src/main.rs -
 The default projection is outline-first: headings are surfaced before bounded list/code block previews so session-review and context-pack can carry a compact document map before selecting bodies. `--node <mdast-*|span-*>` switches to selected-node mode and focuses the projection on one known node handle. This lets `symbol-read` hand a Markdown target span directly to `markdown-ast --node` without requiring consumers to re-scan the whole document, while edit-intents dry-run plans keep using the same stable `span-*` handle for conflict-aware write planning.
 
 `tsift symbol-read <symbol>` is the symbol-centered read replacement surface. It resolves the query through the indexed symbols table, optionally scoped by `--file` and `--scope`, then emits:
+
+At a workspace root, `symbol-read` federates over `<root>` and eligible submodule indexes by default; `--federated` makes that choice explicit. An exact symbol owned by more than one scope fails closed with the ambiguous scope ids and asks for `--file` or `--scope`. A root-owned `--file` resolves against the filtered `<root>` index.
 
 - a stable `sread-*` handle for the selected symbol
 - the symbol signature/range metadata, optional AST `span` metadata, and a token-budgeted body preview capped by both a line-count budget (`preview_items × 16` lines) and a body token cap (default 1500 tokens for Normal, 500 for Small, 3000 for Deep); when the body exceeds the token cap it is truncated and an `expand.body` command is emitted for the remaining body lines
@@ -263,7 +266,9 @@ opencode plugin opencode-tsift          # install the same shortcuts after the n
 
 This means `tsift init src/session-share/tasks/claudescore-3.md` resolves to `src/session-share/` — the submodule root — and initializes there. When the resolved path differs from the input, a `resolved: <input> → <target>` line is printed.
 
-With `--workspace`, `tsift init` first checks `git rev-parse --show-superproject-working-tree`. When invoked inside a submodule, that promotes the target to the parent workspace root before the normal git-root fallback.
+`--workspace` keeps the same resolved project root. In particular, invoking it
+inside a git submodule initializes that submodule's workspace rather than
+promoting the target to the outer superproject.
 
 ### Behavior
 

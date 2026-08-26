@@ -73,14 +73,19 @@ pub fn walk_files(root: &Path) -> Result<Vec<FileEntry>> {
 /// `walk_files`, plus the count of files dropped for want of an indexer
 /// language (`#goindex`).
 pub fn walk_files_with_skips(root: &Path) -> Result<(Vec<FileEntry>, SkipStats)> {
+    walk_files_with_skips_excluding(root, &[])
+}
+
+/// Walk indexable files while pruning whole source roots owned by other
+/// workspace scopes. The exclusions are directory roots, not glob patterns,
+/// so a workspace root index can cover only the meta-repository's own files.
+pub fn walk_files_with_skips_excluding(
+    root: &Path,
+    excluded_roots: &[PathBuf],
+) -> Result<(Vec<FileEntry>, SkipStats)> {
     let mut entries = Vec::new();
     let mut skips = SkipStats::default();
-    let walker = ignore::WalkBuilder::new(root)
-        .hidden(true) // skip hidden files/dirs
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .build();
+    let walker = build_walker(root, excluded_roots);
     for result in walker {
         let dir_entry = result.with_context(|| format!("walking {}", root.display()))?;
         if !dir_entry.file_type().is_some_and(|ft| ft.is_file()) {
@@ -112,7 +117,15 @@ pub fn walk_files_with_skips(root: &Path) -> Result<(Vec<FileEntry>, SkipStats)>
 
 pub fn walk_files_pruned(
     root: &Path,
+    stored_dirs: HashMap<PathBuf, SystemTime>,
+) -> Result<WalkResult> {
+    walk_files_pruned_excluding(root, stored_dirs, &[])
+}
+
+pub fn walk_files_pruned_excluding(
+    root: &Path,
     _stored_dirs: HashMap<PathBuf, SystemTime>,
+    excluded_roots: &[PathBuf],
 ) -> Result<WalkResult> {
     let mut entries = Vec::new();
     let mut skips = SkipStats::default();
@@ -122,12 +135,7 @@ pub fn walk_files_pruned(
     let mut dirs_walked = 0usize;
     let files_pruned = 0usize;
 
-    let walker = ignore::WalkBuilder::new(root)
-        .hidden(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .build();
+    let walker = build_walker(root, excluded_roots);
 
     for result in walker {
         let dir_entry = result.with_context(|| format!("walking {}", root.display()))?;
@@ -181,6 +189,24 @@ pub fn walk_files_pruned(
         },
         skips,
     })
+}
+
+fn build_walker(root: &Path, excluded_roots: &[PathBuf]) -> ignore::Walk {
+    let mut builder = ignore::WalkBuilder::new(root);
+    builder
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true);
+    if !excluded_roots.is_empty() {
+        let excluded_roots = excluded_roots.to_vec();
+        builder.filter_entry(move |entry| {
+            !excluded_roots
+                .iter()
+                .any(|excluded| entry.path() == excluded || entry.path().starts_with(excluded))
+        });
+    }
+    builder.build()
 }
 
 pub fn changed_since(entries: &[FileEntry], since: SystemTime) -> Vec<&FileEntry> {
@@ -275,6 +301,21 @@ mod tests {
         assert!(names.contains(&"src.rs".to_string()));
         assert!(!names.contains(&"debug.rs".to_string()));
         assert!(!names.contains(&"output.generated.rs".to_string()));
+    }
+
+    #[test]
+    fn walk_exclusions_prune_entire_workspace_scopes() {
+        let dir = setup_temp_tree();
+        let root = dir.path();
+        let excluded = root.join("sub");
+
+        let (entries, _) = walk_files_with_skips_excluding(root, &[excluded]).unwrap();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.path.ends_with("sub/mod.rs"))
+        );
+        assert!(entries.iter().any(|entry| entry.path.ends_with("main.rs")));
     }
 
     #[test]

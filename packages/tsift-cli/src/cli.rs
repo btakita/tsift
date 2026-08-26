@@ -591,6 +591,9 @@ pub enum Commands {
         /// Restrict index refs to a specific submodule
         #[arg(long)]
         scope: Option<String>,
+        /// Search all workspace scopes (automatic at a workspace root)
+        #[arg(long)]
+        federated: bool,
         /// Output as JSON
         #[arg(long)]
         json: bool,

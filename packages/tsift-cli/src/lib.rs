@@ -1134,6 +1134,7 @@ pub fn run() -> Result<()> {
             file,
             path,
             scope,
+            federated,
             json,
             max_items,
             max_bytes,
@@ -1143,6 +1144,7 @@ pub fn run() -> Result<()> {
             file.as_deref(),
             &path,
             scope.as_deref(),
+            federated,
             OutputFormat {
                 json_output: json || terse || schema || envelope,
                 compact,
@@ -3659,11 +3661,15 @@ fn resolve_query_index_target(
 ) -> Result<SearchIndexTarget> {
     let cfg = config::Config::load(root)?;
     if let Some(scope_name) = scope {
+        if scope_name == config::WORKSPACE_ROOT_SCOPE_ID {
+            return workspace_root_index_target(root);
+        }
         if let Some(scope) = config::Config::find_submodule(root, scope_name)? {
             return Ok(SearchIndexTarget {
                 label: format!("submodule `{}` index", scope.id),
                 db_path: cfg.db_path_for(root, &scope.id),
                 source_root: scope.source_root.clone(),
+                excluded_roots: Vec::new(),
                 scope_name: Some(scope.id.clone()),
                 reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
             });
@@ -3679,6 +3685,7 @@ fn resolve_query_index_target(
             label: format!("submodule `{}` index", scope.id),
             db_path: cfg.db_path_for(root, &scope.id),
             source_root: scope.source_root.clone(),
+            excluded_roots: Vec::new(),
             scope_name: Some(scope.id.clone()),
             reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
         });
@@ -3693,56 +3700,13 @@ fn resolve_query_index_target(
             label: format!("submodule `{}` index", scope.id),
             db_path: cfg.db_path_for(root, &scope.id),
             source_root: scope.source_root.clone(),
+            excluded_roots: Vec::new(),
             scope_name: Some(scope.id.clone()),
             reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
         });
     }
 
-    let db_path = root.join(".tsift/index.db");
-    if db_path.exists() {
-        return Ok(SearchIndexTarget {
-            label: "index".to_string(),
-            db_path,
-            source_root: root.to_path_buf(),
-            scope_name: None,
-            reindex_cmd: format!("tsift index {}", root.display()),
-        });
-    }
-
-    let scopes = config::Config::submodule_dirs(root)?;
-    if scopes.is_empty() {
-        return Ok(SearchIndexTarget {
-            label: "index".to_string(),
-            db_path,
-            source_root: root.to_path_buf(),
-            scope_name: None,
-            reindex_cmd: format!("tsift index {}", root.display()),
-        });
-    }
-
-    let available_scopes = scopes
-        .iter()
-        .map(|scope| scope.id.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let indexed_scopes = scopes
-        .iter()
-        .filter(|scope| cfg.db_path_for(root, &scope.id).exists())
-        .map(|scope| scope.id.as_str())
-        .collect::<Vec<_>>();
-    let indexed_label = if indexed_scopes.is_empty() {
-        "none".to_string()
-    } else {
-        indexed_scopes.join(", ")
-    };
-
-    bail!(
-        "workspace root {} has no shared root index at {}. Read-only graph queries require `--scope <scope>` when the workspace is indexed into `.tsift/indexes/*/index.db`. Available scopes: {}. Indexed scopes: {}.",
-        root.display(),
-        db_path.display(),
-        available_scopes,
-        indexed_label
-    );
+    workspace_root_index_target(root)
 }
 
 pub(crate) fn resolve_query_db_path(
@@ -3792,14 +3756,17 @@ pub(crate) fn open_index_db(path: &std::path::Path, scope: Option<&str>) -> Resu
     index::IndexDb::open_read_only_resilient(&db_path)
 }
 
-/// Scope ids this workspace federates over, in `.gitmodules` order.
+/// Scope ids this workspace federates over: `<root>` first, then `.gitmodules` order.
 pub(crate) fn federated_scope_ids(root: &Path) -> Result<Vec<String>> {
     let cfg = config::Config::load(root)?;
-    Ok(config::Config::submodule_dirs(root)?
-        .into_iter()
-        .filter(|scope| cfg.federation_for_scope(scope))
-        .map(|scope| scope.id)
-        .collect())
+    let mut scopes = vec![config::WORKSPACE_ROOT_SCOPE_ID.to_string()];
+    scopes.extend(
+        config::Config::submodule_dirs(root)?
+            .into_iter()
+            .filter(|scope| cfg.federation_for_scope(scope))
+            .map(|scope| scope.id),
+    );
+    Ok(scopes)
 }
 
 /// Which federated scope owns `symbol`, and which others also define it.
@@ -3820,19 +3787,18 @@ pub(crate) fn resolve_symbol_scope(
     root: &Path,
     symbol: &str,
 ) -> Result<Option<SymbolScopeResolution>> {
-    let cfg = config::Config::load(root)?;
     let mut owners = Vec::new();
-    for scope in config::Config::submodule_dirs(root)? {
-        if !cfg.federation_for_scope(&scope) {
+    for target in resolve_search_index_targets(root, root, None, true)? {
+        if !target.db_path.exists() {
             continue;
         }
-        let db_path = cfg.db_path_for(root, &scope.id);
-        if !db_path.exists() {
-            continue;
-        }
-        let Ok(db) = index::IndexDb::open_read_only_resilient(&db_path) else {
+        let Ok(db) = index::IndexDb::open_read_only_resilient(&target.db_path) else {
             continue;
         };
+        let scope_id = target
+            .scope_name
+            .clone()
+            .unwrap_or_else(|| config::WORKSPACE_ROOT_SCOPE_ID.to_string());
         let defines = db.symbol_info(symbol).map(|rows| !rows.is_empty())?;
         // A scope that only *calls* the symbol still lets `graph --callers`
         // answer, so it counts as an owner when nothing defines it outright.
@@ -3842,9 +3808,9 @@ pub(crate) fn resolve_symbol_scope(
                 .unwrap_or(false)
         };
         if defines {
-            owners.push((scope.id.clone(), true));
+            owners.push((scope_id, true));
         } else if references() {
-            owners.push((scope.id.clone(), false));
+            owners.push((scope_id, false));
         }
     }
     if owners.is_empty() {
@@ -3879,10 +3845,7 @@ pub(crate) fn open_graph_index_db(
     }
 
     let Some(resolution) = resolve_symbol_scope(&root, symbol)? else {
-        let scopes = config::Config::submodule_dirs(&root)?
-            .iter()
-            .map(|scope| scope.id.clone())
-            .collect::<Vec<_>>();
+        let scopes = federated_scope_ids(&root)?;
         bail!(
             "symbol `{symbol}` was not found in any federated scope of {}. Searched: {}. Run `tsift index --workspace {}` if a scope is unindexed, or pass `--scope <scope>` to query one directly.",
             root.display(),
@@ -3912,6 +3875,9 @@ pub(crate) fn query_tagpath_root(
     scope: Option<&str>,
 ) -> Result<PathBuf> {
     if let Some(scope_name) = scope {
+        if scope_name == config::WORKSPACE_ROOT_SCOPE_ID {
+            return Ok(root.to_path_buf());
+        }
         if let Some(scope) = config::Config::find_submodule(root, scope_name)? {
             return Ok(scope.source_root);
         }
@@ -16259,6 +16225,10 @@ pub(crate) fn resolve_source_file(root: &Path, file: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+fn resolve_indexed_source_file(root: &Path, source_root: &Path, file: &Path) -> Result<PathBuf> {
+    resolve_source_file(source_root, file).or_else(|_| resolve_source_file(root, file))
+}
+
 pub(crate) fn source_read_command(root: &Path, file: &str, start: usize, lines: usize) -> String {
     source_read_window_command(root, file, start, lines)
 }
@@ -18043,6 +18013,7 @@ fn cmd_symbol_read(
     file_hint: Option<&Path>,
     path: &Path,
     scope: Option<&str>,
+    federated: bool,
     format: OutputFormat,
     absolute: bool,
     budget: ResponseBudget,
@@ -18052,44 +18023,100 @@ fn cmd_symbol_read(
         .map(|file| resolve_source_file(&root, file))
         .transpose()?;
     let path_hint = hinted_file_abs.as_deref().unwrap_or(root.as_path());
-    // Build/refresh the per-package cargo index on demand so symbol-read resolves
-    // symbols in any workspace member, not only ones a prior graph/search query
-    // indexed. Previously this checked existence only and bailed with "no index
-    // found" for never-queried members despite a fresh `tsift status`
-    // (#cargoidxcov).
-    let target = resolve_query_index_target(&root, path_hint, scope)?;
-    ensure_query_index_current(&root, &target)?;
-    let db_path = target.db_path;
-    if !db_path.exists() {
-        bail!(
-            "index refs unavailable: no index found at {}",
-            db_path.display()
-        );
-    }
-    let db = index::IndexDb::open_read_only_resilient(&db_path)
-        .with_context(|| format!("opening symbol index {}", db_path.display()))?;
     let search_limit = budget.follow_up_items().max(10);
-    let hits = db
-        .symbol_search(symbol, search_limit)
-        .with_context(|| format!("searching symbols for {symbol:?}"))?;
-    let selected = hits
-        .into_iter()
-        .find(|hit| {
-            let Some(hinted_file_abs) = &hinted_file_abs else {
-                return true;
-            };
-            resolve_source_file(&root, Path::new(&hit.file))
+    let search_across_scopes = file_hint.is_none()
+        && scope.is_none()
+        && (federated || should_auto_federate(&root, path_hint, scope, federated)?);
+    let targets = if search_across_scopes {
+        resolve_search_index_targets(&root, path_hint, None, true)?
+    } else {
+        vec![resolve_query_index_target(&root, path_hint, scope)?]
+    };
+    let mut candidates = Vec::new();
+    for (target_index, target) in targets.iter().enumerate() {
+        ensure_query_index_current(&root, target)?;
+        if !target.db_path.exists() {
+            continue;
+        }
+        let db = index::IndexDb::open_read_only_resilient(&target.db_path)
+            .with_context(|| format!("opening symbol index {}", target.db_path.display()))?;
+        let hits = db
+            .symbol_search(symbol, search_limit)
+            .with_context(|| format!("searching symbols for {symbol:?}"))?;
+        candidates.extend(hits.into_iter().filter_map(|hit| {
+            let matches_file = hinted_file_abs.as_ref().is_none_or(|hinted_file_abs| {
+                resolve_indexed_source_file(
+                    &root,
+                    &targets[target_index].source_root,
+                    Path::new(&hit.file),
+                )
                 .map(|hit_file| hit_file == *hinted_file_abs)
                 .unwrap_or(false)
+            });
+            matches_file.then_some((target_index, hit))
+        }));
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .1
+            .score
+            .partial_cmp(&left.1.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| left.1.file.cmp(&right.1.file))
+    });
+    let (selected_target_index, selected) = candidates.first().cloned().with_context(|| {
+        let hint = file_hint
+            .map(|file| format!(" in {}", file.display()))
+            .unwrap_or_default();
+        let searched = targets
+            .iter()
+            .map(|target| {
+                target
+                    .scope_name
+                    .as_deref()
+                    .unwrap_or(config::WORKSPACE_ROOT_SCOPE_ID)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("no indexed symbol matched {symbol:?}{hint}; searched: {searched}")
+    })?;
+    let selected_scope = targets[selected_target_index]
+        .scope_name
+        .as_deref()
+        .unwrap_or(config::WORKSPACE_ROOT_SCOPE_ID);
+    let ambiguous_scopes = candidates
+        .iter()
+        .filter(|(target_index, hit)| {
+            *target_index != selected_target_index
+                && hit.name == selected.name
+                && hit.kind == selected.kind
+                && (hit.name == symbol || (hit.score - selected.score).abs() < f64::EPSILON)
         })
-        .with_context(|| {
-            let hint = file_hint
-                .map(|file| format!(" in {}", file.display()))
-                .unwrap_or_default();
-            format!("no indexed symbol matched {symbol:?}{hint}")
-        })?;
+        .map(|(target_index, _)| {
+            targets[*target_index]
+                .scope_name
+                .as_deref()
+                .unwrap_or(config::WORKSPACE_ROOT_SCOPE_ID)
+        })
+        .collect::<BTreeSet<_>>();
+    if !ambiguous_scopes.is_empty() {
+        let mut scopes = vec![selected_scope];
+        scopes.extend(ambiguous_scopes);
+        bail!(
+            "symbol {symbol:?} is ambiguous across workspace scopes: {}. Pass `--scope <scope>` or `--file <path>` to select one.",
+            scopes.join(", ")
+        );
+    }
+    let db_path = &targets[selected_target_index].db_path;
+    let db = index::IndexDb::open_read_only_resilient(db_path)
+        .with_context(|| format!("opening symbol index {}", db_path.display()))?;
 
-    let file_abs = resolve_source_file(&root, Path::new(&selected.file))?;
+    let file_abs = resolve_indexed_source_file(
+        &root,
+        &targets[selected_target_index].source_root,
+        Path::new(&selected.file),
+    )?;
     let file_display = if absolute {
         file_abs.to_string_lossy().to_string()
     } else {
@@ -21219,6 +21246,23 @@ pub(crate) fn apply_status_fixes(root: &Path, report: &status::StatusReport) -> 
 
     let cfg = config::Config::load(root)?;
     let scope_ids_needing_fix = status_workspace_scope_ids_needing_fix(report);
+    if scope_ids_needing_fix.contains(config::WORKSPACE_ROOT_SCOPE_ID) {
+        let excluded_roots = scopes
+            .iter()
+            .map(|scope| scope.source_root.clone())
+            .collect::<Vec<_>>();
+        eprintln!("status fix: refreshing workspace root index");
+        run_index_update_excluding(
+            &root.join(".tsift/index.db"),
+            root,
+            "status auto-fix refreshing workspace root index".to_string(),
+            root,
+            None,
+            false,
+            false,
+            &excluded_roots,
+        )?;
+    }
     for scope in scopes {
         if !scope_ids_needing_fix.contains(scope.id.as_str()) {
             continue;
@@ -21271,6 +21315,22 @@ pub(crate) fn autoindex_missing_workspace_scopes(
         .iter()
         .map(|scope| scope.scope.as_str())
         .collect::<std::collections::HashSet<_>>();
+    if missing_scope_ids.contains(config::WORKSPACE_ROOT_SCOPE_ID) {
+        let excluded_roots = config::Config::submodule_dirs(root)?
+            .into_iter()
+            .map(|scope| scope.source_root)
+            .collect::<Vec<_>>();
+        run_index_update_excluding(
+            &root.join(".tsift/index.db"),
+            root,
+            "autoindexing missing workspace root during status".to_string(),
+            root,
+            None,
+            false,
+            false,
+            &excluded_roots,
+        )?;
+    }
     let cfg = config::Config::load(root)?;
     for scope in config::Config::submodule_dirs(root)? {
         if !missing_scope_ids.contains(scope.id.as_str()) || !scope.source_root.exists() {
@@ -21349,14 +21409,37 @@ pub(crate) fn run_index_update(
     rebuild: bool,
     prune: bool,
 ) -> Result<index::IndexSummary> {
+    run_index_update_excluding(
+        db_path,
+        source_root,
+        action,
+        root,
+        scope,
+        rebuild,
+        prune,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_index_update_excluding(
+    db_path: &std::path::Path,
+    source_root: &std::path::Path,
+    action: String,
+    root: &std::path::Path,
+    scope: Option<&str>,
+    rebuild: bool,
+    prune: bool,
+    excluded_roots: &[PathBuf],
+) -> Result<index::IndexSummary> {
     let result = (|| {
         let db = index::IndexDb::open(db_path)?;
         if rebuild {
-            db.rebuild(source_root)
+            db.rebuild_excluding(source_root, excluded_roots)
         } else if prune {
-            db.apply_changes_pruned(source_root)
+            db.apply_changes_pruned_excluding(source_root, excluded_roots)
         } else {
-            db.apply_changes(source_root)
+            db.apply_changes_excluding(source_root, excluded_roots)
         }
     })();
 
@@ -21546,8 +21629,33 @@ struct SearchIndexTarget {
     label: String,
     db_path: PathBuf,
     source_root: PathBuf,
+    excluded_roots: Vec<PathBuf>,
     scope_name: Option<String>,
     reindex_cmd: String,
+}
+
+fn workspace_root_index_target(root: &Path) -> Result<SearchIndexTarget> {
+    let excluded_roots = config::Config::submodule_dirs(root)?
+        .into_iter()
+        .map(|scope| scope.source_root)
+        .collect::<Vec<_>>();
+    let is_workspace = !excluded_roots.is_empty();
+    Ok(SearchIndexTarget {
+        label: if is_workspace {
+            format!("workspace `{}` index", config::WORKSPACE_ROOT_SCOPE_ID)
+        } else {
+            "index".to_string()
+        },
+        db_path: root.join(".tsift/index.db"),
+        source_root: root.to_path_buf(),
+        excluded_roots,
+        scope_name: None,
+        reindex_cmd: if is_workspace {
+            format!("tsift index --workspace {}", root.display())
+        } else {
+            format!("tsift index {}", root.display())
+        },
+    })
 }
 
 fn cargo_package_index_target(
@@ -21558,6 +21666,7 @@ fn cargo_package_index_target(
         label: format!("cargo package `{}` index", package.scope_id),
         db_path: multiplicity::cargo_package_db_path(root, &package.scope_id),
         source_root: package.package_root.clone(),
+        excluded_roots: Vec::new(),
         scope_name: Some(package.scope_id.clone()),
         reindex_cmd: format!(
             "tsift index --submodule {} {}",
@@ -21593,9 +21702,6 @@ pub(crate) fn should_auto_federate(
     if federated || scope.is_some() {
         return Ok(false);
     }
-    if root.join(".tsift/index.db").exists() {
-        return Ok(false);
-    }
     if config::Config::infer_submodule_from_path(root, path_hint)?.is_some() {
         return Ok(false);
     }
@@ -21603,6 +21709,9 @@ pub(crate) fn should_auto_federate(
         return Ok(false);
     }
     if infer_agent_doc_task_submodule(root, path_hint)?.is_some() {
+        return Ok(false);
+    }
+    if path_hint != root {
         return Ok(false);
     }
     Ok(!config::Config::submodule_dirs(root)?.is_empty())
@@ -21616,12 +21725,16 @@ fn resolve_search_index_targets(
 ) -> Result<Vec<SearchIndexTarget>> {
     let federated = federated || should_auto_federate(root, path_hint, scope, federated)?;
     if let Some(scope_name) = scope {
+        if scope_name == config::WORKSPACE_ROOT_SCOPE_ID {
+            return Ok(vec![workspace_root_index_target(root)?]);
+        }
         if let Some(scope) = config::Config::find_submodule(root, scope_name)? {
             let cfg = config::Config::load(root)?;
             return Ok(vec![SearchIndexTarget {
                 label: format!("submodule `{}` index", scope.id),
                 db_path: cfg.db_path_for(root, &scope.id),
                 source_root: scope.source_root.clone(),
+                excluded_roots: Vec::new(),
                 scope_name: Some(scope.id.clone()),
                 reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
             }]);
@@ -21635,7 +21748,7 @@ fn resolve_search_index_targets(
     if federated {
         let cfg = config::Config::load(root)?;
         let scopes = config::Config::submodule_dirs(root)?;
-        let mut targets = Vec::new();
+        let mut targets = vec![workspace_root_index_target(root)?];
         for scope in &scopes {
             if !cfg.federation_for_scope(scope) {
                 continue;
@@ -21644,23 +21757,10 @@ fn resolve_search_index_targets(
                 label: format!("submodule `{}` index", scope.id),
                 db_path: cfg.db_path_for(root, &scope.id),
                 source_root: scope.source_root.clone(),
+                excluded_roots: Vec::new(),
                 scope_name: Some(scope.id.clone()),
                 reindex_cmd: format!("tsift index --workspace {}", root.display()),
             });
-        }
-        // #wsfed: federation is now the workspace-root default, so a workspace
-        // whose every scope opts out of federation is the only remaining way to
-        // reach zero targets. Say so instead of returning silent empty results.
-        if targets.is_empty() && !scopes.is_empty() {
-            bail!(
-                "workspace root {} has no federated scopes to search: every scope opts out of federation. Pass `--scope <scope>` to search one directly. Available scopes: {}.",
-                root.display(),
-                scopes
-                    .iter()
-                    .map(|scope| scope.id.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            );
         }
         return Ok(targets);
     }
@@ -21671,6 +21771,7 @@ fn resolve_search_index_targets(
             label: format!("submodule `{}` index", scope.id),
             db_path: cfg.db_path_for(root, &scope.id),
             source_root: scope.source_root.clone(),
+            excluded_roots: Vec::new(),
             scope_name: Some(scope.id.clone()),
             reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
         }]);
@@ -21686,48 +21787,13 @@ fn resolve_search_index_targets(
             label: format!("submodule `{}` index", scope.id),
             db_path: cfg.db_path_for(root, &scope.id),
             source_root: scope.source_root.clone(),
+            excluded_roots: Vec::new(),
             scope_name: Some(scope.id.clone()),
             reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
         }]);
     }
 
-    let scopes = config::Config::submodule_dirs(root)?;
-    if !scopes.is_empty() {
-        let root_db = root.join(".tsift/index.db");
-        if !root_db.exists() {
-            let available_scopes = scopes
-                .iter()
-                .map(|scope| scope.id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let cfg = config::Config::load(root)?;
-            let indexed_scopes = scopes
-                .iter()
-                .filter(|scope| cfg.db_path_for(root, &scope.id).exists())
-                .map(|scope| scope.id.as_str())
-                .collect::<Vec<_>>();
-            let indexed_label = if indexed_scopes.is_empty() {
-                "none".to_string()
-            } else {
-                indexed_scopes.join(", ")
-            };
-            bail!(
-                "workspace root {} has no shared root index at {}. Default search requires `--scope <scope>` or `--federated` when the workspace uses scoped `.tsift/indexes/*/index.db` files. Available scopes: {}. Indexed scopes: {}.",
-                root.display(),
-                root_db.display(),
-                available_scopes,
-                indexed_label,
-            );
-        }
-    }
-
-    Ok(vec![SearchIndexTarget {
-        label: "index".to_string(),
-        db_path: root.join(".tsift/index.db"),
-        source_root: root.to_path_buf(),
-        scope_name: None,
-        reindex_cmd: format!("tsift index {}", root.display()),
-    }])
+    Ok(vec![workspace_root_index_target(root)?])
 }
 
 fn inspect_search_index(target: &SearchIndexTarget) -> Result<SearchIndexState> {
@@ -21735,8 +21801,12 @@ fn inspect_search_index(target: &SearchIndexTarget) -> Result<SearchIndexState> 
         return Ok(SearchIndexState::Missing);
     }
 
-    let inspection =
-        index::IndexDb::inspect_read_only(&target.db_path, &target.source_root, false)?;
+    let inspection = index::IndexDb::inspect_read_only_excluding(
+        &target.db_path,
+        &target.source_root,
+        false,
+        &target.excluded_roots,
+    )?;
     let stale_files =
         inspection.summary.new + inspection.summary.modified + inspection.summary.deleted;
     if stale_files == 0 {
@@ -21826,7 +21896,7 @@ fn apply_search_index_update(
     root: &Path,
     target: &SearchIndexTarget,
 ) -> Result<index::IndexSummary> {
-    run_index_update(
+    run_index_update_excluding(
         &target.db_path,
         &target.source_root,
         format!("autoindexing {}", target.label),
@@ -21834,6 +21904,7 @@ fn apply_search_index_update(
         target.scope_name.as_deref(),
         false,
         false,
+        &target.excluded_roots,
     )
 }
 
@@ -27084,6 +27155,7 @@ fn main() { api::handler(); }
     #[test]
     fn workspace_index_creates_per_submodule_dbs() {
         let dir = setup_workspace();
+        std::fs::write(dir.path().join("root.rs"), "fn root_helper() {}\n").unwrap();
         cmd_index(
             dir.path(),
             false,
@@ -27101,6 +27173,8 @@ fn main() { api::handler(); }
             false,
         )
         .unwrap();
+        let root_db = index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
+        assert_eq!(root_db.file_count().unwrap(), 1);
         assert!(dir.path().join(".tsift/indexes/alpha/index.db").exists());
         assert!(dir.path().join(".tsift/indexes/beta/index.db").exists());
     }
@@ -28522,7 +28596,7 @@ tier = "private"
         );
 
         assert!(result.is_ok());
-        assert!(!dir.path().join(".tsift/index.db").exists());
+        assert!(dir.path().join(".tsift/index.db").exists());
     }
 
     #[test]
@@ -28587,7 +28661,7 @@ tier = "private"
         );
 
         assert!(result.is_ok());
-        assert!(!dir.path().join(".tsift/index.db").exists());
+        assert!(dir.path().join(".tsift/index.db").exists());
     }
 
     #[test]
@@ -28686,12 +28760,23 @@ tier = "private"
     #[test]
     fn status_fix_targets_only_stale_workspace_scopes() {
         let dir = setup_workspace();
-        let cfg = config::Config::load(dir.path()).unwrap();
-        for scope_id in ["alpha", "beta"] {
-            let scope = config::Config::resolve_submodule(dir.path(), scope_id).unwrap();
-            let db = index::IndexDb::open(&cfg.db_path_for(dir.path(), scope_id)).unwrap();
-            db.apply_changes(&scope.source_root).unwrap();
-        }
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            true,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(
@@ -28719,6 +28804,51 @@ tier = "private"
         )
         .unwrap();
 
+        let report = status::check_status(dir.path()).unwrap();
+        assert!(matches!(report.index, status::IndexStatus::Fresh { .. }));
+    }
+
+    #[test]
+    fn status_fix_refreshes_stale_workspace_root_scope() {
+        let dir = setup_workspace();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            true,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("root.rs"), "fn root_helper() {}\n").unwrap();
+
+        let report = status::check_status(dir.path()).unwrap();
+        assert_eq!(
+            status_workspace_scope_ids_needing_fix(&report),
+            std::collections::HashSet::from([config::WORKSPACE_ROOT_SCOPE_ID])
+        );
+        cmd_status(
+            dir.path(),
+            StatusCommandOptions {
+                fix: false,
+                no_fix: false,
+                fix_instructions: false,
+                json_output: true,
+                compact: false,
+                pretty: false,
+                terse: false,
+                schema: false,
+            },
+        )
+        .unwrap();
         let report = status::check_status(dir.path()).unwrap();
         assert!(matches!(report.index, status::IndexStatus::Fresh { .. }));
     }
@@ -29115,7 +29245,7 @@ tier = "private"
         )
         .expect("the lexical strategy must federate the same way `exact` already did");
 
-        assert!(!dir.path().join(".tsift/index.db").exists());
+        assert!(dir.path().join(".tsift/index.db").exists());
     }
 
     #[test]
@@ -29454,6 +29584,7 @@ tier = "private"
             label: "index".to_string(),
             db_path,
             source_root: dir.path().to_path_buf(),
+            excluded_roots: Vec::new(),
             scope_name: None,
             reindex_cmd: format!("tsift index {}", dir.path().display()),
         };
@@ -34875,6 +35006,15 @@ pub(crate) fn federated_sift_search(
             fts_index_fresh,
         )?;
         absolutize_search_hit_paths(&mut response, &target.source_root);
+        if !target.excluded_roots.is_empty() {
+            response.hits.retain(|hit| {
+                let path = Path::new(&hit.path);
+                !target
+                    .excluded_roots
+                    .iter()
+                    .any(|excluded| path.starts_with(excluded))
+            });
+        }
         response.root = root.display().to_string();
         responses.push(response);
     }
@@ -34896,25 +35036,19 @@ pub(crate) fn federated_symbol_search(
     include_markdown: bool,
     tagpath_opts: &TagpathSearchOpts,
 ) -> Result<(Vec<index::SymbolHit>, TagpathAnnotationDiagnostic)> {
-    let cfg = config::Config::load(root)?;
-    let submodules = config::Config::submodule_dirs(root)?;
     let mut all_hits: Vec<index::SymbolHit> = Vec::new();
     let mut combined = TagpathAnnotationDiagnostic::default();
-    for scope in &submodules {
-        if !cfg.federation_for_scope(scope) {
+    for target in resolve_search_index_targets(root, root, None, true)? {
+        if !target.db_path.exists() {
             continue;
         }
-        let db_path = cfg.db_path_for(root, &scope.id);
-        if !db_path.exists() {
-            continue;
-        }
-        let db = index::IndexDb::open_read_only(&db_path)?;
+        let db = index::IndexDb::open_read_only(&target.db_path)?;
         let mut hits = if include_markdown {
             db.symbol_search(query, limit)?
         } else {
             db.code_symbol_search(query, limit)?
         };
-        let diag = annotate_hits_with_tagpath(&mut hits, &scope.source_root, tagpath_opts)?;
+        let diag = annotate_hits_with_tagpath(&mut hits, &target.source_root, tagpath_opts)?;
         combined.loaded |= diag.loaded;
         if diag.stale && !combined.stale {
             combined.stale = true;
@@ -34959,19 +35093,24 @@ pub(crate) fn federated_exact_search(
     limit: usize,
     timeout_secs: u64,
 ) -> Result<sift::SearchResponse> {
-    let cfg = config::Config::load(root)?;
     let mut responses = Vec::new();
-    for scope in config::Config::submodule_dirs(root)? {
-        if !cfg.federation_for_scope(&scope) {
-            continue;
-        }
+    for target in resolve_search_index_targets(root, root, None, true)? {
         let mut response = run_exact_search_with_timeout(
-            std::slice::from_ref(&scope.source_root),
+            std::slice::from_ref(&target.source_root),
             query,
             limit,
             timeout_secs,
         )?;
-        absolutize_search_hit_paths(&mut response, &scope.source_root);
+        absolutize_search_hit_paths(&mut response, &target.source_root);
+        if !target.excluded_roots.is_empty() {
+            response.hits.retain(|hit| {
+                let path = Path::new(&hit.path);
+                !target
+                    .excluded_roots
+                    .iter()
+                    .any(|excluded| path.starts_with(excluded))
+            });
+        }
         response.root = root.display().to_string();
         responses.push(response);
     }

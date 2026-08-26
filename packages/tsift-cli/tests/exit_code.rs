@@ -6920,7 +6920,7 @@ fn status_autoindexes_missing_workspace_scopes_even_when_root_index_exists_in_js
     fs::write(dir.path().join("src/beta/lib.rs"), "fn beta() {}\n").unwrap();
 
     let output = tsift_bin()
-        .args(["index", dir.path().to_str().unwrap()])
+        .args(["index", "--workspace", dir.path().to_str().unwrap()])
         .output()
         .unwrap();
     assert!(
@@ -6929,20 +6929,7 @@ fn status_autoindexes_missing_workspace_scopes_even_when_root_index_exists_in_js
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let output = tsift_bin()
-        .args([
-            "index",
-            "--submodule",
-            "alpha",
-            dir.path().to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "scoped index stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    fs::remove_file(dir.path().join(".tsift/indexes/beta/index.db")).unwrap();
 
     let output = tsift_bin()
         .args(["status", "--json", dir.path().to_str().unwrap()])
@@ -7020,19 +7007,21 @@ fn workspace_communities_federates_per_scope() {
     let scopes = json["scopes"]
         .as_array()
         .expect("a federated run reports one document per scope");
-    assert_eq!(scopes.len(), 2, "{json}");
+    assert_eq!(scopes.len(), 3, "{json}");
     let ids: Vec<&str> = scopes
         .iter()
         .map(|entry| entry["scope"].as_str().unwrap())
         .collect();
-    assert_eq!(ids, vec!["alpha", "beta"], "{json}");
+    assert_eq!(ids, vec!["<root>", "alpha", "beta"], "{json}");
 
     // Human output labels each scope rather than silently concatenating.
     let human = tsift_bin().args(["communities", root]).output().unwrap();
     assert!(human.status.success());
     let text = String::from_utf8_lossy(&human.stdout);
     assert!(
-        text.contains("scope alpha:") && text.contains("scope beta:"),
+        text.contains("scope <root>:")
+            && text.contains("scope alpha:")
+            && text.contains("scope beta:"),
         "{text}"
     );
 }
@@ -7085,6 +7074,11 @@ fn workspace_path_refuses_endpoints_in_different_scopes() {
 fn workspace_search_federates_by_default_without_shared_root_index() {
     let dir = indexed_workspace_cli_fixture();
     let root = dir.path().to_str().unwrap();
+    fs::write(
+        dir.path().join("root_exact.rs"),
+        "fn root_exact_marker() {}\n",
+    )
+    .unwrap();
 
     // The query shape that used to fail: no underscore, routes past `exact`.
     for query in ["helper", "alpha_helper"] {
@@ -7109,7 +7103,118 @@ fn workspace_search_federates_by_default_without_shared_root_index() {
         rendered.contains("alpha_helper"),
         "federated search must reach the scope that owns the symbol: {rendered}"
     );
-    assert!(!dir.path().join(".tsift/index.db").exists());
+    assert!(dir.path().join(".tsift/index.db").exists());
+
+    let root_owned = tsift_bin()
+        .args([
+            "search",
+            "root_exact_marker",
+            "--exact",
+            "--path",
+            root,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(root_owned.status.success());
+    let rendered = String::from_utf8_lossy(&root_owned.stdout);
+    assert!(rendered.contains("root_exact.rs"), "{rendered}");
+}
+
+#[test]
+fn workspace_symbol_read_federates_without_a_scope_flag() {
+    let dir = indexed_workspace_cli_fixture();
+    let output = tsift_bin()
+        .args([
+            "--envelope",
+            "symbol-read",
+            "alpha_helper",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "symbol-read stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["report"]["symbol"]["name"], "alpha_helper");
+    assert_eq!(json["report"]["symbol"]["file"], "src/alpha/lib.rs");
+}
+
+#[test]
+fn workspace_symbol_read_supports_a_root_owned_file() {
+    let dir = indexed_workspace_cli_fixture();
+    fs::write(
+        dir.path().join("root_owned.rs"),
+        "fn root_owned_helper() {}\n",
+    )
+    .unwrap();
+    let output = tsift_bin()
+        .args([
+            "--envelope",
+            "symbol-read",
+            "root_owned_helper",
+            "--file",
+            "root_owned.rs",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "symbol-read stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["report"]["symbol"]["name"], "root_owned_helper");
+    assert_eq!(json["report"]["symbol"]["file"], "root_owned.rs");
+}
+
+#[test]
+fn workspace_symbol_read_refuses_cross_scope_ambiguity() {
+    let dir = indexed_workspace_cli_fixture();
+    fs::write(
+        dir.path().join("src/alpha/lib.rs"),
+        "fn duplicate_symbol() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("src/beta/lib.rs"),
+        "fn duplicate_symbol() {}\n",
+    )
+    .unwrap();
+    let indexed = tsift_bin()
+        .args(["index", "--workspace", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(indexed.status.success());
+
+    let output = tsift_bin()
+        .args([
+            "symbol-read",
+            "duplicate_symbol",
+            "--federated",
+            "--path",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("ambiguous across workspace scopes"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("alpha") && stderr.contains("beta"),
+        "{stderr}"
+    );
 }
 
 #[test]

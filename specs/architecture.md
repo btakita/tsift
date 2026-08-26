@@ -136,7 +136,10 @@ tsift (root crate — public package shim: lib.rs + graph/lang/resolution/substr
 
 ## Per-Submodule Isolation
 
-Each git submodule gets its own index. Isolation tiers control federation (cross-submodule queries):
+Each git submodule gets its own index. A workspace also gets a filtered root
+index at `.tsift/index.db`, reported as `<root>`, which owns only files outside
+the configured submodule paths. Isolation tiers control federation
+(cross-scope queries):
 
 | Tier | Behavior | Examples |
 |------|----------|----------|
