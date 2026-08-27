@@ -95,7 +95,7 @@ dilute the percentage. Current terminal failures are also reported separately
 and removed from the automatic re-extraction recommendation.
 
 Extraction candidates ignore one leading UTF-8 byte-order mark before testing
-for ASCII whitespace. Empty, whitespace-only, BOM-only, and BOM-plus-whitespace
+for Unicode whitespace. Empty, whitespace-only, BOM-only, and BOM-plus-whitespace
 files are skipped before backend selection and therefore never consume a model
 round trip.
 
@@ -109,6 +109,8 @@ Default behavior:
 
 - `tsift index --workspace` writes a filtered `.tsift/index.db` for files owned by the workspace root alongside the per-submodule databases. Status and federated queries report that database as `<root>`; submodule paths are excluded from it so results are neither duplicated nor allowed to bypass isolation tiers.
 - fresh index: search proceeds normally
+- workspace discovery recursively follows initialized or tracked gitlinks declared by nested `.gitmodules` files, including nested workspaces ignored by their parent checkout. Every discovered scope receives its own index, while ancestor indexes exclude descendant scope roots so ownership remains unambiguous.
+- `graph` and `explain` accept both their compatibility positional project path and the emitted `--path <path>` form. An explicit scoped `explain` whose symbol is absent fails non-zero and names the selected scope instead of returning a successful empty report.
 - stale index: search incrementally refreshes the local or scoped index before running
 - missing index: search builds the local or scoped index before running when a concrete index target can be resolved
 

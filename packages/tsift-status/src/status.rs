@@ -521,6 +521,7 @@ fn check_workspace_index(root: &Path, cache: &StatusCheckCache) -> Result<IndexS
         });
     }
 
+    let all_workspace_scopes = workspace_scopes.clone();
     for scope in workspace_scopes {
         let db_path = cfg.db_path_for(root, &scope.id);
         if !scope.source_root.exists() || !db_path.exists() {
@@ -538,7 +539,24 @@ fn check_workspace_index(root: &Path, cache: &StatusCheckCache) -> Result<IndexS
             .and_then(|t| SystemTime::now().duration_since(t).ok())
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let inspection = cache.inspect_read_only(&db_path, &scope.source_root, false)?;
+        let descendant_roots = all_workspace_scopes
+            .iter()
+            .filter(|candidate| {
+                candidate.source_root != scope.source_root
+                    && candidate.source_root.starts_with(&scope.source_root)
+            })
+            .map(|candidate| candidate.source_root.clone())
+            .collect::<Vec<_>>();
+        let inspection = if descendant_roots.is_empty() {
+            cache.inspect_read_only(&db_path, &scope.source_root, false)?
+        } else {
+            IndexDb::inspect_read_only_excluding(
+                &db_path,
+                &scope.source_root,
+                false,
+                &descendant_roots,
+            )?
+        };
         let stale_files =
             inspection.summary.new + inspection.summary.modified + inspection.summary.deleted;
         scopes.push(WorkspaceScopeStatus {

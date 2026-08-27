@@ -849,6 +849,7 @@ pub fn run() -> Result<()> {
         Some(Commands::Graph {
             symbol,
             path,
+            path_flag,
             callers,
             callees,
             scope,
@@ -857,26 +858,29 @@ pub fn run() -> Result<()> {
             json,
             no_tagpath,
             tagpath_strict,
-        }) => cmd_graph(
-            &symbol,
-            &path,
-            callers,
-            callees,
-            scope.as_deref(),
-            federated,
-            limit,
-            json || terse || schema || envelope,
-            compact,
-            pretty,
-            terse,
-            absolute,
-            tabular,
-            schema,
-            TagpathSearchOpts {
-                no_tagpath,
-                strict: tagpath_strict,
-            },
-        ),
+        }) => {
+            let path = path_flag.as_deref().unwrap_or(&path);
+            cmd_graph(
+                &symbol,
+                path,
+                callers,
+                callees,
+                scope.as_deref(),
+                federated,
+                limit,
+                json || terse || schema || envelope,
+                compact,
+                pretty,
+                terse,
+                absolute,
+                tabular,
+                schema,
+                TagpathSearchOpts {
+                    no_tagpath,
+                    strict: tagpath_strict,
+                },
+            )
+        }
         Some(Commands::Sql {
             db,
             query,
@@ -967,6 +971,7 @@ pub fn run() -> Result<()> {
         Some(Commands::Explain {
             symbol,
             path,
+            path_flag,
             scope,
             federated,
             limit,
@@ -976,27 +981,30 @@ pub fn run() -> Result<()> {
             budget,
             no_tagpath,
             tagpath_strict,
-        }) => cmd_explain_with_budget(
-            &symbol,
-            &path,
-            scope.as_deref(),
-            federated,
-            limit,
-            json || terse || schema || envelope,
-            compact,
-            pretty,
-            terse,
-            ultra_terse,
-            absolute,
-            tabular,
-            schema,
-            envelope,
-            ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
-            TagpathSearchOpts {
-                no_tagpath,
-                strict: tagpath_strict,
-            },
-        ),
+        }) => {
+            let path = path_flag.as_deref().unwrap_or(&path);
+            cmd_explain_with_budget(
+                &symbol,
+                path,
+                scope.as_deref(),
+                federated,
+                limit,
+                json || terse || schema || envelope,
+                compact,
+                pretty,
+                terse,
+                ultra_terse,
+                absolute,
+                tabular,
+                schema,
+                envelope,
+                ResponseBudget::from_cli(max_items, max_bytes, budget, envelope),
+                TagpathSearchOpts {
+                    no_tagpath,
+                    strict: tagpath_strict,
+                },
+            )
+        }
         Some(Commands::Traverse {
             node,
             to,
@@ -4403,6 +4411,7 @@ fn insert_semantic_edge(
 
 fn append_summary_semantic_projection_rows(
     root: &Path,
+    scope: Option<&str>,
     graph: &TraversalGraphBuild,
     provenance: &GraphProvenance,
     nodes: &mut Vec<SubstrateGraphNode>,
@@ -4447,6 +4456,12 @@ fn append_summary_semantic_projection_rows(
     for summary in &summaries {
         let source_handles =
             summary_source_handles(summary, &file_node_by_path, &symbol_node_by_file_label);
+        // A scoped graph projection must not attach the workspace-wide semantic
+        // tier to one scope's code tier. Only summaries anchored to a node in
+        // this scope belong in the scoped projection.
+        if scope.is_some() && source_handles.is_empty() {
+            continue;
+        }
         let mut entity_ids_by_name = BTreeMap::<String, String>::new();
 
         if let Some(entities) = &summary.entities {
@@ -4586,7 +4601,10 @@ fn append_summary_semantic_projection_rows(
         }
     }
 
-    for node in semantic_nodes.into_values() {
+    for mut node in semantic_nodes.into_values() {
+        if let Some(scope) = scope {
+            node = node.with_property("scope", scope);
+        }
         nodes.push(node_with_content_freshness(node)?);
     }
     for edge in semantic_edges.into_values() {
@@ -4653,6 +4671,11 @@ fn traversal_projection_from_graph(
         for (key, value) in &node.properties {
             projected = projected.with_property(key.clone(), value.clone());
         }
+        if let Some(scope) = scope
+            && matches!(node.kind.as_str(), "file" | "symbol" | "ast_span" | "route")
+        {
+            projected = projected.with_property("scope", scope);
+        }
         nodes.push(node_with_content_freshness(projected)?);
     }
 
@@ -4669,7 +4692,14 @@ fn traversal_projection_from_graph(
     }
 
     append_traversal_context_projection_rows(root, graph, &provenance, &mut nodes, &mut edges)?;
-    append_summary_semantic_projection_rows(root, graph, &provenance, &mut nodes, &mut edges)?;
+    append_summary_semantic_projection_rows(
+        root,
+        scope,
+        graph,
+        &provenance,
+        &mut nodes,
+        &mut edges,
+    )?;
     append_tsift_memory_graph_projection_rows(root, &mut nodes, &mut edges)?;
 
     let projection_hash = projection_content_hash(&nodes, &edges)?;
@@ -7115,8 +7145,20 @@ pub(crate) fn graph_db_compaction_policy(
         .file_size_bytes
         .zip(counts.freelist_bytes)
         .is_some_and(|(file_size, freelist)| freelist > 0 && freelist >= file_size / 20);
+    let bytes_per_live_row = counts
+        .file_size_bytes
+        .map(|file_size| file_size / u64::try_from(live_rows.max(1)).unwrap_or(u64::MAX));
+    let large_projection = counts.file_size_bytes.is_some_and(|file_size| {
+        file_size >= 256 * 1024 * 1024 && bytes_per_live_row.is_some_and(|bytes| bytes >= 1024)
+    });
     let status = if tombstone_heavy || freelist_heavy {
         "recommended"
+    } else if large_projection {
+        // VACUUM cannot help when the freelist is empty, but calling a
+        // hundreds-of-megabytes projection "not_needed" hides a meaningful
+        // storage cost. Report it distinctly so status/doctor users can
+        // inspect projection breadth and per-row property density.
+        "large_projection"
     } else {
         "not_needed"
     }
@@ -7144,6 +7186,10 @@ pub(crate) fn graph_db_compaction_policy(
             "graph.db file_size={} byte(s), freelist={} byte(s)",
             counts.file_size_bytes.unwrap_or(0),
             counts.freelist_bytes.unwrap_or(0)
+        ),
+        format!(
+            "graph.db bytes_per_live_row={} byte(s)",
+            bytes_per_live_row.unwrap_or(0)
         ),
     ];
     GraphDbCompactionPolicy {
@@ -10615,6 +10661,23 @@ pub(crate) fn graph_db_report_from_store(
     Ok(report)
 }
 
+fn print_graph_db_node_human(node: &SubstrateTerseGraphNode) {
+    println!("node: {} [{}] {}", node.id, node.kind, node.label);
+    if let Some(path) = node.properties.get("path") {
+        if let Some(line) = node.properties.get("line") {
+            println!("  location: {path}:{line}");
+        } else {
+            println!("  location: {path}");
+        }
+    }
+    if let Some(scope) = node.properties.get("scope") {
+        println!("  scope: {scope}");
+    }
+    if let Some(detail) = node.properties.get("detail") {
+        println!("  detail: {detail}");
+    }
+}
+
 pub(crate) fn print_graph_db_human(report: &GraphDbReport, compact: bool) {
     if compact {
         println!(
@@ -10650,7 +10713,7 @@ pub(crate) fn print_graph_db_human(report: &GraphDbReport, compact: bool) {
         );
     }
     if let Some(node) = &report.node {
-        println!("node: {} [{}] {}", node.id, node.kind, node.label);
+        print_graph_db_node_human(node);
     }
     if let Some(edge) = &report.edge {
         let edge_full: SubstrateGraphEdge = edge.into();
@@ -10675,7 +10738,7 @@ pub(crate) fn print_graph_db_human(report: &GraphDbReport, compact: bool) {
         );
     }
     for node in &report.nodes {
-        println!("node: {} [{}] {}", node.id, node.kind, node.label);
+        print_graph_db_node_human(node);
     }
     for edge in &report.edges {
         let edge_full: SubstrateGraphEdge = edge.into();
@@ -12785,7 +12848,8 @@ fn traversal_raw_source_file_node(root: &Path, file: &str) -> TraversalNode {
 
 fn traversal_symbol_node(root: &Path, symbol: &index::StoredSymbol) -> TraversalNode {
     let file = relativize(&symbol.file, root);
-    let key = format!("symbol:{file}:{}:{}", symbol.line, symbol.name);
+    let line = symbol.line.saturating_add(1);
+    let key = format!("symbol:{file}:{line}:{}", symbol.name);
     let handle = stable_handle("gsym", &key);
     TraversalNode {
         handle: handle.clone(),
@@ -12793,7 +12857,7 @@ fn traversal_symbol_node(root: &Path, symbol: &index::StoredSymbol) -> Traversal
         label: symbol.name.clone(),
         ref_id: Some(symbol.name.clone()),
         path: Some(file),
-        line: Some(symbol.line),
+        line: Some(line),
         detail: Some(format!("{} {}", symbol.language, symbol.kind)),
         properties: BTreeMap::new(),
         expand: traversal_expand_command(root, &handle),
@@ -12927,10 +12991,8 @@ fn traversal_unresolved_symbol_node(root: &Path, name: &str) -> TraversalNode {
 fn traversal_route_node(root: &Path, route: &index::StoredRoute) -> TraversalNode {
     let file = relativize(&route.file, root);
     let method = route.method.as_deref().unwrap_or("any");
-    let key = format!(
-        "route:{file}:{}:{}:{}",
-        route.line, method, route.route_path
-    );
+    let line = route.line.saturating_add(1);
+    let key = format!("route:{file}:{}:{}:{}", line, method, route.route_path);
     let handle = stable_handle("grte", &key);
     TraversalNode {
         handle: handle.clone(),
@@ -12938,7 +13000,7 @@ fn traversal_route_node(root: &Path, route: &index::StoredRoute) -> TraversalNod
         label: format!("{} {}", method.to_uppercase(), route.route_path),
         ref_id: Some(route.route_path.clone()),
         path: Some(file),
-        line: Some(route.line),
+        line: Some(line),
         detail: Some(format!(
             "{} route handled by {}",
             route.framework, route.handler_name
@@ -33705,6 +33767,24 @@ fn sample() {}
     }
 
     #[test]
+    fn cli_graph_accepts_named_path() {
+        let cli = parse_cli([
+            "tsift",
+            "graph",
+            "main",
+            "--path",
+            "/tmp/project",
+            "--callers",
+        ]);
+        match cli.command {
+            Some(Commands::Graph { path_flag, .. }) => {
+                assert_eq!(path_flag.as_deref(), Some(Path::new("/tmp/project")));
+            }
+            _ => panic!("expected Graph command"),
+        }
+    }
+
+    #[test]
     fn cli_tabular_with_communities() {
         let cli = parse_cli(["tsift", "--tabular", "communities"]);
         assert!(cli.tabular);
@@ -33716,6 +33796,17 @@ fn sample() {}
         let cli = parse_cli(["tsift", "--tabular", "explain", "main"]);
         assert!(cli.tabular);
         assert!(matches!(cli.command, Some(Commands::Explain { .. })));
+    }
+
+    #[test]
+    fn cli_explain_accepts_named_path() {
+        let cli = parse_cli(["tsift", "explain", "main", "--path", "/tmp/project"]);
+        match cli.command {
+            Some(Commands::Explain { path_flag, .. }) => {
+                assert_eq!(path_flag.as_deref(), Some(Path::new("/tmp/project")));
+            }
+            _ => panic!("expected Explain command"),
+        }
     }
 
     #[test]
@@ -34886,6 +34977,85 @@ fn sample() {}
         let input = serde_json::json!({"report": {"entries": [{"from_id": "a", "to_id": "b"}]}});
         let result = edge_index_transform(input);
         assert_eq!(result["report"]["entries"][0]["from_id"], "a");
+    }
+
+    #[test]
+    fn traversal_projection_normalizes_index_lines_to_one_based() {
+        let root = Path::new("/repo");
+        let symbol = index::StoredSymbol {
+            name: "alpha".to_string(),
+            kind: "function".to_string(),
+            language: "rust".to_string(),
+            signature: None,
+            file: "/repo/src/lib.rs".to_string(),
+            line: 18,
+            end_line: None,
+            node_kind: None,
+            start_byte: None,
+            end_byte: None,
+            body_start_byte: None,
+            body_end_byte: None,
+            parent_module: None,
+            visibility: None,
+            tags: None,
+            tagpath_handle: None,
+        };
+        let route = index::StoredRoute {
+            framework: "axum".to_string(),
+            method: Some("get".to_string()),
+            route_path: "/health".to_string(),
+            handler_name: "health".to_string(),
+            file: "/repo/src/routes.rs".to_string(),
+            line: 147,
+            handler_line: None,
+        };
+
+        assert_eq!(traversal_symbol_node(root, &symbol).line, Some(19));
+        assert_eq!(traversal_route_node(root, &route).line, Some(148));
+    }
+
+    #[test]
+    fn scoped_traversal_projection_tags_source_nodes_with_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut graph = TraversalGraphBuild::default();
+        let node = traversal_file_node(dir.path(), "src/lib.rs");
+        graph.nodes.insert(node.handle.clone(), node);
+
+        let projection =
+            traversal_projection_from_graph(dir.path(), Some("alpha"), &graph).unwrap();
+        let file = projection
+            .nodes
+            .iter()
+            .find(|node| node.kind == "file")
+            .expect("file projection node");
+        assert_eq!(
+            file.properties.get("scope").map(String::as_str),
+            Some("alpha")
+        );
+    }
+
+    #[test]
+    fn graph_db_compaction_reports_large_dense_projection() {
+        let counts = GraphDbOperatorCounts {
+            nodes: 160_000,
+            edges: 156_000,
+            tombstones: GraphDbTombstoneCounts {
+                nodes: 0,
+                edges: 0,
+                total: 0,
+            },
+            file_size_bytes: Some(593 * 1024 * 1024),
+            freelist_bytes: Some(0),
+        };
+
+        let policy = graph_db_compaction_policy(Path::new("/repo"), None, &counts, false);
+        assert_eq!(policy.status, "large_projection");
+        assert!(
+            policy
+                .proof
+                .iter()
+                .any(|line| line.contains("bytes_per_live_row"))
+        );
     }
 }
 

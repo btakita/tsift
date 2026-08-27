@@ -2498,6 +2498,21 @@ pub(crate) fn cmd_graph_db(
         _ => {}
     }
     let graph_db = graph_substrate_db_path(&root, scope);
+    if matches!(backend, GraphDbBackend::Sqlite)
+        && !matches!(&query, GraphDbQuery::Evidence { .. })
+        && !graph_db.exists()
+    {
+        let refresh = format!(
+            "tsift graph-db --path {}{} refresh --json",
+            shell_quote(root.to_string_lossy().as_ref()),
+            graph_db_scope_arg(scope)
+        );
+        bail!(
+            "graph-db projection is missing for scope `{}` at {}; run `{refresh}` before reading it",
+            scope.unwrap_or("root"),
+            graph_db.display()
+        );
+    }
     let mut warnings = Vec::new();
     if matches!(
         backend,

@@ -977,7 +977,12 @@ fn semantic_edit_stored_symbol_handles(
         (
             stable_handle(
                 "gsym",
-                &format!("symbol:{}:{}:{}", file_display, symbol.line, symbol.name),
+                &format!(
+                    "symbol:{}:{}:{}",
+                    file_display,
+                    symbol.line.saturating_add(1),
+                    symbol.name
+                ),
             ),
             "graph_symbol",
             "graph traversal symbol",

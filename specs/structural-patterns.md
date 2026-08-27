@@ -23,7 +23,7 @@ matching engine for rewrite so search and codemod cannot drift apart.
 
 | Command | Behavior |
 |---------|----------|
-| `tsift ast-grep search <PATTERN>` | Report every non-overlapping match with path, 1-based start/end line and column coordinates, byte range, matched text, and metavariable captures |
+| `tsift ast-grep search <PATTERN>` | Report every non-overlapping match with path, 1-based start/end lines, a 1-based inclusive start column and exclusive end column (`[start, end)` like the byte range), byte range, matched text, and metavariable captures |
 | `tsift ast-grep rewrite <PATTERN> <REWRITE>` | Rewrite matches. **Previews by default**; writes only under `--apply` |
 | `tsift ast-grep languages` | List the grammars compiled into this build |
 

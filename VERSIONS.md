@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **Close scoped graph, recursive workspace, and extraction accounting gaps** ([#21](https://github.com/btakita/tsift/issues/21)). Graph projection lines now use the same one-based coordinates as `explain`; `graph` and `explain` accept emitted `--path` commands; scoped graph reads fail with a refresh remedy, isolate semantic rows, preserve scope provenance, and fail closed for absent symbols; workspace discovery recurses through nested ignored gitlinks; Unicode-only whitespace never incurs extraction usage; human graph nodes expose locations; and oversized dense projections are reported explicitly.
+
 ## 0.1.92
 
 - **Make graph guidance executable and close remaining navigation fidelity gaps** ([#20](https://github.com/btakita/tsift/issues/20)). `graph-db --json` now parses before or after every subcommand, missing graph targets fail closed with actionable diagnostics, root graph projections federate every workspace scope, ast-grep columns are consistently 1-based, unresolved evidence guesses are suppressed, and BOM-only extraction candidates are skipped without a model call.

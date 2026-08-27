@@ -407,6 +407,115 @@ fn graph_db_accepts_trailing_json_and_fails_closed_for_missing_targets() {
     assert!(error.contains("symbol"), "{error}");
 }
 
+#[test]
+fn graph_db_symbol_coordinates_match_explain_and_human_nodes_show_location() {
+    let project = graph_db_project();
+    let root = project.path().to_string_lossy().to_string();
+    let _refresh = graph_db_json(project.path(), Backend::Sqlite, vec!["refresh".to_string()]);
+    let symbols = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec!["kind".to_string(), "symbol".to_string()],
+    );
+    let alpha = symbols["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["label"] == "alpha")
+        .unwrap_or_else(|| panic!("alpha projection node missing: {symbols}"));
+
+    let explain = assert_tsift_json(vec![
+        "explain".to_string(),
+        "alpha".to_string(),
+        "--path".to_string(),
+        root.clone(),
+        "--json".to_string(),
+    ]);
+    let projection_line = alpha["properties"]["line"]
+        .as_str()
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
+    assert_eq!(projection_line, explain["definitions"][0]["line"]);
+
+    let human = run_tsift(vec![
+        "graph-db".to_string(),
+        "--path".to_string(),
+        root,
+        "node".to_string(),
+        alpha["id"].as_str().unwrap().to_string(),
+    ]);
+    assert!(human.status.success());
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        stdout.contains(&format!("location: main.rs:{projection_line}")),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn scoped_graph_projection_excludes_other_scope_semantics_and_tags_provenance() {
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path();
+    fs::write(
+        root.join(".gitmodules"),
+        "[submodule \"src/alpha\"]\npath = src/alpha\nurl = https://example.com/alpha\n\
+         [submodule \"src/beta\"]\npath = src/beta\nurl = https://example.com/beta\n",
+    )
+    .unwrap();
+    fs::create_dir_all(root.join("src/alpha")).unwrap();
+    fs::create_dir_all(root.join("src/beta")).unwrap();
+    fs::write(root.join("src/alpha/lib.rs"), "fn alpha_main() {}\n").unwrap();
+    fs::write(root.join("src/beta/lib.rs"), "fn beta_main() {}\n").unwrap();
+    let index = run_tsift(vec![
+        "index".to_string(),
+        "--workspace".to_string(),
+        root.to_string_lossy().to_string(),
+    ]);
+    assert!(
+        index.status.success(),
+        "workspace index failed: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+    seed_current_semantic_summary(root, "src/alpha/lib.rs", "alpha_main");
+    seed_current_semantic_summary(root, "src/beta/lib.rs", "beta_main");
+
+    let scoped_args = |query: &[&str]| {
+        let mut args = vec![
+            "graph-db".to_string(),
+            "--path".to_string(),
+            root.to_string_lossy().to_string(),
+            "--scope".to_string(),
+            "alpha".to_string(),
+            "--json".to_string(),
+        ];
+        args.extend(query.iter().map(|part| (*part).to_string()));
+        args
+    };
+    let _refresh = assert_tsift_json(scoped_args(&["refresh"]));
+    let entities = assert_tsift_json(scoped_args(&["kind", "semantic_entity"]));
+    let nodes = entities["nodes"].as_array().unwrap();
+    assert!(nodes.iter().any(|node| node["label"] == "alpha_main"));
+    assert!(
+        !nodes.iter().any(|node| node["label"] == "beta_main"),
+        "beta semantic rows leaked into alpha projection: {entities}"
+    );
+    assert!(
+        nodes.iter().all(|node| node["properties"]["scope"] == "alpha"),
+        "scoped semantic nodes need explicit provenance: {entities}"
+    );
+
+    let files = assert_tsift_json(scoped_args(&["kind", "file"]));
+    assert!(
+        files["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|node| node["properties"]["scope"] == "alpha"),
+        "scoped source nodes need explicit provenance: {files}"
+    );
+}
+
 fn current_convex_snapshot(project: &Path) -> Value {
     let report = assert_tsift_json(vec![
         "convex-sync".to_string(),
@@ -4285,7 +4394,8 @@ fn agent_orchestration_acceptance_pack_regenerates_from_real_queue_fixture() {
     };
     assert_eq!(
         expected, &actual,
-        "agent-orchestration acceptance fixture drifted; update fixtures/graph-db-operator-examples/agent-orchestration-acceptance-pack.json regenerated_samples from the live queue fixture output"
+        "agent-orchestration acceptance fixture drifted; update fixtures/graph-db-operator-examples/agent-orchestration-acceptance-pack.json regenerated_samples from the live queue fixture output:\n{}",
+        serde_json::to_string_pretty(&actual).unwrap(),
     );
 }
 
@@ -5073,7 +5183,12 @@ fn graph_db_scale_caps_pagination_paths_doctor_and_sqlite_plans() {
     );
     assert_eq!(neighborhood["page"]["returned_nodes"], 13);
     assert!(neighborhood["page"]["truncated"].as_bool().unwrap());
-    assert!(neighborhood["edges"].as_array().unwrap().len() <= 12);
+    assert!(
+        neighborhood["edges"]
+            .as_array()
+            .map_or(0, |edges| edges.len())
+            <= 12
+    );
     assert_sqlite_page_uses_index(&neighborhood["page"], "idx_graph_edges_from_kind");
     assert_sqlite_page_diagnostic_contains(
         &neighborhood["page"],

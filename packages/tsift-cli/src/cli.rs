@@ -288,6 +288,9 @@ pub enum Commands {
         /// Path to the indexed codebase (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Path to the indexed codebase (named form used by generated commands)
+        #[arg(long = "path", value_name = "PATH")]
+        path_flag: Option<PathBuf>,
         /// Show callers of the symbol
         #[arg(long)]
         callers: bool,
@@ -411,6 +414,9 @@ pub enum Commands {
         /// Path to the indexed codebase (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Path to the indexed codebase (named form used by generated commands)
+        #[arg(long = "path", value_name = "PATH")]
+        path_flag: Option<PathBuf>,
         /// Restrict to a specific submodule
         #[arg(long)]
         scope: Option<String>,

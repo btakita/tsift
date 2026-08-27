@@ -6228,6 +6228,89 @@ fn search_scope_accepts_the_workspace_root_scope() {
 }
 
 #[test]
+fn workspace_index_federates_nested_ignored_submodule_scopes() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("src/parent");
+    let nested = parent.join("vendor/nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(
+        dir.path().join(".gitmodules"),
+        "[submodule \"src/parent\"]\npath = src/parent\nurl = https://example.com/parent\n",
+    )
+    .unwrap();
+    fs::write(
+        parent.join(".gitmodules"),
+        "[submodule \"vendor/nested\"]\npath = vendor/nested\nurl = https://example.com/nested\n",
+    )
+    .unwrap();
+    fs::write(parent.join(".gitignore"), "vendor/nested\n").unwrap();
+    fs::write(parent.join("lib.rs"), "fn parent_only() {}\n").unwrap();
+    fs::write(nested.join("lib.rs"), "fn nested_only() {}\n").unwrap();
+
+    let index = tsift_bin()
+        .args(["index", "--workspace", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        index.status.success(),
+        "workspace index stderr: {}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+
+    let search = tsift_bin()
+        .args([
+            "search",
+            "nested_only",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--scope",
+            "nested",
+            "--strategy",
+            "lexical",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "federated search stderr: {}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    let nested_symbol = json["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|symbol| symbol["name"] == "nested_only")
+        .unwrap_or_else(|| panic!("nested symbol missing from federated search: {json}"));
+    assert!(nested_symbol["file"].as_str().unwrap().ends_with("vendor/nested/lib.rs"));
+
+    let explain = tsift_bin()
+        .args([
+            "explain",
+            "nested_only",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        explain.status.success(),
+        "root-level explain must federate the nested scope: {}",
+        String::from_utf8_lossy(&explain.stderr)
+    );
+    let explain_json: serde_json::Value = serde_json::from_slice(&explain.stdout).unwrap();
+    assert!(
+        explain_json["definitions"][0]["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("vendor/nested/lib.rs"),
+        "{explain_json}"
+    );
+}
+
+#[test]
 fn summarize_cached_too_large_failure_recommends_a_larger_token_limit() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -7555,6 +7638,7 @@ fn init_workspace_skips_scopes_that_opt_out_of_instructions() {
 #[test]
 fn workspace_explain_and_graph_resolve_the_owning_scope_without_a_flag() {
     let dir = indexed_workspace_cli_fixture();
+    let root = dir.path().to_str().unwrap();
 
     let search = tsift_bin()
         .current_dir(dir.path())
@@ -7574,7 +7658,7 @@ fn workspace_explain_and_graph_resolve_the_owning_scope_without_a_flag() {
 
     let explain = tsift_bin()
         .current_dir(dir.path())
-        .args(["explain", "alpha_helper", "--json"])
+        .args(["explain", "alpha_helper", "--path", root, "--json"])
         .output()
         .unwrap();
     assert!(
@@ -7610,7 +7694,14 @@ fn workspace_explain_and_graph_resolve_the_owning_scope_without_a_flag() {
 
     let graph = tsift_bin()
         .current_dir(dir.path())
-        .args(["graph", "alpha_helper", "--callers", "--json"])
+        .args([
+            "graph",
+            "alpha_helper",
+            "--path",
+            root,
+            "--callers",
+            "--json",
+        ])
         .output()
         .unwrap();
     assert!(
@@ -7664,6 +7755,56 @@ fn workspace_explain_names_the_searched_scopes_when_the_symbol_is_absent() {
         stderr.contains("alpha") && stderr.contains("beta"),
         "{stderr}"
     );
+}
+
+#[test]
+fn scoped_explain_fails_when_the_symbol_is_absent() {
+    let dir = indexed_workspace_cli_fixture();
+    let output = tsift_bin()
+        .args([
+            "explain",
+            "no_such_symbol_in_alpha",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--scope",
+            "alpha",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success(), "scoped explain must fail closed");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("symbol `no_such_symbol_in_alpha` was not found in scope `alpha`"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn scoped_graph_db_read_without_projection_reports_refresh_remedy() {
+    let dir = indexed_workspace_cli_fixture();
+    let root = dir.path().to_str().unwrap();
+    let output = tsift_bin()
+        .args([
+            "graph-db",
+            "--path",
+            root,
+            "--scope",
+            "alpha",
+            "node",
+            "missing",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("projection is missing"), "{stderr}");
+    assert!(stderr.contains("tsift graph-db --path"), "{stderr}");
+    assert!(stderr.contains(root), "{stderr}");
+    assert!(stderr.contains("--scope \"alpha\" refresh --json"), "{stderr}");
+    assert!(!stderr.contains("unable to open database file"), "{stderr}");
 }
 
 #[test]

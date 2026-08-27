@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
@@ -327,31 +327,29 @@ pub fn is_extraction_candidate_file(path: &Path) -> bool {
     // Read incrementally so status/candidate discovery does not allocate the
     // whole file just to reject a whitespace-only source. If the read fails,
     // retain it as a candidate so the extraction path reports the I/O error.
-    let Ok(mut file) = File::open(path) else {
+    let Ok(file) = File::open(path) else {
         return true;
     };
-    let mut buffer = [0_u8; 8 * 1024];
-    let mut bom_prefix_len = 0usize;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let mut first_line = true;
     loop {
-        match file.read(&mut buffer) {
-            Ok(0) => return bom_prefix_len > 0 && bom_prefix_len < UTF8_BOM.len(),
-            Ok(read) => {
-                for byte in &buffer[..read] {
-                    if bom_prefix_len < UTF8_BOM.len() {
-                        if *byte == UTF8_BOM[bom_prefix_len] {
-                            bom_prefix_len += 1;
-                            continue;
-                        }
-                        if bom_prefix_len > 0 {
-                            return true;
-                        }
-                        bom_prefix_len = UTF8_BOM.len();
-                    }
-                    if !byte.is_ascii_whitespace() {
-                        return true;
-                    }
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return false,
+            Ok(_) => {
+                let content = if first_line {
+                    first_line = false;
+                    line.strip_prefix('\u{feff}').unwrap_or(&line)
+                } else {
+                    &line
+                };
+                if content.chars().any(|character| !character.is_whitespace()) {
+                    return true;
                 }
             }
+            // Invalid UTF-8 is source content, not a blank file. Preserve it as
+            // a candidate so the extraction path can report the real problem.
             Err(_) => return true,
         }
     }
@@ -361,11 +359,11 @@ const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 
 /// Whether already-read source bytes contain content worth sending to a model.
 pub fn has_extraction_content(content: &[u8]) -> bool {
-    content
-        .strip_prefix(UTF8_BOM)
-        .unwrap_or(content)
-        .iter()
-        .any(|byte| !byte.is_ascii_whitespace())
+    let content = content.strip_prefix(UTF8_BOM).unwrap_or(content);
+    match std::str::from_utf8(content) {
+        Ok(content) => content.chars().any(|character| !character.is_whitespace()),
+        Err(_) => true,
+    }
 }
 
 impl ExtractionClient {
@@ -2615,18 +2613,22 @@ mod tests {
         let whitespace = dir.path().join("whitespace.rs");
         let bom_only = dir.path().join("bom_only.rs");
         let bom_then_whitespace = dir.path().join("bom_then_whitespace.rs");
+        let unicode_whitespace = dir.path().join("unicode_whitespace.rs");
         let nonempty = dir.path().join("nonempty.rs");
         std::fs::write(&empty, "").unwrap();
         std::fs::write(&whitespace, "\n\t  \n").unwrap();
         std::fs::write(&bom_only, UTF8_BOM).unwrap();
         std::fs::write(&bom_then_whitespace, b"\xEF\xBB\xBF\n\t  \n").unwrap();
+        std::fs::write(&unicode_whitespace, "\u{00a0}\n\u{2003}\n").unwrap();
         std::fs::write(&nonempty, "fn main() {}\n").unwrap();
         assert!(!is_extraction_candidate_file(&empty));
         assert!(!is_extraction_candidate_file(&whitespace));
         assert!(!is_extraction_candidate_file(&bom_only));
         assert!(!is_extraction_candidate_file(&bom_then_whitespace));
+        assert!(!is_extraction_candidate_file(&unicode_whitespace));
         assert!(!has_extraction_content(UTF8_BOM));
         assert!(!has_extraction_content(b"\xEF\xBB\xBF\n\t  \n"));
+        assert!(!has_extraction_content("\u{00a0}\n\u{2003}\n".as_bytes()));
         assert!(is_extraction_candidate_file(&nonempty));
     }
 

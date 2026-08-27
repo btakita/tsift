@@ -1093,6 +1093,16 @@ pub(crate) fn cmd_explain_with_budget(
     let mut callers = db.callers_of(symbol)?;
     let mut callees = db.callees_of(symbol)?;
 
+    if scope.is_some() && symbols.is_empty() && callers.is_empty() && callees.is_empty() {
+        let scope_hint = scope
+            .map(|scope| format!(" in scope `{scope}`"))
+            .unwrap_or_default();
+        anyhow::bail!(
+            "symbol `{symbol}` was not found{scope_hint}. Run `tsift index --workspace {}` if the index is stale, or choose another `--scope`.",
+            root.display()
+        );
+    }
+
     // Annotate against absolute paths so the tagpath adapter can resolve
     // each symbol's source file. Relativization happens after annotation.
     let def_diag = annotate_stored_symbols_with_tagpath(&mut symbols, &root, &tagpath_opts)?;

@@ -275,23 +275,19 @@ impl Config {
     /// repository index still owns a `160000` gitlink for it; otherwise the
     /// declaration is stale configuration, not a scope.
     pub fn workspace_discovery(root: &Path) -> Result<WorkspaceDiscovery> {
-        let gitmodules = root.join(".gitmodules");
-        if !gitmodules.exists() {
+        let mut paths = Vec::new();
+        let mut unresolved_paths = Vec::new();
+        let mut seen_paths = HashSet::new();
+        collect_workspace_paths(
+            root,
+            Path::new(""),
+            &mut paths,
+            &mut unresolved_paths,
+            &mut seen_paths,
+        )?;
+        if paths.is_empty() && unresolved_paths.is_empty() {
             return Ok(WorkspaceDiscovery::default());
         }
-        let content =
-            std::fs::read_to_string(&gitmodules).with_context(|| "reading .gitmodules")?;
-        let mut paths = Vec::new();
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if let Some(path_val) = trimmed.strip_prefix("path = ") {
-                paths.push(path_val.trim().to_string());
-            }
-        }
-        let gitlinks = gitlink_paths(root, &paths);
-        let (paths, unresolved_paths): (Vec<_>, Vec<_>) = paths
-            .into_iter()
-            .partition(|path_val| root.join(path_val).is_dir() || gitlinks.contains(path_val));
         let mut alias_counts: HashMap<String, usize> = HashMap::new();
         for path_val in &paths {
             let legacy_name = Path::new(path_val)
@@ -331,6 +327,58 @@ impl Config {
             unresolvable,
         })
     }
+}
+
+/// Discover every initialized nested workspace, not only the root's immediate
+/// `.gitmodules` entries. A nested workspace is its own index/federation scope;
+/// otherwise a parent scope can silently omit an ignored-but-tracked gitlink
+/// while root diagnostics still claim that parent was searched completely.
+fn collect_workspace_paths(
+    root: &Path,
+    base_relative: &Path,
+    paths: &mut Vec<String>,
+    unresolved_paths: &mut Vec<String>,
+    seen_paths: &mut HashSet<String>,
+) -> Result<()> {
+    let source_root = root.join(base_relative);
+    let gitmodules = source_root.join(".gitmodules");
+    if !gitmodules.exists() {
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(&gitmodules)
+        .with_context(|| format!("reading {}", gitmodules.display()))?;
+    let declared = content
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("path = "))
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let gitlinks = gitlink_paths(&source_root, &declared);
+
+    for local_path in declared {
+        let relative = base_relative.join(&local_path);
+        let relative_path = relative.to_string_lossy().replace('\\', "/");
+        if !seen_paths.insert(relative_path.clone()) {
+            continue;
+        }
+        let nested_root = root.join(&relative);
+        if nested_root.is_dir() || gitlinks.contains(&local_path) {
+            paths.push(relative_path);
+            if nested_root.is_dir() {
+                collect_workspace_paths(
+                    root,
+                    &relative,
+                    paths,
+                    unresolved_paths,
+                    seen_paths,
+                )?;
+            }
+        } else {
+            unresolved_paths.push(relative_path);
+        }
+    }
+    Ok(())
 }
 
 fn gitlink_paths(root: &Path, paths: &[String]) -> HashSet<String> {
@@ -678,6 +726,39 @@ url = https://example.com/deploy
 
         assert_eq!(discovery.scopes.len(), 1);
         assert_eq!(discovery.scopes[0].id, "deploy");
+        assert!(discovery.unresolvable.is_empty());
+    }
+
+    #[test]
+    fn workspace_discovery_recurses_into_nested_workspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("src/parent");
+        let nested = parent.join("vendor/nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            dir.path().join(".gitmodules"),
+            "[submodule \"src/parent\"]\npath = src/parent\nurl = https://example.com/parent\n",
+        )
+        .unwrap();
+        fs::write(
+            parent.join(".gitmodules"),
+            "[submodule \"vendor/nested\"]\npath = vendor/nested\nurl = https://example.com/nested\n",
+        )
+        .unwrap();
+        // The parent can ignore a path that Git still owns as a gitlink. The
+        // nested workspace must remain independently discoverable.
+        fs::write(parent.join(".gitignore"), "vendor/nested\n").unwrap();
+
+        let discovery = Config::workspace_discovery(dir.path()).unwrap();
+
+        assert_eq!(
+            discovery
+                .scopes
+                .iter()
+                .map(|scope| (scope.id.as_str(), scope.relative_path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("parent", "src/parent"), ("nested", "src/parent/vendor/nested")]
+        );
         assert!(discovery.unresolvable.is_empty());
     }
 }

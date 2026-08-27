@@ -12,9 +12,13 @@ use std::collections::BTreeMap;
 pub struct StructuralMatch {
     pub start_byte: usize,
     pub end_byte: usize,
-    /// 1-based, matching editor and `file:line:column` conventions.
+    /// 1-based start coordinates, matching editor and
+    /// `file:line:column` conventions.
     pub start_line: usize,
     pub start_column: usize,
+    /// 1-based end line with a 1-based, exclusive end column. The column is
+    /// deliberately half-open so byte and column ranges share the same
+    /// `[start, end)` slicing contract.
     pub end_line: usize,
     pub end_column: usize,
     pub text: String,

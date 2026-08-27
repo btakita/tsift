@@ -30,6 +30,16 @@ struct IndexCommandTarget {
     excluded_roots: Vec<PathBuf>,
 }
 
+fn descendant_scope_roots(scopes: &[config::WorkspaceScope], source_root: &Path) -> Vec<PathBuf> {
+    scopes
+        .iter()
+        .filter(|scope| {
+            scope.source_root != source_root && scope.source_root.starts_with(source_root)
+        })
+        .map(|scope| scope.source_root.clone())
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_index(
     path: &std::path::Path,
@@ -89,12 +99,13 @@ pub(crate) fn cmd_index(
         let targets: Vec<IndexCommandTarget> = if let Some(name) = submodule {
             if let Some(scope) = config::Config::find_submodule(&root, name)? {
                 let db_path = cfg.db_path_for(&root, &scope.id);
+                let scopes = config::Config::submodule_dirs(&root)?;
                 vec![IndexCommandTarget {
                     name: scope.id.clone(),
                     source_root: scope.source_root.clone(),
                     db_path,
+                    excluded_roots: descendant_scope_roots(&scopes, &scope.source_root),
                     workspace_scope: Some(scope),
-                    excluded_roots: Vec::new(),
                 }]
             } else if let Some(package) = multiplicity::find_cargo_package(&root, name)? {
                 let db_path = multiplicity::cargo_package_db_path(&root, &package.scope_id);
@@ -127,14 +138,15 @@ pub(crate) fn cmd_index(
                         .collect(),
                 });
             }
+            let all_scopes = scopes.clone();
             targets.extend(scopes.into_iter().map(|scope| {
                 let db_path = cfg.db_path_for(&root, &scope.id);
                 IndexCommandTarget {
                     name: scope.id.clone(),
                     source_root: scope.source_root.clone(),
                     db_path,
+                    excluded_roots: descendant_scope_roots(&all_scopes, &scope.source_root),
                     workspace_scope: Some(scope),
-                    excluded_roots: Vec::new(),
                 }
             }));
             targets
