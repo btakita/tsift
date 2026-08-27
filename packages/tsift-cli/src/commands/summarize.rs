@@ -125,7 +125,7 @@ pub(crate) fn cmd_summarize(
                     continue;
                 }
             };
-            if content.iter().all(u8::is_ascii_whitespace) {
+            if !summarize::has_extraction_content(&content) {
                 continue;
             }
             let hash = summarize::content_hash(&content);

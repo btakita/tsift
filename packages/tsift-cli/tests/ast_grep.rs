@@ -40,6 +40,7 @@ fn search_reports_every_structural_match_as_json() {
     let first = &report["files"][0]["matches"][0];
     assert_eq!(first["captures"]["A"], "1");
     assert_eq!(first["start_line"], 2);
+    assert_eq!(first["start_column"], 5);
 }
 
 #[test]
@@ -48,7 +49,7 @@ fn search_text_output_cites_file_line_column() {
     let out = run(&["ast-grep", "search", "foo($A)", "--path", root(&dir)]);
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("a.rs:2:4: foo(1)"), "got: {stdout}");
+    assert!(stdout.contains("a.rs:2:5: foo(1)"), "got: {stdout}");
     assert!(stdout.contains("3 match(es)"), "got: {stdout}");
 }
 

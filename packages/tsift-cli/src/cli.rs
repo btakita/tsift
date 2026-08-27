@@ -515,7 +515,7 @@ pub enum Commands {
         #[arg(long)]
         convex_snapshot: Option<PathBuf>,
         /// Output as JSON
-        #[arg(long)]
+        #[arg(long, global = true)]
         json: bool,
         #[command(subcommand)]
         query: GraphDbQuery,

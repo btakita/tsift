@@ -331,20 +331,41 @@ pub fn is_extraction_candidate_file(path: &Path) -> bool {
         return true;
     };
     let mut buffer = [0_u8; 8 * 1024];
+    let mut bom_prefix_len = 0usize;
     loop {
         match file.read(&mut buffer) {
-            Ok(0) => return false,
-            Ok(read)
-                if buffer[..read]
-                    .iter()
-                    .any(|byte| !byte.is_ascii_whitespace()) =>
-            {
-                return true;
+            Ok(0) => return bom_prefix_len > 0 && bom_prefix_len < UTF8_BOM.len(),
+            Ok(read) => {
+                for byte in &buffer[..read] {
+                    if bom_prefix_len < UTF8_BOM.len() {
+                        if *byte == UTF8_BOM[bom_prefix_len] {
+                            bom_prefix_len += 1;
+                            continue;
+                        }
+                        if bom_prefix_len > 0 {
+                            return true;
+                        }
+                        bom_prefix_len = UTF8_BOM.len();
+                    }
+                    if !byte.is_ascii_whitespace() {
+                        return true;
+                    }
+                }
             }
-            Ok(_) => {}
             Err(_) => return true,
         }
     }
+}
+
+const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
+
+/// Whether already-read source bytes contain content worth sending to a model.
+pub fn has_extraction_content(content: &[u8]) -> bool {
+    content
+        .strip_prefix(UTF8_BOM)
+        .unwrap_or(content)
+        .iter()
+        .any(|byte| !byte.is_ascii_whitespace())
 }
 
 impl ExtractionClient {
@@ -2592,12 +2613,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let empty = dir.path().join("empty.rs");
         let whitespace = dir.path().join("whitespace.rs");
+        let bom_only = dir.path().join("bom_only.rs");
+        let bom_then_whitespace = dir.path().join("bom_then_whitespace.rs");
         let nonempty = dir.path().join("nonempty.rs");
         std::fs::write(&empty, "").unwrap();
         std::fs::write(&whitespace, "\n\t  \n").unwrap();
+        std::fs::write(&bom_only, UTF8_BOM).unwrap();
+        std::fs::write(&bom_then_whitespace, b"\xEF\xBB\xBF\n\t  \n").unwrap();
         std::fs::write(&nonempty, "fn main() {}\n").unwrap();
         assert!(!is_extraction_candidate_file(&empty));
         assert!(!is_extraction_candidate_file(&whitespace));
+        assert!(!is_extraction_candidate_file(&bom_only));
+        assert!(!is_extraction_candidate_file(&bom_then_whitespace));
+        assert!(!has_extraction_content(UTF8_BOM));
+        assert!(!has_extraction_content(b"\xEF\xBB\xBF\n\t  \n"));
         assert!(is_extraction_candidate_file(&nonempty));
     }
 

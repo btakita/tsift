@@ -374,6 +374,39 @@ fn graph_db_failure(project: &Path, backend: Backend<'_>, query: Vec<String>) ->
     assert_tsift_failure(graph_db_args(project, backend, query))
 }
 
+#[test]
+fn graph_db_accepts_trailing_json_and_fails_closed_for_missing_targets() {
+    let project = graph_db_project();
+    let root = project.path().to_string_lossy().to_string();
+    let _refresh = assert_tsift_json(vec![
+        "graph-db".to_string(),
+        "--path".to_string(),
+        root,
+        "refresh".to_string(),
+        "--json".to_string(),
+    ]);
+    for query in [
+        vec!["node".to_string(), "gsym-does-not-exist".to_string()],
+        vec!["edge".to_string(), "gedge-does-not-exist".to_string()],
+        vec!["incident".to_string(), "gsym-does-not-exist".to_string()],
+        vec![
+            "neighborhood".to_string(),
+            "gsym-does-not-exist".to_string(),
+        ],
+    ] {
+        let error = graph_db_failure(project.path(), Backend::Sqlite, query);
+        assert!(error.contains("not found"), "{error}");
+    }
+
+    let error = graph_db_failure(
+        project.path(),
+        Backend::Sqlite,
+        vec!["kind".to_string(), "function".to_string()],
+    );
+    assert!(error.contains("available kinds:"), "{error}");
+    assert!(error.contains("symbol"), "{error}");
+}
+
 fn current_convex_snapshot(project: &Path) -> Value {
     let report = assert_tsift_json(vec![
         "convex-sync".to_string(),

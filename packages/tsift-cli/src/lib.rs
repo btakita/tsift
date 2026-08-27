@@ -4162,6 +4162,37 @@ impl TraversalGraphBuild {
             });
         }
     }
+
+    fn mark_code_scope(&mut self, scope: &str) {
+        for node in self.nodes.values_mut() {
+            if matches!(node.kind.as_str(), "file" | "symbol" | "ast_span") {
+                node.properties
+                    .insert("scope".to_string(), scope.to_string());
+            }
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        let TraversalGraphBuild {
+            nodes,
+            edges,
+            warnings,
+            ..
+        } = other;
+        for node in nodes.into_values() {
+            self.add_node(node);
+        }
+        for edge in edges {
+            self.add_edge(
+                &edge.from,
+                &edge.to,
+                &edge.relation,
+                edge.label,
+                edge.weight,
+            );
+        }
+        self.warnings.extend(warnings);
+    }
 }
 
 pub(crate) fn graph_substrate_db_path(root: &Path, scope: Option<&str>) -> PathBuf {
@@ -9632,7 +9663,7 @@ pub(crate) fn sqlite_graph_freshness(
             content_hash: None,
             source_watermark: None,
             diagnostics: vec![
-                "graph projection metadata is missing; rebuild the graph before trusting reads"
+                "graph projection metadata is missing; run `tsift graph-db --json refresh` before trusting reads"
                     .to_string(),
             ],
         });
@@ -9648,6 +9679,11 @@ pub(crate) fn sqlite_graph_freshness(
     }
     if version.content_hash.is_none() {
         diagnostics.push("projection content hash is missing".to_string());
+    }
+    if fail_closed {
+        diagnostics.push(
+            "run `tsift graph-db --json refresh` to rebuild the graph projection".to_string(),
+        );
     }
     Ok(GraphDbFreshnessReport {
         status: if fail_closed { "stale" } else { "current" }.to_string(),
@@ -10418,9 +10454,15 @@ pub(crate) fn graph_db_report_from_store(
         }
         GraphDbQuery::Node { id } => {
             report.node = store.node(&id)?.map(Into::into);
+            if report.node.is_none() {
+                bail!("graph-db node `{id}` not found");
+            }
         }
         GraphDbQuery::Edge { id } => {
             report.edge = store.edge(&id)?.map(Into::into);
+            if report.edge.is_none() {
+                bail!("graph-db edge `{id}` not found");
+            }
         }
         GraphDbQuery::Edges {
             edge_kind,
@@ -10446,6 +10488,9 @@ pub(crate) fn graph_db_report_from_store(
             limit,
             property_filters,
         } => {
+            if store.node(&id)?.is_none() {
+                bail!("graph-db incident node `{id}` not found");
+            }
             let options = graph_db_query_options(cursor, limit, &property_filters)?;
             let paged = store.paged_incident_edges(
                 &id,
@@ -10469,6 +10514,19 @@ pub(crate) fn graph_db_report_from_store(
                 store.paged_nodes_by_kind(&kind, graph_db_query_options_for_store(&options))?;
             report.nodes = paged.nodes.into_iter().map(Into::into).collect();
             report.edges = paged.edges.into_iter().map(Into::into).collect();
+            if report.nodes.is_empty() {
+                let available_kinds = store
+                    .all_nodes()?
+                    .into_iter()
+                    .map(|node| node.kind)
+                    .collect::<BTreeSet<_>>();
+                if !available_kinds.contains(&kind) {
+                    bail!(
+                        "graph-db kind `{kind}` not found; available kinds: {}",
+                        available_kinds.into_iter().collect::<Vec<_>>().join(", ")
+                    );
+                }
+            }
             report.page = Some(graph_db_page_report_from_store(
                 paged.page,
                 options.property_filters,
@@ -10529,6 +10587,8 @@ pub(crate) fn graph_db_report_from_store(
                 if let Some(comparison) = comparison {
                     report.ranked_neighborhood_comparison = Some(comparison);
                 }
+            } else {
+                bail!("graph-db neighborhood node `{id}` not found");
             }
         }
         GraphDbQuery::Path {
@@ -13761,31 +13821,33 @@ pub(crate) fn traversal_source_watermark(
             Ok(targets) => targets,
             Err(_) => return Ok(None),
         };
-        let Some(target) = targets.into_iter().next() else {
+        if targets.is_empty() {
             return Ok(None);
-        };
-        let db = match index::IndexDb::open_read_only_resilient(&target.db_path) {
-            Ok(db) => db,
-            Err(_) => return Ok(None),
-        };
-        parts.push(format!("index_label:{}", target.label));
-        parts.push(format!(
-            "index_scope:{}",
-            target.scope_name.as_deref().unwrap_or("root")
-        ));
-        parts.push(format!(
-            "index_source_root:{}",
-            traversal_watermark_path(root, &target.source_root)
-        ));
-        let mut snapshot_rows = 0usize;
-        for part in db.source_snapshot_parts()? {
-            if traversal_index_snapshot_part_is_generated(root, &target.source_root, &part) {
-                continue;
-            }
-            snapshot_rows += 1;
-            parts.push(format!("index_snapshot:{part}"));
         }
-        parts.push(format!("index_snapshot_rows:{snapshot_rows}"));
+        for target in targets {
+            let db = match index::IndexDb::open_read_only_resilient(&target.db_path) {
+                Ok(db) => db,
+                Err(_) => return Ok(None),
+            };
+            parts.push(format!("index_label:{}", target.label));
+            parts.push(format!(
+                "index_scope:{}",
+                target.scope_name.as_deref().unwrap_or("root")
+            ));
+            parts.push(format!(
+                "index_source_root:{}",
+                traversal_watermark_path(root, &target.source_root)
+            ));
+            let mut snapshot_rows = 0usize;
+            for part in db.source_snapshot_parts()? {
+                if traversal_index_snapshot_part_is_generated(root, &target.source_root, &part) {
+                    continue;
+                }
+                snapshot_rows += 1;
+                parts.push(format!("index_snapshot:{part}"));
+            }
+            parts.push(format!("index_snapshot_rows:{snapshot_rows}"));
+        }
     }
 
     let markdown_files = markdown_files_for_traversal(root, path_hint)?;
@@ -14515,6 +14577,34 @@ fn build_traversal_graph_source_with_options(
     scope: Option<&str>,
     session_only: bool,
 ) -> Result<TraversalGraphBuild> {
+    if scope.is_none() && !session_only && should_auto_federate(root, path_hint, scope, false)? {
+        let config = config::Config::load(root)?;
+        let workspace_scopes = config::Config::submodule_dirs(root)?;
+        if !workspace_scopes.is_empty() {
+            let mut graph = build_traversal_graph_source_with_options(
+                root,
+                path_hint,
+                Some(config::WORKSPACE_ROOT_SCOPE_ID),
+                session_only,
+            )?;
+            graph.mark_code_scope(config::WORKSPACE_ROOT_SCOPE_ID);
+            for workspace_scope in workspace_scopes {
+                if !config.federation_for_scope(&workspace_scope) {
+                    continue;
+                }
+                let mut scoped_graph = build_traversal_graph_source_with_options(
+                    root,
+                    &workspace_scope.source_root,
+                    Some(&workspace_scope.id),
+                    session_only,
+                )?;
+                scoped_graph.mark_code_scope(&workspace_scope.id);
+                graph.merge(scoped_graph);
+            }
+            return Ok(graph);
+        }
+    }
+
     let mut graph = TraversalGraphBuild::default();
     let mut symbol_entries = Vec::new();
     let mut file_entries = Vec::new();
@@ -27282,6 +27372,45 @@ fn main() { api::handler(); }
         assert_eq!(root_db.file_count().unwrap(), 1);
         assert!(dir.path().join(".tsift/indexes/alpha/index.db").exists());
         assert!(dir.path().join(".tsift/indexes/beta/index.db").exists());
+    }
+
+    #[test]
+    fn workspace_graph_projection_federates_root_and_scope_code_nodes() {
+        let dir = setup_workspace();
+        let root = dir.path();
+        std::fs::write(root.join("root.rs"), "fn root_helper() {}\n").unwrap();
+        cmd_index(
+            root, false, false, false, false, false, true, None, false, false, false, false, false,
+            false,
+        )
+        .unwrap();
+
+        let graph = build_traversal_graph_source_with_options(root, root, None, false).unwrap();
+        let file_scopes = graph
+            .nodes
+            .values()
+            .filter(|node| node.kind == "file")
+            .map(|node| {
+                (
+                    node.path.clone().unwrap(),
+                    node.properties.get("scope").cloned().unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            file_scopes.get("root.rs").map(String::as_str),
+            Some("<root>")
+        );
+        assert_eq!(
+            file_scopes.get("src/alpha/lib.rs").map(String::as_str),
+            Some("alpha")
+        );
+        assert_eq!(
+            file_scopes.get("src/beta/lib.rs").map(String::as_str),
+            Some("beta")
+        );
+        assert_eq!(file_scopes.len(), 3);
     }
 
     #[test]

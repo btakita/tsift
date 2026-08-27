@@ -94,6 +94,11 @@ Markdown and other indexed-only formats are reported separately and do not
 dilute the percentage. Current terminal failures are also reported separately
 and removed from the automatic re-extraction recommendation.
 
+Extraction candidates ignore one leading UTF-8 byte-order mark before testing
+for ASCII whitespace. Empty, whitespace-only, BOM-only, and BOM-plus-whitespace
+files are skipped before backend selection and therefore never consume a model
+round trip.
+
 `tsift edit` now stages each rewritten file beside its target and only swaps the batch into place after every edit validates and every staged file is ready. If any later swap fails, tsift restores earlier files before returning an error instead of leaving a partially-written batch behind.
 
 ## Search Stale Precheck + Timeout

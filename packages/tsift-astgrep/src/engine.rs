@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 pub struct StructuralMatch {
     pub start_byte: usize,
     pub end_byte: usize,
-    /// 1-based, matching editor and `file:line` conventions.
+    /// 1-based, matching editor and `file:line:column` conventions.
     pub start_line: usize,
     pub start_column: usize,
     pub end_line: usize,
@@ -96,9 +96,9 @@ fn collect_matches(
             start_byte: range.start,
             end_byte: range.end,
             start_line: start.line() + 1,
-            start_column: start.column(&matched),
+            start_column: start.column(&matched) + 1,
             end_line: end.line() + 1,
-            end_column: end.column(&matched),
+            end_column: end.column(&matched) + 1,
             text: matched.text().to_string(),
             captures,
         });
@@ -156,6 +156,8 @@ mod tests {
         let hits = search_source(SRC, AstGrepLang::Rust, "foo($A)").unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].start_line, 2);
+        assert_eq!(hits[0].start_column, 5);
+        assert_eq!(hits[0].end_column, 11);
         assert_eq!(hits[0].text, "foo(1)");
         assert_eq!(hits[0].captures.get("A").map(String::as_str), Some("1"));
         assert_eq!(hits[1].start_line, 3);

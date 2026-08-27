@@ -1279,6 +1279,13 @@ pub(crate) fn build_context_pack_report_with_profile(
         "context-pack graph freshness, evidence packet ids, and conflict-matrix follow-up commands",
         || context_pack_graph_orchestration(&root, path, &next_context, &exploration),
     )?;
+    // Graph orchestration re-resolves every evidence target against the live
+    // projection and emits commands only for targets that exist. Drop the
+    // session-review guesses so a context pack never recommends a command for
+    // a target its own warnings already declared missing.
+    let resume_commands = resolved_context_pack_resume_commands(
+        review.next_context.next_digest_commands,
+    );
 
     Ok((
         ContextPackReport {
@@ -1296,10 +1303,17 @@ pub(crate) fn build_context_pack_report_with_profile(
             exploration,
             findings,
             graph_orchestration,
-            resume_commands: review.next_context.next_digest_commands,
+            resume_commands,
         },
         phases,
     ))
+}
+
+fn resolved_context_pack_resume_commands(commands: Vec<String>) -> Vec<String> {
+    commands
+        .into_iter()
+        .filter(|command| !(command.contains("graph-db") && command.contains(" evidence ")))
+        .collect()
 }
 
 pub(crate) fn context_pack_status_reminders(root: &Path) -> Vec<String> {
@@ -1856,5 +1870,24 @@ pub(crate) fn print_context_pack_human(report: &ContextPackReport, compact: bool
     println!("Resume commands:");
     for command in &report.resume_commands {
         println!("  - {}", command);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolved_context_pack_resume_commands;
+
+    #[test]
+    fn resume_commands_drop_unresolved_evidence_guesses() {
+        let commands = vec![
+            "tsift status".to_string(),
+            "tsift graph-db evidence missing-target --json".to_string(),
+            "tsift diff-digest".to_string(),
+        ];
+
+        assert_eq!(
+            resolved_context_pack_resume_commands(commands),
+            vec!["tsift status", "tsift diff-digest"]
+        );
     }
 }
