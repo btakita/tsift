@@ -23,6 +23,13 @@ use crate::{
     verify_convex_projection_snapshot,
 };
 
+fn normalize_user_facing_edge_lines(edges: &mut [index::StoredEdge]) {
+    for edge in edges {
+        edge.caller_line = edge.caller_line.saturating_add(1);
+        edge.call_site_line = edge.call_site_line.saturating_add(1);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_graph(
     symbol: &str,
@@ -86,6 +93,7 @@ pub(crate) fn cmd_graph(
             &tagpath_opts,
         )?;
         maybe_emit_stale_diagnostic(&diag);
+        normalize_user_facing_edge_lines(&mut edges);
         if !absolute {
             relativize_edges(&mut edges, &root);
         }
@@ -105,6 +113,7 @@ pub(crate) fn cmd_graph(
             &tagpath_opts,
         )?;
         maybe_emit_stale_diagnostic(&diag);
+        normalize_user_facing_edge_lines(&mut edges);
         if !absolute {
             relativize_edges(&mut edges, &root);
         }
@@ -1110,6 +1119,8 @@ pub(crate) fn cmd_explain_with_budget(
         symbol.line = symbol.line.saturating_add(1);
         symbol.end_line = symbol.end_line.map(|end_line| end_line.saturating_add(1));
     }
+    normalize_user_facing_edge_lines(&mut callers);
+    normalize_user_facing_edge_lines(&mut callees);
     let mut tagpath_stale = def_diag.stale || caller_diag.stale || callee_diag.stale;
     let mut tagpath_stale_reason = def_diag
         .reason

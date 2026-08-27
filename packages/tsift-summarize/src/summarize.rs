@@ -192,6 +192,12 @@ impl CachedExtractionFailure {
             None => true,
         }
     }
+
+    pub fn required_max_file_tokens(&self) -> Option<usize> {
+        (self.kind == ExtractionFailureKind::TooLarge)
+            .then(|| too_large_required_tokens_from_message(&self.message))
+            .flatten()
+    }
 }
 
 #[derive(Debug)]
@@ -308,10 +314,37 @@ pub fn is_extraction_candidate_path(path: &Path) -> bool {
 /// Whether a live file can produce a useful extraction. Empty source files have
 /// no summary to ask a model for and must not consume a request.
 pub fn is_extraction_candidate_file(path: &Path) -> bool {
-    is_extraction_candidate_path(path)
-        && path
-            .metadata()
-            .is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+    if !is_extraction_candidate_path(path) {
+        return false;
+    }
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() == 0 {
+        return false;
+    }
+
+    // Read incrementally so status/candidate discovery does not allocate the
+    // whole file just to reject a whitespace-only source. If the read fails,
+    // retain it as a candidate so the extraction path reports the I/O error.
+    let Ok(mut file) = File::open(path) else {
+        return true;
+    };
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => return false,
+            Ok(read)
+                if buffer[..read]
+                    .iter()
+                    .any(|byte| !byte.is_ascii_whitespace()) =>
+            {
+                return true;
+            }
+            Ok(_) => {}
+            Err(_) => return true,
+        }
+    }
 }
 
 impl ExtractionClient {
@@ -802,6 +835,41 @@ CREATE INDEX IF NOT EXISTS idx_extraction_failures_file
             }
         }
         Ok(current)
+    }
+
+    /// Remove cached failures that can never be retried because their live
+    /// path is missing, unsupported, empty, or whitespace-only.
+    pub fn prune_terminal_failures_for_non_candidates(&self, root: &Path) -> Result<usize> {
+        if !self.has_extraction_failures_table()? {
+            return Ok(0);
+        }
+        let paths = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT DISTINCT file_path FROM extraction_failures ORDER BY file_path")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        let mut pruned = 0;
+        let mut visited = BTreeSet::new();
+        for file_path in paths {
+            let normalized = normalize_summary_file_key_str(&file_path);
+            if !visited.insert(normalized.clone()) {
+                continue;
+            }
+            let is_candidate = Self::stats_live_path(root, &normalized)
+                .is_some_and(|path| is_extraction_candidate_file(&path));
+            if is_candidate {
+                continue;
+            }
+            let legacy = legacy_windows_summary_file_key(&normalized);
+            pruned += self.conn.execute(
+                "DELETE FROM extraction_failures WHERE file_path = ?1 OR file_path = ?2",
+                rusqlite::params![normalized, legacy],
+            )?;
+        }
+        Ok(pruned)
     }
 
     fn has_extraction_failures_table(&self) -> Result<bool> {
@@ -1345,11 +1413,22 @@ fn first_balanced_json_object(text: &str) -> Option<&str> {
     None
 }
 
-fn too_large_limit_from_message(message: &str) -> Option<usize> {
+fn too_large_limits_from_message(message: &str) -> Option<(usize, usize)> {
     let (_, limits) = message.split_once("exceeds max_file_tokens (")?;
     let (limits, _) = limits.split_once(')')?;
-    let (_, failed_limit) = limits.split_once('>')?;
-    failed_limit.trim().parse().ok()
+    let (required, failed_limit) = limits.split_once('>')?;
+    Some((
+        required.trim().parse().ok()?,
+        failed_limit.trim().parse().ok()?,
+    ))
+}
+
+fn too_large_limit_from_message(message: &str) -> Option<usize> {
+    too_large_limits_from_message(message).map(|(_, failed_limit)| failed_limit)
+}
+
+fn too_large_required_tokens_from_message(message: &str) -> Option<usize> {
+    too_large_limits_from_message(message).map(|(required, _)| required)
 }
 
 fn normalize_lookup_path(path: &Path) -> String {
@@ -2221,6 +2300,7 @@ mod tests {
             .unwrap();
         assert!(cached.applies_at_max_file_tokens(8_000));
         assert!(!cached.applies_at_max_file_tokens(12_000));
+        assert_eq!(cached.required_max_file_tokens(), Some(9_291));
 
         db.record_terminal_failure(
             "src/legacy.rs",
@@ -2234,6 +2314,48 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!legacy.applies_at_max_file_tokens(12_000));
+        assert_eq!(legacy.required_max_file_tokens(), Some(9_291));
+    }
+
+    #[test]
+    fn terminal_failures_for_non_candidates_are_pruned() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/empty.rs"), "").unwrap();
+        std::fs::write(root.path().join("src/whitespace.rs"), "\n\t  \n").unwrap();
+        std::fs::write(root.path().join("src/live.rs"), "fn live() {}\n").unwrap();
+        let (_tmp, db) = test_db();
+
+        for path in ["src/empty.rs", "src/whitespace.rs", "src/live.rs"] {
+            db.record_terminal_failure(
+                path,
+                "legacy-content",
+                ExtractionFailureKind::UnparseableResponse,
+                "legacy failure",
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            db.prune_terminal_failures_for_non_candidates(root.path())
+                .unwrap(),
+            2
+        );
+        assert!(
+            db.terminal_failure("src/empty.rs", "legacy-content")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.terminal_failure("src/whitespace.rs", "legacy-content")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.terminal_failure("src/live.rs", "legacy-content")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -2466,13 +2588,16 @@ mod tests {
     }
 
     #[test]
-    fn zero_byte_source_files_are_not_extraction_candidates() {
+    fn empty_and_whitespace_source_files_are_not_extraction_candidates() {
         let dir = tempfile::tempdir().unwrap();
         let empty = dir.path().join("empty.rs");
+        let whitespace = dir.path().join("whitespace.rs");
         let nonempty = dir.path().join("nonempty.rs");
         std::fs::write(&empty, "").unwrap();
+        std::fs::write(&whitespace, "\n\t  \n").unwrap();
         std::fs::write(&nonempty, "fn main() {}\n").unwrap();
         assert!(!is_extraction_candidate_file(&empty));
+        assert!(!is_extraction_candidate_file(&whitespace));
         assert!(is_extraction_candidate_file(&nonempty));
     }
 

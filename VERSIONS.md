@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **Keep navigation output faithful to source and make extraction residue recoverable** ([#19](https://github.com/btakita/tsift/issues/19)). Search and graph coordinates are consistently one-based, shared budget truncation preserves indentation, search accepts the `<root>` scope, cached oversized-file skips recommend a raised token limit, obsolete terminal failures are pruned, and whitespace-only source files are ignored.
+
 ## 0.1.90
 
 - **Restore sound workspace navigation and extraction retries** ([#18](https://github.com/btakita/tsift/issues/18)). Relative workspace-root `explain` / `graph` calls auto-federate again and fail closed on ambiguity; explain definition ranges are one-based. Raising `--max-file-tokens` invalidates cached `too_large` failures (including legacy rows), the CLI names `.tsift/config.toml`, zero-byte sources never reach the model or summary denominator, fenced/prefaced JSON responses parse through the first balanced object, and small filtered `<root>` language gaps are visible in status.

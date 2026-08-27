@@ -979,6 +979,7 @@ fn indexed_workspace_cli_fixture() -> tempfile::TempDir {
     .unwrap();
     fs::create_dir_all(dir.path().join("src/alpha")).unwrap();
     fs::create_dir_all(dir.path().join("src/beta")).unwrap();
+    fs::write(dir.path().join("root.rs"), "fn root_only() {}\n").unwrap();
     fs::write(
         dir.path().join("src/alpha/lib.rs"),
         "fn alpha_helper() {}\nfn alpha_main() { alpha_helper(); }\n",
@@ -2979,6 +2980,10 @@ fn source_read_json_reports_bounded_window_handles_and_expansion_commands() {
     let preview = structured_rows(&json["report"]["preview"]);
     assert_eq!(preview.len(), 8);
     assert!(preview[0]["text"].as_str().unwrap().contains("fn main"));
+    assert_eq!(
+        preview[1]["text"], "    alpha();",
+        "source previews must preserve leading indentation"
+    );
     assert!(
         json["report"]["expand"]["after"]
             .as_str()
@@ -6184,8 +6189,83 @@ fn search_scope_fails_on_unknown_submodule_name() {
         "stderr was: {stderr}"
     );
     assert!(
-        stderr.contains("Available scopes: alpha, beta"),
+        stderr.contains("Available scopes: <root>, alpha, beta"),
         "stderr was: {stderr}"
+    );
+}
+
+#[test]
+fn search_scope_accepts_the_workspace_root_scope() {
+    let dir = indexed_workspace_cli_fixture();
+
+    let output = tsift_bin()
+        .args([
+            "search",
+            "--scope",
+            "<root>",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--json",
+            "root_only",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "root-scoped search stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let root_only = json["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|symbol| symbol["name"] == "root_only")
+        .unwrap_or_else(|| panic!("root symbol missing: {json}"));
+    assert_eq!(root_only["line"], 1);
+    assert_eq!(root_only["end_line"], 1);
+}
+
+#[test]
+fn summarize_cached_too_large_failure_recommends_a_larger_token_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::create_dir_all(dir.path().join(".tsift")).unwrap();
+    fs::write(dir.path().join("src/large.rs"), "x".repeat(100)).unwrap();
+    fs::write(
+        dir.path().join(".tsift/config.toml"),
+        "[summarize]\napi_key_env = \"PATH\"\nmax_file_tokens = 1\n",
+    )
+    .unwrap();
+
+    let first = tsift_bin()
+        .current_dir(dir.path())
+        .args(["summarize", "--extract", "src"])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+
+    fs::write(
+        dir.path().join(".tsift/config.toml"),
+        "[summarize]\napi_key_env = \"TSIFT_TEST_MISSING_API_KEY\"\nmax_file_tokens = 1\n",
+    )
+    .unwrap();
+    let second = tsift_bin()
+        .current_dir(dir.path())
+        .args(["summarize", "--extract", "src"])
+        .output()
+        .unwrap();
+    assert!(second.status.success());
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    assert!(stdout.contains("1 too_large"), "stdout was: {stdout}");
+    assert!(
+        stdout.contains("raise --max-file-tokens to at least"),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        !stdout.contains("use --force to retry"),
+        "raising the limit is the actionable retry path: {stdout}"
     );
 }
 
@@ -7476,6 +7556,22 @@ fn init_workspace_skips_scopes_that_opt_out_of_instructions() {
 fn workspace_explain_and_graph_resolve_the_owning_scope_without_a_flag() {
     let dir = indexed_workspace_cli_fixture();
 
+    let search = tsift_bin()
+        .current_dir(dir.path())
+        .args(["search", "alpha_helper", "--json"])
+        .output()
+        .unwrap();
+    assert!(search.status.success());
+    let search_json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    let search_symbol = search_json["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|symbol| symbol["name"] == "alpha_helper")
+        .unwrap_or_else(|| panic!("search symbol missing: {search_json}"));
+    assert_eq!(search_symbol["line"], 1);
+    assert_eq!(search_symbol["end_line"], 1);
+
     let explain = tsift_bin()
         .current_dir(dir.path())
         .args(["explain", "alpha_helper", "--json"])
@@ -7507,6 +7603,10 @@ fn workspace_explain_and_graph_resolve_the_owning_scope_without_a_flag() {
         explain_json["definitions"][0]["line"], symbol_read_json["report"]["symbol"]["line"],
         "explain and symbol-read must agree on the definition start line"
     );
+    assert_eq!(
+        search_symbol["line"], explain_json["definitions"][0]["line"],
+        "search and explain must agree on one-based definition lines"
+    );
 
     let graph = tsift_bin()
         .current_dir(dir.path())
@@ -7523,6 +7623,14 @@ fn workspace_explain_and_graph_resolve_the_owning_scope_without_a_flag() {
         graph_json.to_string().contains("alpha_main"),
         "the caller lives in the resolved scope: {graph_json}"
     );
+    let alpha_main = graph_json["callers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|edge| edge["caller_name"] == "alpha_main")
+        .unwrap_or_else(|| panic!("caller missing: {graph_json}"));
+    assert_eq!(alpha_main["caller_line"], 2);
+    assert_eq!(alpha_main["call_site_line"], 2);
 
     // The explicit flag is accepted too, and both commands advertise it.
     for command in ["explain", "graph"] {

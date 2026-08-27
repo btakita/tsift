@@ -622,9 +622,8 @@ pub(crate) fn cmd_search_with_budget(
             };
             (hits, scope.source_root.clone(), None)
         } else if let Some(ref scope_name) = scope {
-            let cfg = config::Config::load(&root)?;
-            let scope = config::Config::resolve_submodule(&root, scope_name)?;
-            let db_path = cfg.db_path_for(&root, &scope.id);
+            let target = crate::resolve_query_index_target(&root, &base_path, Some(scope_name))?;
+            let db_path = target.db_path;
             let hits = if db_path.exists() {
                 let db = index::IndexDb::open_read_only_resilient(&db_path)?;
                 if include_markdown_symbols {
@@ -635,7 +634,7 @@ pub(crate) fn cmd_search_with_budget(
             } else {
                 Vec::new()
             };
-            (hits, scope.source_root, None)
+            (hits, target.source_root, None)
         } else if federated {
             let (hits, diag) = federated_symbol_search(
                 &root,
@@ -661,6 +660,13 @@ pub(crate) fn cmd_search_with_budget(
         };
 
     let mut symbol_hits = symbol_hits;
+    // SQLite stores tree-sitter coordinates as zero-based values. Normalize
+    // the public search projection once so human, tabular, JSON, and envelope
+    // output all agree with source-read/symbol-read.
+    for hit in &mut symbol_hits {
+        hit.line = hit.line.saturating_add(1);
+        hit.end_line = hit.end_line.map(|end_line| end_line.saturating_add(1));
+    }
     // Use `sift_path` (which equals `scope.source_root` for scoped /
     // inferred-scope paths and the workspace root otherwise) so the
     // tagpath adapter walks for `.naming.toml` from the right project

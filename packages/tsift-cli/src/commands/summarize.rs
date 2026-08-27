@@ -64,7 +64,7 @@ pub(crate) fn cmd_summarize(
                 .filter(|f| summarize_diff_matches_scope(f, &extract_scope))
                 .map(|file_path| summarize_relative_file_path(&root, &file_path))
                 .collect::<BTreeSet<_>>();
-            if existing.is_empty() && deleted_summary_paths.is_empty() {
+            if existing.is_empty() && deleted_summary_paths.is_empty() && !db_path.exists() {
                 println!("No files to extract.");
                 return Ok(());
             }
@@ -80,6 +80,9 @@ pub(crate) fn cmd_summarize(
 
         let _summary_write_lock = summarize::acquire_write_lock(&db_path)?;
         let summary_cache = summarize::SummaryCache::new(summarize::SummaryDb::open(&db_path)?);
+        summary_cache
+            .db()
+            .prune_terminal_failures_for_non_candidates(&root)?;
 
         if !diff {
             deleted_summary_paths.extend(summarize_full_extract_deleted_summary_paths(
@@ -108,6 +111,8 @@ pub(crate) fn cmd_summarize(
             terminal_failures_skipped: 0,
             errors: Vec::new(),
         };
+        let mut too_large_failures_skipped = 0usize;
+        let mut largest_required_tokens = None::<usize>;
 
         let mut pending_extractions = Vec::new();
         for file_path in &files_to_extract {
@@ -120,7 +125,7 @@ pub(crate) fn cmd_summarize(
                     continue;
                 }
             };
-            if content.is_empty() {
+            if content.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
             let hash = summarize::content_hash(&content);
@@ -130,6 +135,15 @@ pub(crate) fn cmd_summarize(
                 && failure.applies_at_max_file_tokens(cfg.max_file_tokens)
             {
                 report.terminal_failures_skipped += 1;
+                if failure.kind == summarize::ExtractionFailureKind::TooLarge {
+                    too_large_failures_skipped += 1;
+                    if let Some(required) = failure.required_max_file_tokens() {
+                        largest_required_tokens = Some(
+                            largest_required_tokens
+                                .map_or(required, |current| current.max(required)),
+                        );
+                    }
+                }
                 continue;
             }
             if summary_cache.current_by_file(&rel_path, &hash)?.is_none() {
@@ -234,9 +248,26 @@ pub(crate) fn cmd_summarize(
                 println!("  errors: {}", report.errors.len());
             }
             if report.terminal_failures_skipped > 0 {
+                let other_failures = report
+                    .terminal_failures_skipped
+                    .saturating_sub(too_large_failures_skipped);
+                let mut hints = Vec::new();
+                if too_large_failures_skipped > 0 {
+                    let hint = largest_required_tokens.map_or_else(
+                        || "raise --max-file-tokens or use --force to retry".to_string(),
+                        |required| format!("raise --max-file-tokens to at least {required}"),
+                    );
+                    hints.push(format!("{too_large_failures_skipped} too_large; {hint}"));
+                }
+                if other_failures > 0 {
+                    hints.push(format!(
+                        "use --force to retry {other_failures} other failure(s)"
+                    ));
+                }
                 println!(
-                    "  skipped terminal failures: {} (use --force to retry)",
-                    report.terminal_failures_skipped
+                    "  skipped terminal failures: {} ({})",
+                    report.terminal_failures_skipped,
+                    hints.join("; ")
                 );
             }
         }

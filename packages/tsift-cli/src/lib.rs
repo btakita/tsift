@@ -3406,7 +3406,10 @@ fn compact_symbol_ref_token(symbol: &CompactSymbolRefPreview) -> String {
 }
 
 pub(crate) fn truncate_for_budget(input: &str, max_bytes: usize) -> String {
-    let trimmed = input.trim();
+    // Leading whitespace is source data: dropping it changes the meaning of
+    // indentation-sensitive formats and makes source-read output unusable as
+    // byte-exact input to `tsift edit`. Only discard trailing whitespace here.
+    let trimmed = input.trim_end();
     if trimmed.len() <= max_bytes {
         return trimmed.to_string();
     }
@@ -3681,7 +3684,13 @@ fn resolve_query_index_target(
         if let Some(package) = multiplicity::find_cargo_package(root, scope_name)? {
             return Ok(cargo_package_index_target(root, package));
         }
-        config::Config::resolve_submodule(root, scope_name)?;
+        let mut available_scopes = vec![config::WORKSPACE_ROOT_SCOPE_ID.to_string()];
+        available_scopes.extend(config::Config::available_scope_names(root)?);
+        bail!(
+            "unknown scope `{}`. Available scopes: {}",
+            scope_name,
+            available_scopes.join(", ")
+        );
     }
 
     if let Some(scope) = config::Config::infer_submodule_from_path(root, path_hint)? {
