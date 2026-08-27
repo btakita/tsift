@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.91
+
 - **Keep navigation output faithful to source and make extraction residue recoverable** ([#19](https://github.com/btakita/tsift/issues/19)). Search and graph coordinates are consistently one-based, shared budget truncation preserves indentation, search accepts the `<root>` scope, cached oversized-file skips recommend a raised token limit, obsolete terminal failures are pruned, and whitespace-only source files are ignored.
 
 ## 0.1.90

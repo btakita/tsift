@@ -1,6 +1,6 @@
 [package]
 name = "tsift-algorithms"
-version = "0.1.90"
+version = "0.1.91"
 edition = "2024"
 description = "Graph algorithms for tsift — Tarjan SCC, health scoring, dead code detection, coupling analysis"
 license = "MIT"
@@ -14,4 +14,4 @@ publish = true
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
-tsift-core = { path = "../tsift-core", version = "0.1.90" }
+tsift-core = { path = "../tsift-core", version = "0.1.91" }

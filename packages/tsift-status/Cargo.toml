@@ -1,6 +1,6 @@
 [package]
 name = "tsift-status"
-version = "0.1.90"
+version = "0.1.91"
 edition = "2024"
 description = "Session health + lock diagnostics for tsift — index freshness, instruction version, summary-cache and lock-sidecar status"
 license = "MIT"
@@ -17,9 +17,9 @@ lazily = "0.49.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
-tsift-index = { path = "../tsift-index", version = "0.1.90" }
-tsift-sqlite = { path = "../tsift-sqlite", version = "0.1.90" }
-tsift-summarize = { path = "../tsift-summarize", version = "0.1.90" }
+tsift-index = { path = "../tsift-index", version = "0.1.91" }
+tsift-sqlite = { path = "../tsift-sqlite", version = "0.1.91" }
+tsift-summarize = { path = "../tsift-summarize", version = "0.1.91" }
 
 [dev-dependencies]
 tempfile = "3"
