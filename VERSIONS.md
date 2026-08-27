@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.92
+
 - **Make graph guidance executable and close remaining navigation fidelity gaps** ([#20](https://github.com/btakita/tsift/issues/20)). `graph-db --json` now parses before or after every subcommand, missing graph targets fail closed with actionable diagnostics, root graph projections federate every workspace scope, ast-grep columns are consistently 1-based, unresolved evidence guesses are suppressed, and BOM-only extraction candidates are skipped without a model call.
 
 ## 0.1.91
