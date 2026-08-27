@@ -1,6 +1,6 @@
 [package]
 name = "tsift-core"
-version = "0.1.92"
+version = "0.1.93"
 edition = "2024"
 description = "Provider-neutral graph types and GraphStore trait for tsift"
 license = "MIT"
