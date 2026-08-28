@@ -154,6 +154,8 @@ pub(crate) struct SearchScaleGuard {
     pub(crate) narrow_commands: Vec<String>,
 }
 
+const SEARCH_SCALE_GUARD_WORKFLOW_COMMAND: &str = "tsift workflow search --json";
+
 #[derive(Serialize)]
 pub(crate) struct SearchBudgetReport {
     pub(crate) query: String,
@@ -962,9 +964,7 @@ fn build_search_scale_guard(
     if let Some(hit) = hits.first() {
         narrow_commands.push(build_search_path_narrow_command(query, strategy, &hit.path));
     }
-    narrow_commands.push(
-        "tsift workflow search --json # preserve handles, expand only cited parents".to_string(),
-    );
+    narrow_commands.push(SEARCH_SCALE_GUARD_WORKFLOW_COMMAND.to_string());
 
     Some(SearchScaleGuard {
         level: if broad_hits || broad_symbols {
@@ -1409,5 +1409,19 @@ pub(crate) fn print_search_budget_human(report: &SearchBudgetReport) {
         for command in &guard.narrow_commands {
             println!("narrow: {command}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SEARCH_SCALE_GUARD_WORKFLOW_COMMAND;
+
+    #[test]
+    fn scale_guard_workflow_command_is_directly_executable() {
+        assert_eq!(
+            SEARCH_SCALE_GUARD_WORKFLOW_COMMAND,
+            "tsift workflow search --json"
+        );
+        assert!(!SEARCH_SCALE_GUARD_WORKFLOW_COMMAND.contains('#'));
     }
 }

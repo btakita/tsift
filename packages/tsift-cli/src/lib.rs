@@ -6908,6 +6908,13 @@ impl GraphDbDoctorReport {
         self.fail_closed = self.checks.iter().any(|check| check.fail_closed);
         self.status = if self.fail_closed {
             "fail_closed"
+        } else if self.checks.iter().any(|check| {
+            matches!(
+                check.status.as_str(),
+                "warning" | "large_projection" | "recommended"
+            )
+        }) {
+            "warning"
         } else {
             "ok"
         }
@@ -7179,7 +7186,7 @@ pub(crate) fn graph_db_compaction_policy(
             graph_db_scope_arg(scope)
         ));
     }
-    let proof = vec![
+    let mut proof = vec![
         format!("{live_rows} live graph row(s)"),
         format!("{tombstone_scan_rows} retained tombstone row(s) scanned by status/doctor"),
         format!(
@@ -7192,6 +7199,12 @@ pub(crate) fn graph_db_compaction_policy(
             bytes_per_live_row.unwrap_or(0)
         ),
     ];
+    if large_projection {
+        proof.push(
+            "large live projection has no automatic compaction remedy while the freelist is empty; reduce projected scope/property density or treat this storage cost as expected"
+                .to_string(),
+        );
+    }
     GraphDbCompactionPolicy {
         status,
         tombstone_scan_rows,
@@ -14255,6 +14268,7 @@ struct AgentDocIndexGate {
     db_path: Option<PathBuf>,
     source_root: PathBuf,
     diagnostics: Vec<String>,
+    fail_closed_error: Option<String>,
 }
 
 #[derive(Clone, Hash, PartialEq, Eq)]
@@ -14388,6 +14402,7 @@ fn prepare_agent_doc_index_gate(
                 diagnostics: vec![format!(
                     "code index unavailable before {packet_label}: {err:#}; falling back to raw source file nodes"
                 )],
+                fail_closed_error: None,
             };
         }
     };
@@ -14398,6 +14413,7 @@ fn prepare_agent_doc_index_gate(
             diagnostics: vec![format!(
                 "code index unavailable before {packet_label}: no index target resolved; falling back to raw source file nodes"
             )],
+            fail_closed_error: None,
         };
     };
 
@@ -14410,6 +14426,7 @@ fn prepare_agent_doc_index_gate(
                 diagnostics: vec![format!(
                     "code index freshness unavailable before {packet_label}: {err:#}; falling back to raw source file nodes"
                 )],
+                fail_closed_error: None,
             };
         }
     };
@@ -14419,6 +14436,7 @@ fn prepare_agent_doc_index_gate(
             db_path: Some(target.db_path),
             source_root: target.source_root,
             diagnostics: Vec::new(),
+            fail_closed_error: None,
         };
     };
 
@@ -14436,10 +14454,25 @@ fn prepare_agent_doc_index_gate(
                 &summary,
                 packet_label,
             )];
+            let fail_closed_error = match inspect_search_index(&target) {
+                Ok(state) => index_reason_for_state(state).map(|remaining_reason| {
+                    format!(
+                        "code index remained stale after automatic refresh before {packet_label}: {}; refusing to build the graph projection; run: {}",
+                        index_reason_detail(&target, remaining_reason),
+                        target.reindex_cmd
+                    )
+                }),
+                Err(err) => Some(format!(
+                    "could not verify code index freshness after automatic refresh before {packet_label}: {err:#}; refusing to build the graph projection; run: {}",
+                    target.reindex_cmd
+                )),
+            };
+            let db_path = fail_closed_error.is_none().then_some(target.db_path);
             AgentDocIndexGate {
-                db_path: Some(target.db_path),
+                db_path,
                 source_root: target.source_root,
                 diagnostics,
+                fail_closed_error,
             }
         }
         Err(err) => {
@@ -14453,6 +14486,7 @@ fn prepare_agent_doc_index_gate(
                 db_path: None,
                 source_root: target.source_root,
                 diagnostics,
+                fail_closed_error: None,
             }
         }
     }
@@ -14678,6 +14712,9 @@ fn build_traversal_graph_source_with_options(
         let (gate, _cache_detail) =
             prepare_agent_doc_index_gate_cached(root, path_hint, scope, "graph traversal packet");
         graph.warnings.extend(gate.diagnostics);
+        if let Some(err) = gate.fail_closed_error {
+            bail!(err);
+        }
         let gate_source_root = gate.source_root.clone();
 
         match gate.db_path {
@@ -21419,7 +21456,7 @@ pub(crate) fn apply_status_fixes(root: &Path, report: &status::StatusReport) -> 
             root,
             None,
             false,
-            false,
+            true,
         )?;
         return Ok(());
     }
@@ -21439,7 +21476,7 @@ pub(crate) fn apply_status_fixes(root: &Path, report: &status::StatusReport) -> 
             root,
             None,
             false,
-            false,
+            true,
             &excluded_roots,
         )?;
     }
@@ -21463,7 +21500,7 @@ pub(crate) fn apply_status_fixes(root: &Path, report: &status::StatusReport) -> 
             root,
             Some(scope.id.as_str()),
             false,
-            false,
+            true,
         )?;
     }
 
@@ -22091,7 +22128,7 @@ fn apply_search_index_update(
         root,
         target.scope_name.as_deref(),
         false,
-        false,
+        true,
         &target.excluded_roots,
     )
 }
@@ -27081,6 +27118,31 @@ fn main() { api::handler(); }
         let db = index::IndexDb::open_read_only(&dir.path().join(".tsift/index.db")).unwrap();
         let summary = db.compute_changes(dir.path()).unwrap();
         assert_eq!(summary.new + summary.modified + summary.deleted, 0);
+    }
+
+    #[test]
+    fn traversal_graph_prunes_deleted_files_before_loading_symbols() {
+        let dir = setup_traversal_project();
+        let deleted_path = dir.path().join("deleted.rs");
+        std::fs::write(&deleted_path, "fn deleted_helper() {}\n").unwrap();
+        let db_path = dir.path().join(".tsift/index.db");
+        let db = index::IndexDb::open(&db_path).unwrap();
+        db.apply_changes_pruned(dir.path()).unwrap();
+        drop(db);
+        std::fs::remove_file(&deleted_path).unwrap();
+
+        let graph = build_traversal_graph(dir.path(), dir.path(), None).unwrap();
+
+        assert!(resolve_traversal_node(&graph, "deleted_helper").is_none());
+        let db = index::IndexDb::open_read_only(&db_path).unwrap();
+        let summary = db.compute_changes(dir.path()).unwrap();
+        assert_eq!(summary.new + summary.modified + summary.deleted, 0);
+        assert!(
+            !db.file_paths()
+                .unwrap()
+                .iter()
+                .any(|path| path.ends_with("deleted.rs"))
+        );
     }
 
     #[test]
@@ -35056,6 +35118,33 @@ fn sample() {}
                 .iter()
                 .any(|line| line.contains("bytes_per_live_row"))
         );
+        assert!(
+            policy
+                .proof
+                .iter()
+                .any(|line| line.contains("no automatic compaction remedy"))
+        );
+    }
+
+    #[test]
+    fn graph_db_doctor_reports_non_fatal_checks_as_warning() {
+        let mut report = GraphDbDoctorReport::new(
+            Path::new("/repo"),
+            None,
+            "sqlite",
+            Path::new("/repo/.tsift/graph.db"),
+            None,
+        );
+        report.push_check(GraphDbDoctorCheck {
+            name: "compaction_policy".to_string(),
+            status: "large_projection".to_string(),
+            fail_closed: false,
+            diagnostics: vec!["large projection".to_string()],
+            repair_commands: Vec::new(),
+        });
+        report.finalize();
+        assert_eq!(report.status, "warning");
+        assert!(!report.fail_closed);
     }
 }
 

@@ -1245,27 +1245,12 @@ fn format_missing_workspace_scope_line(
     }
 }
 
-fn format_index_run_with_gap(index_cmd: &str, stale_files: usize, missing_scopes: usize) -> String {
-    let mut notes = Vec::new();
-    if stale_files > 0 {
-        notes.push(format!(
-            "{} stale file{}",
-            stale_files,
-            if stale_files == 1 { "" } else { "s" }
-        ));
-    }
-    if missing_scopes > 0 {
-        notes.push(format!(
-            "{} missing scope{}",
-            missing_scopes,
-            if missing_scopes == 1 { "" } else { "s" }
-        ));
-    }
-    if notes.is_empty() {
-        index_cmd.to_string()
-    } else {
-        format!("{}  ({})", index_cmd, notes.join(", "))
-    }
+fn format_index_run_with_gap(
+    index_cmd: &str,
+    _stale_files: usize,
+    _missing_scopes: usize,
+) -> String {
+    index_cmd.to_string()
 }
 
 pub fn format_human(report: &StatusReport, compact: bool) -> String {
@@ -2084,7 +2069,7 @@ mod tests {
         }
         assert_eq!(
             report.recommendations.run.as_deref(),
-            Some("tsift init --workspace && tsift index --workspace .  (3 missing scopes)")
+            Some("tsift init --workspace && tsift index --workspace .")
         );
     }
 
@@ -2117,7 +2102,7 @@ mod tests {
         }
         assert_eq!(
             report.recommendations.run.as_deref(),
-            Some("tsift init --workspace && tsift index --workspace .  (2 missing scopes)")
+            Some("tsift init --workspace && tsift index --workspace .")
         );
     }
 
@@ -2158,7 +2143,7 @@ mod tests {
         }
         assert_eq!(
             report.recommendations.run.as_deref(),
-            Some("tsift init --workspace && tsift index --workspace .  (1 missing scope)")
+            Some("tsift init --workspace && tsift index --workspace .")
         );
     }
 
@@ -2192,7 +2177,7 @@ mod tests {
         }
         assert_eq!(
             report.recommendations.run.as_deref(),
-            Some("tsift init --workspace && tsift index --workspace .  (1 stale file)")
+            Some("tsift init --workspace && tsift index --workspace .")
         );
     }
 
@@ -2891,6 +2876,13 @@ mod tests {
                 .unwrap()
                 .contains("tsift init")
         );
+    }
+
+    #[test]
+    fn stale_index_recommendation_is_an_executable_shell_command() {
+        let command = format_index_run_with_gap("tsift index --workspace .", 7, 2);
+        assert_eq!(command, "tsift index --workspace .");
+        assert!(!command.contains('('));
     }
 
     #[test]

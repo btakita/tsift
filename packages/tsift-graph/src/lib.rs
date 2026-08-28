@@ -461,6 +461,14 @@ fn parse_ts_route_decorator(line: &str) -> Option<PendingRoute> {
 }
 
 fn parse_ts_router_call(line: &str, line_idx: usize) -> Option<RouteSite> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with("*/")
+    {
+        return None;
+    }
     for method in route_methods() {
         if *method == "route" {
             continue;
@@ -469,6 +477,21 @@ fn parse_ts_router_call(line: &str, line_idx: usize) -> Option<RouteSite> {
         let Some(pos) = line.find(&needle) else {
             continue;
         };
+        let receiver = line[..pos]
+            .trim_end()
+            .chars()
+            .rev()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'))
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        let receiver = receiver.to_ascii_lowercase();
+        if !matches!(receiver.as_str(), "app" | "router" | "server" | "api")
+            && !receiver.ends_with("router")
+        {
+            continue;
+        }
         let args = &line[pos + needle.len()..];
         let (path, end_offset) = extract_string_literal(args)?;
         let handler = args[end_offset..]
@@ -1318,6 +1341,17 @@ function createUser() {}
         assert_eq!(routes[0].method.as_deref(), Some("post"));
         assert_eq!(routes[0].path, "/users");
         assert_eq!(routes[0].handler, "createUser");
+    }
+
+    #[cfg(feature = "lang-typescript")]
+    #[test]
+    fn typescript_route_extraction_ignores_search_params_and_comments() {
+        let source = br#"const visible = searchParams.get("visible");
+// searchParams.delete("date");
+/* router.delete("/commented", removeCommented); */
+"#;
+        let routes = extract_route_sites(Lang::TypeScript, source).unwrap();
+        assert!(routes.is_empty(), "got: {routes:?}");
     }
 
     #[cfg(feature = "lang-javascript")]

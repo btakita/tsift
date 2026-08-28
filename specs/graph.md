@@ -89,6 +89,18 @@ The first implementation is a local SQLite store with `graph_nodes`, `graph_edge
 
 Backend-eval includes a bounded `neighborhood` operation for the real, synthetic high-degree, synthetic deep-chain, and opt-in full-projection workloads. The performance gate treats repeated neighborhood latency samples like evidence/path samples: single runs are diagnostic, while three-sample real/full/synthetic evidence is required before promoting a neighborhood traversal rewrite or backend replacement.
 
+Before traversal graph projection consumes a stale code index, automatic repair
+prunes deleted files and re-checks freshness. Projection fails closed with an
+executable reindex command if the repaired index remains stale. TypeScript and
+JavaScript route extraction accepts router-like receivers (`app`, `router`,
+`server`, `api`, or names ending in `Router`) and ignores comments and unrelated
+method calls such as `URLSearchParams.get` and `.delete`.
+
+For a `large_projection`, doctor elevates overall health to `warning` and states
+that no automatic compaction remedy exists while the freelist is empty. The
+operator can narrow projected scope/property density or explicitly accept the
+live storage cost.
+
 ### Graph DB Performance Release Gate
 
 The Graph DB performance release gate turns repeated `graph-db backend-eval` samples into a binding promote/block decision for candidate `GraphStore` backends. The gate is implemented in `src/perf_gate.rs` and exercised by `tests/perf_gate.rs`; the canonical sample store is `fixtures/graph-db-performance-history.json` and the canonical digest path is `tsift metric-digest --baseline fixtures/graph-db-performance-history.json`.

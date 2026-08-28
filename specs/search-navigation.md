@@ -101,6 +101,12 @@ round trip.
 
 `tsift edit` now stages each rewritten file beside its target and only swaps the batch into place after every edit validates and every staged file is ready. If any later swap fails, tsift restores earlier files before returning an error instead of leaving a partially-written batch behind.
 
+Every command emitted in `status.recommendations.run`, search scale-guard
+`narrow_commands`, or another machine-action field is directly executable shell
+text. Stale-file counts, scope gaps, and explanatory guidance belong in their
+dedicated diagnostic fields, never as parenthetical suffixes or inline comments
+inside the command string.
+
 ## Search Stale Precheck + Timeout
 
 `tsift search` now performs a cheap freshness precheck before it calls the sift engine. If an existing local index is stale, search refreshes it before spending time in the lexical engine; callers that pass `--no-autoindex` fail fast instead.
