@@ -1,4 +1,4 @@
-<!-- tsift:opencode-command v=0.1.93 name=tsift-symbol-read -->
+<!-- tsift:opencode-command v=0.1.94 name=tsift-symbol-read -->
 ---
 description: Read symbol body with AST metadata via tsift symbol-read
 ---

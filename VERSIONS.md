@@ -8,6 +8,10 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.94
+
+- **Close post-0.1.93 correctness and operator-output gaps** ([#22](https://github.com/btakita/tsift/issues/22)). Graph projection auto-repair now prunes deleted index rows, rechecks freshness, and fails closed before writing from a still-stale index. Status and search scale-guard action fields emit directly executable commands without prose suffixes or inline comments. JavaScript/TypeScript route extraction rejects comments and unrelated `.get`/`.delete` calls such as `URLSearchParams`, while retaining router-like Express receivers. Large dense projections now raise overall doctor health to `warning` and explicitly state when an empty freelist leaves no automatic compaction remedy.
+
 ## 0.1.93
 
 - **Close scoped graph, recursive workspace, and extraction accounting gaps** ([#21](https://github.com/btakita/tsift/issues/21)). Graph projection lines now use the same one-based coordinates as `explain`; `graph` and `explain` accept emitted `--path` commands; scoped graph reads fail with a refresh remedy, isolate semantic rows, preserve scope provenance, and fail closed for absent symbols; workspace discovery recurses through nested ignored gitlinks; Unicode-only whitespace never incurs extraction usage; human graph nodes expose locations; and oversized dense projections are reported explicitly.
