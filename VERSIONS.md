@@ -8,6 +8,10 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.95
+
+- **Make graph freshness follow semantic index state and keep nested-scope repair idempotent** ([#23](https://github.com/btakita/tsift/issues/23)). Traversal watermarks now include a canonical hash of projection-driving index rows, projection versions include the tsift release version, and `graph-db status`, doctor, and context-pack fail closed when the current index no longer matches `graph.db`. Operators can force transactional replacement with `graph-db refresh --rebuild`, while federated inline repair now applies the same descendant-scope exclusions as workspace indexing.
+
 ## 0.1.94
 
 - **Close post-0.1.93 correctness and operator-output gaps** ([#22](https://github.com/btakita/tsift/issues/22)). Graph projection auto-repair now prunes deleted index rows, rechecks freshness, and fails closed before writing from a still-stale index. Status and search scale-guard action fields emit directly executable commands without prose suffixes or inline comments. JavaScript/TypeScript route extraction rejects comments and unrelated `.get`/`.delete` calls such as `URLSearchParams`, while retaining router-like Express receivers. Large dense projections now raise overall doctor health to `warning` and explicitly state when an empty freelist leaves no automatic compaction remedy.
