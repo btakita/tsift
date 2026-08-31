@@ -2,7 +2,7 @@ use crate::walk::{self, FileEntry, PruneStats};
 use anyhow::{Context, Result, bail};
 use fs4::fs_std::FileExt;
 use lazily::{Computed, Context as LazyContext, Source};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, types::ValueRef};
 use serde::Serialize;
 #[cfg(test)]
 use std::cell::Cell;
@@ -463,6 +463,39 @@ fn warning_on_error<T>(
             None
         }
     }
+}
+
+fn hash_projection_query(
+    conn: &Connection,
+    hasher: &mut blake3::Hasher,
+    table: &str,
+    query: &str,
+) -> Result<()> {
+    fn update_field(hasher: &mut blake3::Hasher, tag: u8, bytes: &[u8]) {
+        hasher.update(&[tag]);
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    }
+
+    update_field(hasher, b'T', table.as_bytes());
+    let mut stmt = conn.prepare(query)?;
+    let column_count = stmt.column_count();
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        hasher.update(b"R");
+        for column in 0..column_count {
+            match row.get_ref(column)? {
+                ValueRef::Null => update_field(hasher, b'N', &[]),
+                ValueRef::Integer(value) => {
+                    update_field(hasher, b'I', &value.to_le_bytes())
+                }
+                ValueRef::Real(value) => update_field(hasher, b'F', &value.to_bits().to_le_bytes()),
+                ValueRef::Text(value) => update_field(hasher, b'S', value),
+                ValueRef::Blob(value) => update_field(hasher, b'B', value),
+            }
+        }
+    }
+    Ok(())
 }
 
 impl IndexDb {
@@ -1468,6 +1501,41 @@ impl IndexDb {
         Ok(parts)
     }
 
+    /// Hash every index row that can contribute to the traversal graph projection.
+    ///
+    /// File mtimes alone are insufficient here: an extractor or index rebuild can
+    /// add or remove semantic rows while the source files remain unchanged.
+    pub fn projection_snapshot_hash(&self) -> Result<String> {
+        const QUERIES: &[(&str, &str)] = &[
+            (
+                "file_state",
+                "SELECT path, mtime_secs, mtime_nanos, language FROM file_state ORDER BY path",
+            ),
+            (
+                "file_zonemap",
+                "SELECT path, min_line, max_line, symbol_count, kinds, content_hash FROM file_zonemap ORDER BY path",
+            ),
+            (
+                "symbols",
+                "SELECT name, kind, language, signature, file, line, end_line, node_kind, start_byte, end_byte, body_start_byte, body_end_byte, parent_module, visibility, tags FROM symbols ORDER BY file, line, name, kind, language, COALESCE(signature, ''), COALESCE(end_line, -1), COALESCE(node_kind, ''), COALESCE(start_byte, -1), COALESCE(end_byte, -1), COALESCE(body_start_byte, -1), COALESCE(body_end_byte, -1), COALESCE(parent_module, ''), COALESCE(visibility, ''), COALESCE(tags, '')",
+            ),
+            (
+                "call_edges",
+                "SELECT caller_file, caller_name, caller_line, callee_name, call_site_line FROM call_edges ORDER BY caller_file, caller_line, caller_name, callee_name, call_site_line",
+            ),
+            (
+                "route_nodes",
+                "SELECT framework, method, route_path, handler_name, file, line, handler_line FROM route_nodes ORDER BY file, line, framework, COALESCE(method, ''), route_path, handler_name, COALESCE(handler_line, -1)",
+            ),
+        ];
+
+        let mut hasher = blake3::Hasher::new();
+        for (table, query) in QUERIES {
+            hash_projection_query(&self.conn, &mut hasher, table, query)?;
+        }
+        Ok(hasher.finalize().to_hex().to_string())
+    }
+
     pub fn symbol_count(&self) -> Result<usize> {
         let count: i64 = self
             .conn
@@ -2116,6 +2184,24 @@ mod tests {
         fs::write(root.join("app.tsx"), "export default () => <div/>").unwrap();
         fs::write(root.join("readme.txt"), "not code").unwrap();
         dir
+    }
+
+    #[test]
+    fn projection_snapshot_hash_tracks_semantic_rows_without_mtime_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
+        let before = db.projection_snapshot_hash().unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO route_nodes (framework, method, route_path, handler_name, file, line, handler_line) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params!["express", "GET", "/health", "health", "app.ts", 3, 3],
+            )
+            .unwrap();
+        let with_route = db.projection_snapshot_hash().unwrap();
+        assert_ne!(before, with_route);
+
+        db.conn.execute("DELETE FROM route_nodes", []).unwrap();
+        assert_eq!(before, db.projection_snapshot_hash().unwrap());
     }
 
     fn db_in(dir: &Path) -> IndexDb {

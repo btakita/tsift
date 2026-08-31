@@ -5659,6 +5659,7 @@ name = "tsift-index"
 version = "0.1.94"
 dependencies = [
  "anyhow",
+ "blake3",
  "fs4",
  "ignore",
  "lazily",

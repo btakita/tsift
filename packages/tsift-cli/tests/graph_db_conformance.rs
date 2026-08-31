@@ -1600,7 +1600,8 @@ fn graph_db_refresh_and_status_materialize_operator_report() {
         "{refresh}"
     );
     assert_eq!(
-        refresh["freshness"]["projection_version"], "tsift-traversal-v1",
+        refresh["freshness"]["projection_version"],
+        format!("tsift-traversal-v2@{}", env!("CARGO_PKG_VERSION")),
         "{refresh}"
     );
     assert!(refresh["freshness"]["content_hash"].as_str().is_some());
@@ -1688,6 +1689,17 @@ fn graph_db_refresh_and_status_materialize_operator_report() {
                         .contains("reused current graph.db projection")
             }),
         "{cached_refresh}"
+    );
+
+    let forced_refresh = graph_db_json(
+        project.path(),
+        Backend::Sqlite,
+        vec!["refresh".to_string(), "--rebuild".to_string()],
+    );
+    assert_eq!(forced_refresh["status"], "current", "{forced_refresh}");
+    assert_eq!(
+        forced_refresh["refresh"]["mode"], "forced_source_graph_rebuild",
+        "{forced_refresh}"
     );
 
     let status = graph_db_json(project.path(), Backend::Sqlite, vec!["status".to_string()]);

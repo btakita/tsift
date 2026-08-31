@@ -1937,7 +1937,11 @@ pub enum MapFormat {
 #[derive(Subcommand, Debug, Clone)]
 pub enum GraphDbQuery {
     /// Materialize or refresh the local SQLite graph.db projection for operator workflows
-    Refresh,
+    Refresh {
+        /// Rebuild projection rows even when the stored source watermark matches
+        #[arg(long)]
+        rebuild: bool,
+    },
     /// Report graph.db freshness, projection metadata, row counts, tombstone counts, and next commands without refreshing
     Status,
     /// Diagnose graph.db or Convex snapshot health without refreshing the local projection

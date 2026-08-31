@@ -33,8 +33,8 @@ use crate::{
     graph_db_semantic_readiness, graph_store_semantic_node_count, graph_substrate_db_path,
     load_tag_ontology_preview_context, log_digest_summary_label, node_with_content_freshness,
     ontology_refs_for_alias, prepare_agent_doc_index_gate_cached, shell_quote, source_read_command,
-    sqlite_graph_freshness, stable_handle, tag_alias_from_name, test_digest_summary_label,
-    truncate_for_budget,
+    sqlite_graph_freshness_for_path, stable_handle, tag_alias_from_name,
+    test_digest_summary_label, truncate_for_budget,
 };
 
 #[derive(Clone, Serialize)]
@@ -1331,7 +1331,7 @@ fn context_pack_graph_orchestration(
     let graph_db = graph_substrate_db_path(root, None);
     let store = SqliteGraphStore::open_read_only_resilient(&graph_db)
         .with_context(|| format!("opening graph-db projection: {}", graph_db.display()))?;
-    let projection_freshness = sqlite_graph_freshness(&store, "root")?;
+    let projection_freshness = sqlite_graph_freshness_for_path(&store, root, path, None, false)?;
     let mut warnings = projection_freshness.diagnostics.clone();
     if let Some(recovery) = store.read_only_recovery() {
         warnings.push(graph_db_read_recovery_diagnostic(recovery));

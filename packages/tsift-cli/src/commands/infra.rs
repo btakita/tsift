@@ -266,11 +266,15 @@ pub(crate) fn cmd_graph_db_refresh(
     root: &Path,
     path: &Path,
     scope: Option<&str>,
+    rebuild: bool,
     format: OutputFormat,
 ) -> Result<()> {
     let source_watermark = traversal_source_watermark(root, path, scope, false)?;
-    let cached_refresh =
-        graph_db_backend_eval_cached_refresh(root, scope, source_watermark.as_deref())?;
+    let cached_refresh = if rebuild {
+        None
+    } else {
+        graph_db_backend_eval_cached_refresh(root, scope, source_watermark.as_deref())?
+    };
     let (mode, mut warnings, refresh, phase_timings) =
         if let Some((_graph, refresh, phase_timings)) = cached_refresh {
             (
@@ -291,7 +295,11 @@ pub(crate) fn cmd_graph_db_refresh(
                 })
                 .collect::<Vec<_>>();
             (
-                "cold_source_graph_rebuild".to_string(),
+                if rebuild {
+                    "forced_source_graph_rebuild".to_string()
+                } else {
+                    "cold_source_graph_rebuild".to_string()
+                },
                 graph.warnings,
                 refresh,
                 phase_timings,
@@ -2447,8 +2455,8 @@ pub(crate) fn cmd_graph_db(
     };
     let preferred_path = preferred_path.as_deref();
     match &query {
-        GraphDbQuery::Refresh => {
-            return cmd_graph_db_refresh(&root, path, scope, format);
+        GraphDbQuery::Refresh { rebuild } => {
+            return cmd_graph_db_refresh(&root, path, scope, *rebuild, format);
         }
         GraphDbQuery::Status => {
             return cmd_graph_db_status(&root, scope, format);

@@ -30,7 +30,10 @@ struct IndexCommandTarget {
     excluded_roots: Vec<PathBuf>,
 }
 
-fn descendant_scope_roots(scopes: &[config::WorkspaceScope], source_root: &Path) -> Vec<PathBuf> {
+pub(crate) fn descendant_scope_roots(
+    scopes: &[config::WorkspaceScope],
+    source_root: &Path,
+) -> Vec<PathBuf> {
     scopes
         .iter()
         .filter(|scope| {

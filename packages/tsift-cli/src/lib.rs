@@ -99,7 +99,9 @@ use commands::graph::{
 };
 #[cfg(test)]
 use commands::index_search::cmd_search;
-use commands::index_search::{cmd_index, cmd_search_with_budget, cmd_search_worker};
+use commands::index_search::{
+    cmd_index, cmd_search_with_budget, cmd_search_worker, descendant_scope_roots,
+};
 use commands::infra::{
     StatusCommandOptions, cmd_convex_sync, cmd_edit, cmd_graph_db, cmd_init, cmd_locks,
     cmd_rewrite, cmd_route, cmd_sql, cmd_status,
@@ -3953,7 +3955,8 @@ struct TraversalGraphBuild {
     warnings: Vec<String>,
 }
 
-pub(crate) const GRAPH_PROJECTION_VERSION: &str = "tsift-traversal-v1";
+pub(crate) const GRAPH_PROJECTION_VERSION: &str =
+    concat!("tsift-traversal-v2@", env!("CARGO_PKG_VERSION"));
 const GRAPH_DB_EVIDENCE_CONTRACT_VERSION: &str = "graph-db-evidence-v1";
 const WORKER_PROMPT_PACKET_CONTRACT_VERSION: &str = "worker-prompt-packet-v1";
 const CONFLICT_MATRIX_CONTRACT_VERSION: &str = "conflict-matrix-v1";
@@ -6972,7 +6975,11 @@ fn graph_db_refresh_command(root: &Path, scope: Option<&str>) -> String {
 }
 
 fn graph_db_rebuild_command(root: &Path, scope: Option<&str>) -> String {
-    graph_db_refresh_command(root, scope)
+    format!(
+        "tsift graph-db --path {}{} refresh --rebuild --json",
+        shell_quote(root.to_string_lossy().as_ref()),
+        graph_db_scope_arg(scope)
+    )
 }
 
 fn graph_db_backup_rebuild_command(root: &Path, scope: Option<&str>, graph_db: &Path) -> String {
@@ -7958,6 +7965,24 @@ pub(crate) fn append_sqlite_graph_doctor_checks(
         vec![rebuild.clone()],
     ));
 
+    let source_watermark_diagnostics =
+        sqlite_graph_freshness_from_conn(conn.conn(), scope.unwrap_or("root"))
+            .map(|mut freshness| {
+                let existing = freshness.diagnostics.len();
+                apply_current_source_watermark(&mut freshness, root, root, scope, false);
+                freshness.diagnostics.into_iter().skip(existing).collect()
+            })
+            .unwrap_or_else(|err| {
+                vec![format!(
+                    "graph projection source watermark inspection failed: {err}"
+                )]
+            });
+    report.push_check(graph_db_doctor_check(
+        "sqlite_source_watermark",
+        source_watermark_diagnostics,
+        vec![rebuild.clone()],
+    ));
+
     let duplicate_diagnostics = sqlite_graph_duplicate_diagnostics(conn.conn())
         .unwrap_or_else(|err| vec![format!("duplicate id inspection failed: {err}")]);
     report.push_check(graph_db_doctor_check(
@@ -8384,6 +8409,7 @@ pub(crate) fn graph_db_operator_report_from_disk(
         warnings.push(graph_db_read_recovery_diagnostic(recovery));
     }
     let mut freshness = sqlite_graph_freshness_from_conn(conn.conn(), scope.unwrap_or("root"))?;
+    apply_current_source_watermark(&mut freshness, root, root, scope, false);
     let schema_diagnostics = sqlite_graph_schema_diagnostics(conn.conn())
         .unwrap_or_else(|err| vec![format!("graph.db schema inspection failed: {err}")]);
     if !schema_diagnostics.is_empty() {
@@ -8407,6 +8433,13 @@ pub(crate) fn graph_db_operator_report_from_disk(
         "current"
     }
     .to_string();
+    let next_commands = if freshness.fail_closed {
+        let mut commands = vec![graph_db_rebuild_command(root, scope)];
+        commands.extend(graph_db_operator_next_commands(root, scope, false));
+        commands
+    } else {
+        graph_db_operator_next_commands(root, scope, false)
+    };
 
     Ok(GraphDbOperatorReport {
         root: root.to_string_lossy().to_string(),
@@ -8421,7 +8454,7 @@ pub(crate) fn graph_db_operator_report_from_disk(
         counts,
         refresh,
         recovery,
-        next_commands: graph_db_operator_next_commands(root, scope, false),
+        next_commands,
         warnings,
     })
 }
@@ -9626,8 +9659,8 @@ fn graph_db_schema() -> GraphDbSchema {
         ],
         operations: vec![
             GraphDbSchemaOperation {
-                command: "refresh",
-                description: "Materialize .tsift/graph.db explicitly with delta upserts/deletes, row hash watermarks, tombstone pruning, projection metadata, row counts, and operator next commands",
+                command: "refresh [--rebuild]",
+                description: "Materialize .tsift/graph.db explicitly with delta upserts/deletes, row hash watermarks, tombstone pruning, projection metadata, row counts, and operator next commands; --rebuild bypasses matching cached watermarks",
             },
             GraphDbSchemaOperation {
                 command: "status",
@@ -9752,6 +9785,50 @@ pub(crate) fn sqlite_graph_freshness(
         source_watermark: version.source_watermark,
         diagnostics,
     })
+}
+
+fn apply_current_source_watermark(
+    freshness: &mut GraphDbFreshnessReport,
+    root: &Path,
+    path_hint: &Path,
+    scope: Option<&str>,
+    session_only: bool,
+) {
+    let mismatch = match traversal_source_watermark(root, path_hint, scope, session_only) {
+        Ok(Some(expected)) if freshness.source_watermark.as_deref() == Some(expected.as_str()) => {
+            None
+        }
+        Ok(Some(expected)) => Some(format!(
+            "graph projection source watermark mismatch: expected {expected} got {}; run `{}`",
+            freshness.source_watermark.as_deref().unwrap_or("<missing>"),
+            graph_db_rebuild_command(root, scope)
+        )),
+        Ok(None) => Some(format!(
+            "graph projection source watermark could not be derived from the current index; run `{}`",
+            graph_db_rebuild_command(root, scope)
+        )),
+        Err(err) => Some(format!(
+            "graph projection source watermark validation failed: {err}; run `{}`",
+            graph_db_rebuild_command(root, scope)
+        )),
+    };
+    if let Some(diagnostic) = mismatch {
+        freshness.diagnostics.push(diagnostic);
+        freshness.fail_closed = true;
+        freshness.status = "stale".to_string();
+    }
+}
+
+pub(crate) fn sqlite_graph_freshness_for_path(
+    store: &SqliteGraphStore,
+    root: &Path,
+    path_hint: &Path,
+    scope: Option<&str>,
+    session_only: bool,
+) -> Result<GraphDbFreshnessReport> {
+    let mut freshness = sqlite_graph_freshness(store, scope.unwrap_or("root"))?;
+    apply_current_source_watermark(&mut freshness, root, path_hint, scope, session_only);
+    Ok(freshness)
 }
 
 pub(crate) fn convex_graph_freshness(
@@ -10401,7 +10478,7 @@ pub(crate) fn graph_db_report_from_store(
     };
 
     match query {
-        GraphDbQuery::Refresh => {
+        GraphDbQuery::Refresh { .. } => {
             bail!("graph-db refresh must be handled by the refresh command path");
         }
         GraphDbQuery::Status => {
@@ -13912,6 +13989,10 @@ pub(crate) fn traversal_source_watermark(
             parts.push(format!(
                 "index_source_root:{}",
                 traversal_watermark_path(root, &target.source_root)
+            ));
+            parts.push(format!(
+                "index_projection_hash:{}",
+                db.projection_snapshot_hash()?
             ));
             let mut snapshot_rows = 0usize;
             for part in db.source_snapshot_parts()? {
@@ -21949,6 +22030,7 @@ fn resolve_search_index_targets(
     federated: bool,
 ) -> Result<Vec<SearchIndexTarget>> {
     let federated = federated || should_auto_federate(root, path_hint, scope, federated)?;
+    let scopes = config::Config::submodule_dirs(root)?;
     if let Some(scope_name) = scope {
         if scope_name == config::WORKSPACE_ROOT_SCOPE_ID {
             return Ok(vec![workspace_root_index_target(root)?]);
@@ -21959,7 +22041,7 @@ fn resolve_search_index_targets(
                 label: format!("submodule `{}` index", scope.id),
                 db_path: cfg.db_path_for(root, &scope.id),
                 source_root: scope.source_root.clone(),
-                excluded_roots: Vec::new(),
+                excluded_roots: descendant_scope_roots(&scopes, &scope.source_root),
                 scope_name: Some(scope.id.clone()),
                 reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
             }]);
@@ -21972,7 +22054,6 @@ fn resolve_search_index_targets(
 
     if federated {
         let cfg = config::Config::load(root)?;
-        let scopes = config::Config::submodule_dirs(root)?;
         let mut targets = vec![workspace_root_index_target(root)?];
         for scope in &scopes {
             if !cfg.federation_for_scope(scope) {
@@ -21982,7 +22063,7 @@ fn resolve_search_index_targets(
                 label: format!("submodule `{}` index", scope.id),
                 db_path: cfg.db_path_for(root, &scope.id),
                 source_root: scope.source_root.clone(),
-                excluded_roots: Vec::new(),
+                excluded_roots: descendant_scope_roots(&scopes, &scope.source_root),
                 scope_name: Some(scope.id.clone()),
                 reindex_cmd: format!("tsift index --workspace {}", root.display()),
             });
@@ -21996,7 +22077,7 @@ fn resolve_search_index_targets(
             label: format!("submodule `{}` index", scope.id),
             db_path: cfg.db_path_for(root, &scope.id),
             source_root: scope.source_root.clone(),
-            excluded_roots: Vec::new(),
+            excluded_roots: descendant_scope_roots(&scopes, &scope.source_root),
             scope_name: Some(scope.id.clone()),
             reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
         }]);
@@ -22012,7 +22093,7 @@ fn resolve_search_index_targets(
             label: format!("submodule `{}` index", scope.id),
             db_path: cfg.db_path_for(root, &scope.id),
             source_root: scope.source_root.clone(),
-            excluded_roots: Vec::new(),
+            excluded_roots: descendant_scope_roots(&scopes, &scope.source_root),
             scope_name: Some(scope.id.clone()),
             reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
         }]);
@@ -24423,6 +24504,85 @@ dispatch #spec-test-build-install-commit-push
         )
         .unwrap();
         dir
+    }
+
+    #[test]
+    fn graph_db_status_invalidates_when_index_route_rows_change() {
+        let dir = setup_graph_index();
+        let index_db = dir.path().join(".tsift/index.db");
+        let conn = Connection::open(&index_db).unwrap();
+        conn.execute(
+            "INSERT INTO route_nodes (framework, method, route_path, handler_name, file, line, handler_line) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params!["axum", "GET", "/health", "health", "main.rs", 1, 1],
+        )
+        .unwrap();
+        drop(conn);
+
+        write_traversal_graph_store(dir.path(), dir.path(), None).unwrap();
+        let graph_db = dir.path().join(".tsift/graph.db");
+        let current = graph_db_operator_report_from_disk(
+            dir.path(),
+            None,
+            &graph_db,
+            "status",
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(current.status, "current");
+
+        let conn = Connection::open(&index_db).unwrap();
+        conn.execute("DELETE FROM route_nodes", []).unwrap();
+        drop(conn);
+        let stale = graph_db_operator_report_from_disk(
+            dir.path(),
+            None,
+            &graph_db,
+            "status",
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(stale.status, "stale");
+        assert!(stale.freshness.fail_closed);
+        assert!(stale.freshness.diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("source watermark mismatch")
+                && diagnostic.contains("refresh --rebuild")
+        }));
+        assert!(
+            stale
+                .next_commands
+                .iter()
+                .any(|command| command.contains("refresh --rebuild"))
+        );
+    }
+
+    #[test]
+    fn graph_db_status_invalidates_projection_version_mismatch() {
+        let dir = setup_graph_index();
+        write_traversal_graph_store(dir.path(), dir.path(), None).unwrap();
+        let graph_db = dir.path().join(".tsift/graph.db");
+        let conn = Connection::open(&graph_db).unwrap();
+        conn.execute(
+            "UPDATE graph_projection_versions SET projection_version = 'tsift-traversal-v1' WHERE scope = 'root'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let report = graph_db_operator_report_from_disk(
+            dir.path(),
+            None,
+            &graph_db,
+            "status",
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(report.status, "stale");
+        assert!(report.freshness.diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("projection version mismatch")
+        }));
     }
 
     fn resolve_ast_span_node<'a>(
@@ -27469,6 +27629,72 @@ fn main() { api::handler(); }
         )
         .unwrap();
         dir
+    }
+
+    fn setup_workspace_with_nested_scope() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join(".gitmodules"),
+            r#"[submodule "src/parent"]
+	path = src/parent
+	url = https://example.com/parent
+[submodule "src/parent/vendor/child"]
+	path = src/parent/vendor/child
+	url = https://example.com/child
+"#,
+        )
+        .unwrap();
+        let parent = root.join("src/parent");
+        let child = parent.join("vendor/child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(parent.join("lib.rs"), "fn parent_only() {}\n").unwrap();
+        std::fs::write(child.join("lib.rs"), "fn child_only() {}\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn federated_refresh_keeps_nested_scope_out_of_parent_index() {
+        let dir = setup_workspace_with_nested_scope();
+        cmd_index(
+            dir.path(),
+            false,
+            false,
+            false,
+            true,
+            false,
+            true,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let parent_root = dir.path().join("src/parent");
+        let child_root = parent_root.join("vendor/child");
+        let targets = resolve_search_index_targets(dir.path(), dir.path(), None, true).unwrap();
+        let parent = targets
+            .iter()
+            .find(|target| target.source_root == parent_root)
+            .expect("parent target");
+        assert_eq!(parent.excluded_roots, vec![child_root]);
+
+        let first = apply_search_index_update(dir.path(), parent).unwrap();
+        let second = apply_search_index_update(dir.path(), parent).unwrap();
+        assert_eq!((first.new, first.modified, first.deleted), (0, 0, 0));
+        assert_eq!((second.new, second.modified, second.deleted), (0, 0, 0));
+        let parent_db = index::IndexDb::open_read_only(&parent.db_path).unwrap();
+        assert!(
+            parent_db
+                .file_paths()
+                .unwrap()
+                .iter()
+                .all(|path| !path.contains("vendor/child"))
+        );
     }
 
     #[test]
@@ -33985,6 +34211,26 @@ fn sample() {}
                 assert_eq!(auth_token_env, "TSIFT_TEST_TOKEN");
             }
             _ => panic!("expected ConvexSync command"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graph_db_forced_rebuild() {
+        let cli = parse_cli([
+            "tsift",
+            "graph-db",
+            "--path",
+            ".",
+            "refresh",
+            "--rebuild",
+            "--json",
+        ]);
+        match cli.command {
+            Some(Commands::GraphDb {
+                query: GraphDbQuery::Refresh { rebuild },
+                ..
+            }) => assert!(rebuild),
+            _ => panic!("expected graph-db refresh --rebuild"),
         }
     }
 
