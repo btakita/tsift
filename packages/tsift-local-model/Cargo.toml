@@ -1,6 +1,6 @@
 [package]
 name = "tsift-local-model"
-version = "0.1.95"
+version = "0.1.96"
 edition = "2024"
 description = "Local model profile, GPU probe, and lifecycle contracts for tsift Knowledge Graph extraction"
 license = "MIT"

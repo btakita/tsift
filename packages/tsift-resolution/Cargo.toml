@@ -1,6 +1,6 @@
 [package]
 name = "tsift-resolution"
-version = "0.1.95"
+version = "0.1.96"
 edition = "2024"
 description = "Multi-strategy reference resolution, scoring heuristics, and path blocklist for tsift"
 license = "MIT"
@@ -14,4 +14,4 @@ publish = true
 [dependencies]
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
-tsift-core = { path = "../tsift-core", version = "0.1.95" }
+tsift-core = { path = "../tsift-core", version = "0.1.96" }

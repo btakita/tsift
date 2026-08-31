@@ -1,4 +1,4 @@
-<!-- tsift:opencode-command v=0.1.95 name=tsift-log-digest -->
+<!-- tsift:opencode-command v=0.1.96 name=tsift-log-digest -->
 ---
 description: Run a verbose command through the bounded log digest
 ---

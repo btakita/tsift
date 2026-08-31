@@ -130,7 +130,7 @@
   "regenerated_samples": {
     "graph_db_refresh": {
       "status": "current",
-      "projection_version": "tsift-traversal-v2@0.1.95",
+      "projection_version": "tsift-traversal-v2@0.1.96",
       "content_hash_present": true,
       "next_mentions_status": false,
       "next_mentions_doctor": true,

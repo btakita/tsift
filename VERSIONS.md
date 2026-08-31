@@ -8,6 +8,10 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.96
+
+- **Make graph freshness path-invariant and keep status actions executable** ([#24](https://github.com/btakita/tsift/issues/24)). Graph projection watermarks now canonicalize equivalent relative and absolute path hints, persist the exact path/mode domain used to build each projection, and apply that path-aware validator consistently to SQLite reads. `graph-db refresh` fails non-zero if its post-write projection is still stale, while summary extraction recommendations keep uncached counts out of the shell command field.
+
 ## 0.1.95
 
 - **Make graph freshness follow semantic index state and keep nested-scope repair idempotent** ([#23](https://github.com/btakita/tsift/issues/23)). Traversal watermarks now include a canonical hash of projection-driving index rows, projection versions include the tsift release version, and `graph-db status`, doctor, and context-pack fail closed when the current index no longer matches `graph.db`. Operators can force transactional replacement with `graph-db refresh --rebuild`, while federated inline repair now applies the same descendant-scope exclusions as workspace indexing.
