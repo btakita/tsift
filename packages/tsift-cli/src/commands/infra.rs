@@ -53,9 +53,10 @@ use crate::{
     print_graph_db_doctor_human, print_graph_db_drift_human, print_graph_db_evidence_report,
     print_graph_db_human, print_graph_db_operator_report, print_json_or_envelope, rewrite_command,
     schema_overview, shell_quote, sqlite_convex_rows_from_conn, sqlite_graph_freshness,
-    status_missing_workspace_scopes, table_columns, to_json_schema, tokensave_graph_freshness,
-    traversal_source_watermark, truncate_for_compact, validate_convex_projection_rows,
-    write_traversal_graph_store, write_traversal_graph_store_with_options,
+    sqlite_graph_freshness_for_path, status_missing_workspace_scopes, table_columns,
+    to_json_schema, tokensave_graph_freshness, traversal_source_watermark, truncate_for_compact,
+    validate_convex_projection_rows, write_traversal_graph_store,
+    write_traversal_graph_store_with_options,
 };
 use tsift_tokensave::TokensaveDb;
 
@@ -337,7 +338,12 @@ pub(crate) fn cmd_graph_db_refresh(
         Some(refresh),
         warnings,
     )?;
-    print_graph_db_operator_report(&report, format)
+    let fail_closed = report.freshness.fail_closed;
+    print_graph_db_operator_report(&report, format)?;
+    if fail_closed {
+        bail!("graph-db refresh completed with stale projection freshness");
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -2529,7 +2535,7 @@ pub(crate) fn cmd_graph_db(
     {
         let needs_refresh = if graph_db.exists() {
             let store = SqliteGraphStore::open_read_only_resilient(&graph_db)?;
-            sqlite_graph_freshness(&store, scope.unwrap_or("root"))?.fail_closed
+            sqlite_graph_freshness_for_path(&store, &root, path, scope, true)?.fail_closed
                 || graph_db_resolve_evidence_target_with_path(&store, target, preferred_path)?
                     .is_none()
         } else {
@@ -2547,7 +2553,13 @@ pub(crate) fn cmd_graph_db(
             if let Some(recovery) = store.read_only_recovery() {
                 warnings.push(graph_db_read_recovery_diagnostic(recovery));
             }
-            let freshness = sqlite_graph_freshness(&store, scope.unwrap_or("root"))?;
+            let freshness = sqlite_graph_freshness_for_path(
+                &store,
+                &root,
+                path,
+                scope,
+                matches!(&query, GraphDbQuery::Evidence { .. }),
+            )?;
             if let GraphDbQuery::Evidence {
                 target,
                 depth,

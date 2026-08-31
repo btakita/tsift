@@ -501,7 +501,9 @@ fn scoped_graph_projection_excludes_other_scope_semantics_and_tags_provenance() 
         "beta semantic rows leaked into alpha projection: {entities}"
     );
     assert!(
-        nodes.iter().all(|node| node["properties"]["scope"] == "alpha"),
+        nodes
+            .iter()
+            .all(|node| node["properties"]["scope"] == "alpha"),
         "scoped semantic nodes need explicit provenance: {entities}"
     );
 
@@ -1709,6 +1711,94 @@ fn graph_db_refresh_and_status_materialize_operator_report() {
     assert_eq!(
         status["compaction"]["live_rows"],
         refresh["compaction"]["live_rows"]
+    );
+}
+
+#[test]
+fn graph_db_relative_path_refresh_watermark_matches_current_status() {
+    let project = graph_db_project();
+    fs::remove_dir_all(project.path().join(".tsift")).unwrap();
+    init_git_repo(project.path());
+
+    let output = tsift_bin()
+        .args(["index", "."])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "index failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let graph_db_json_relative = |query: &[&str]| {
+        let output = tsift_bin()
+            .args(["graph-db", "--path", ".", "--json"])
+            .args(query)
+            .current_dir(project.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "graph-db {} failed\nstdout:\n{}\nstderr:\n{}",
+            query.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
+    };
+    let refresh = graph_db_json_relative(&["refresh", "--rebuild"]);
+    let status = graph_db_json_relative(&["status"]);
+
+    assert_eq!(refresh["status"], "current", "{refresh}");
+    assert_eq!(status["status"], "current", "{status}");
+    assert_eq!(
+        refresh["refresh"]["source_watermark"], refresh["freshness"]["source_watermark"],
+        "{refresh}"
+    );
+    assert_eq!(
+        refresh["refresh"]["source_watermark"], status["freshness"]["source_watermark"],
+        "refresh={refresh}\nstatus={status}"
+    );
+
+    fs::write(
+        project.path().join("main.rs"),
+        "fn main() {}\nfn changed_after_refresh() {}\n",
+    )
+    .unwrap();
+    let output = tsift_bin()
+        .args(["index", "."])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "reindex failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stale_status = graph_db_json_relative(&["status"]);
+    assert_eq!(stale_status["status"], "stale", "{stale_status}");
+
+    let stale_kind = tsift_bin()
+        .args([
+            "graph-db", "--path", ".", "--json", "kind", "symbol", "--limit", "1",
+        ])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(
+        !stale_kind.status.success(),
+        "stale kind read unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&stale_kind.stdout),
+        String::from_utf8_lossy(&stale_kind.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&stale_kind.stderr).contains("source watermark mismatch"),
+        "{}",
+        String::from_utf8_lossy(&stale_kind.stderr)
     );
 }
 
@@ -4405,7 +4495,8 @@ fn agent_orchestration_acceptance_pack_regenerates_from_real_queue_fixture() {
         );
     };
     assert_eq!(
-        expected, &actual,
+        expected,
+        &actual,
         "agent-orchestration acceptance fixture drifted; update fixtures/graph-db-operator-examples/agent-orchestration-acceptance-pack.json regenerated_samples from the live queue fixture output:\n{}",
         serde_json::to_string_pretty(&actual).unwrap(),
     );

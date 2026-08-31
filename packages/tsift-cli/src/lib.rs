@@ -4645,7 +4645,9 @@ pub(crate) fn graph_projection_content_hash(projection: &GraphProjection) -> Opt
 
 fn traversal_projection_from_graph(
     root: &Path,
+    path_hint: &Path,
     scope: Option<&str>,
+    session_only: bool,
     graph: &TraversalGraphBuild,
 ) -> Result<GraphProjection> {
     let provenance = GraphProvenance::new(
@@ -4714,6 +4716,8 @@ fn traversal_projection_from_graph(
     .with_property("projection_version", GRAPH_PROJECTION_VERSION)
     .with_property("content_hash", projection_hash.clone())
     .with_property("root", root.to_string_lossy().to_string())
+    .with_property("path_hint", traversal_watermark_path(root, path_hint))
+    .with_property("session_only", session_only.to_string())
     .with_property("scope", scope.unwrap_or("root"))
     .with_property("node_count", graph.nodes.len().to_string())
     .with_property("edge_count", graph.edges.len().to_string())
@@ -9827,7 +9831,29 @@ pub(crate) fn sqlite_graph_freshness_for_path(
     session_only: bool,
 ) -> Result<GraphDbFreshnessReport> {
     let mut freshness = sqlite_graph_freshness(store, scope.unwrap_or("root"))?;
-    apply_current_source_watermark(&mut freshness, root, path_hint, scope, session_only);
+    let projection_meta = store.node(&graph_projection_meta_id(scope))?;
+    let stored_path_hint = projection_meta
+        .as_ref()
+        .and_then(|meta| meta.properties.get("path_hint"))
+        .map(|stored| {
+            let stored = PathBuf::from(stored);
+            if stored.is_absolute() {
+                stored
+            } else {
+                root.join(stored)
+            }
+        });
+    let stored_session_only = projection_meta
+        .as_ref()
+        .and_then(|meta| meta.properties.get("session_only"))
+        .and_then(|stored| stored.parse::<bool>().ok());
+    apply_current_source_watermark(
+        &mut freshness,
+        root,
+        stored_path_hint.as_deref().unwrap_or(path_hint),
+        scope,
+        stored_session_only.unwrap_or(session_only),
+    );
     Ok(freshness)
 }
 
@@ -11043,7 +11069,7 @@ pub(crate) fn graph_db_backend_eval_refresh_with_profile(
         &mut phases,
         "projection_rows",
         "provider-neutral GraphStore node/edge row construction before SQLite persistence",
-        || traversal_projection_from_graph(root, scope, &source_graph),
+        || traversal_projection_from_graph(root, path_hint, scope, false, &source_graph),
     )?;
     let graph_db = graph_substrate_db_path(root, scope);
     let mut store = graph_db_backend_eval_timed_phase(
@@ -11482,7 +11508,7 @@ pub(crate) fn graph_db_backend_eval_full_projection_with_profile(
         &mut phases,
         "full_projection.projection_rows",
         "provider-neutral row construction for the opt-in full-project projection dataset",
-        || traversal_projection_from_graph(root, scope, &full_source),
+        || traversal_projection_from_graph(root, root, scope, false, &full_source),
     )?;
     let warnings = full_source.warnings;
     let refreshed_source_watermark =
@@ -13864,8 +13890,18 @@ fn markdown_files_for_traversal(root: &Path, path_hint: &Path) -> Result<Vec<Pat
 }
 
 fn traversal_watermark_path(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| root.join(path))
+    };
+    let canonical_path = fs::canonicalize(&absolute_path).unwrap_or(absolute_path);
+    canonical_path
+        .strip_prefix(&canonical_root)
+        .unwrap_or(&canonical_path)
         .to_string_lossy()
         .replace('\\', "/")
 }
@@ -15160,7 +15196,8 @@ pub(crate) fn write_traversal_graph_store_with_options(
 ) -> Result<(TraversalGraphBuild, SqliteProjectionRefresh)> {
     let source_graph =
         build_traversal_graph_source_with_options(root, path_hint, scope, session_only)?;
-    let projection = traversal_projection_from_graph(root, scope, &source_graph)?;
+    let projection =
+        traversal_projection_from_graph(root, path_hint, scope, session_only, &source_graph)?;
     let graph_db = graph_substrate_db_path(root, scope);
     // Serialize the write against concurrent refresh/snapshot-import (#gdbwritelock).
     let _write_lock = acquire_graph_db_write_lock(&graph_db)?;
@@ -24580,9 +24617,13 @@ dispatch #spec-test-build-install-commit-push
         )
         .unwrap();
         assert_eq!(report.status, "stale");
-        assert!(report.freshness.diagnostics.iter().any(|diagnostic| {
-            diagnostic.contains("projection version mismatch")
-        }));
+        assert!(
+            report
+                .freshness
+                .diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.contains("projection version mismatch") })
+        );
     }
 
     fn resolve_ast_span_node<'a>(
@@ -26373,7 +26414,9 @@ fn main() { api::handler(); }
     fn traversal_projection_queries_match_sqlite_and_convex_stores() {
         let dir = setup_traversal_project();
         let source_graph = build_traversal_graph_source(dir.path(), dir.path(), None).unwrap();
-        let projection = traversal_projection_from_graph(dir.path(), None, &source_graph).unwrap();
+        let projection =
+            traversal_projection_from_graph(dir.path(), dir.path(), None, false, &source_graph)
+                .unwrap();
 
         let mut sqlite = SqliteGraphStore::in_memory().unwrap();
         sqlite.replace_projection(&projection).unwrap();
@@ -33235,7 +33278,9 @@ fn sample() {}
     fn convex_sync_report_chunks_upserts_and_tombstones() {
         let dir = setup_traversal_project();
         let source_graph = build_traversal_graph_source(dir.path(), dir.path(), None).unwrap();
-        let projection = traversal_projection_from_graph(dir.path(), None, &source_graph).unwrap();
+        let projection =
+            traversal_projection_from_graph(dir.path(), dir.path(), None, false, &source_graph)
+                .unwrap();
         let mut snapshot = projection.to_convex_rows();
         snapshot.nodes.push(ConvexNodeRow {
             external_id: "stale-node".to_string(),
@@ -35329,8 +35374,14 @@ fn sample() {}
         let node = traversal_file_node(dir.path(), "src/lib.rs");
         graph.nodes.insert(node.handle.clone(), node);
 
-        let projection =
-            traversal_projection_from_graph(dir.path(), Some("alpha"), &graph).unwrap();
+        let projection = traversal_projection_from_graph(
+            dir.path(),
+            dir.path(),
+            Some("alpha"),
+            false,
+            &graph,
+        )
+        .unwrap();
         let file = projection
             .nodes
             .iter()

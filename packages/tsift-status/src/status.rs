@@ -874,12 +874,7 @@ fn build_recommendations(
                         .saturating_sub(*cached_files)
                         .saturating_sub(*terminal_failure_files);
                     if uncached > 0 {
-                        Some(format!(
-                            "tsift summarize --extract {}  ({} uncached file{})",
-                            summarize_extract,
-                            uncached,
-                            if uncached == 1 { "" } else { "s" }
-                        ))
+                        Some(format!("tsift summarize --extract {}", summarize_extract))
                     } else {
                         None
                     }
@@ -2400,6 +2395,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let source = b"fn main() {}\n";
         std::fs::write(dir.path().join("main.rs"), source).unwrap();
+        std::fs::write(dir.path().join("worker.rs"), "pub fn work() {}\n").unwrap();
         std::fs::write(dir.path().join("empty.rs"), "").unwrap();
         std::fs::write(dir.path().join("README.md"), "# Indexed documentation\n").unwrap();
         let db = IndexDb::open(&dir.path().join(".tsift/index.db")).unwrap();
@@ -2432,12 +2428,15 @@ mod tests {
                 ..
             } => {
                 assert_eq!(cached_files, 1);
-                assert_eq!(total_indexed_files, 1);
+                assert_eq!(total_indexed_files, 2);
                 assert_eq!(non_candidate_files, 2);
-                assert_eq!(coverage_pct, 100);
+                assert_eq!(coverage_pct, 50);
             }
             other => panic!("expected available summaries, got {other:?}"),
         }
+        let run = report.recommendations.run.as_deref().unwrap();
+        assert_eq!(run, "tsift init && tsift summarize --extract .");
+        assert!(!run.contains("uncached file"), "{run}");
     }
 
     #[test]
