@@ -6732,6 +6732,7 @@ struct GraphDbTombstoneCounts {
 
 #[derive(Clone, Serialize)]
 struct GraphDbOperatorCounts {
+    from_cache: bool,
     nodes: usize,
     edges: usize,
     tombstones: GraphDbTombstoneCounts,
@@ -6745,6 +6746,7 @@ struct GraphDbOperatorCounts {
 struct GraphDbCompactionPolicy {
     status: String,
     tombstone_scan_rows: usize,
+    retained_tombstone_rows: usize,
     live_rows: usize,
     file_size_bytes: Option<u64>,
     freelist_bytes: Option<u64>,
@@ -6915,12 +6917,11 @@ impl GraphDbDoctorReport {
         self.fail_closed = self.checks.iter().any(|check| check.fail_closed);
         self.status = if self.fail_closed {
             "fail_closed"
-        } else if self.checks.iter().any(|check| {
-            matches!(
-                check.status.as_str(),
-                "warning" | "large_projection" | "recommended"
-            )
-        }) {
+        } else if self
+            .checks
+            .iter()
+            .any(|check| matches!(check.status.as_str(), "warning" | "recommended"))
+        {
             "warning"
         } else {
             "ok"
@@ -6984,6 +6985,20 @@ fn graph_db_rebuild_command(root: &Path, scope: Option<&str>) -> String {
         shell_quote(root.to_string_lossy().as_ref()),
         graph_db_scope_arg(scope)
     )
+}
+
+fn graph_db_freshness_repair_command(
+    freshness: &GraphDbFreshnessReport,
+    root: &Path,
+    scope: Option<&str>,
+) -> String {
+    if freshness.projection_version.as_deref() != Some(GRAPH_PROJECTION_VERSION)
+        || freshness.content_hash.is_none()
+    {
+        graph_db_rebuild_command(root, scope)
+    } else {
+        graph_db_refresh_command(root, scope)
+    }
 }
 
 fn graph_db_backup_rebuild_command(root: &Path, scope: Option<&str>, graph_db: &Path) -> String {
@@ -7097,6 +7112,7 @@ fn sqlite_graph_counts_from_cache(
     Ok(row.map(
         |(nodes, edges, tombstone_nodes, tombstone_edges, file_size_bytes, freelist_bytes)| {
             GraphDbOperatorCounts {
+                from_cache: true,
                 nodes,
                 edges,
                 tombstones: GraphDbTombstoneCounts {
@@ -7130,6 +7146,7 @@ fn sqlite_graph_counts(conn: &Connection, scope: &str) -> Result<GraphDbOperator
         0
     };
     Ok(GraphDbOperatorCounts {
+        from_cache: false,
         nodes,
         edges,
         tombstones: sqlite_tombstone_counts(conn)?,
@@ -7157,8 +7174,13 @@ pub(crate) fn graph_db_compaction_policy(
     prune_confirmed: bool,
 ) -> GraphDbCompactionPolicy {
     let live_rows = counts.nodes + counts.edges;
-    let tombstone_scan_rows = counts.tombstones.total;
-    let tombstone_heavy = tombstone_scan_rows > live_rows.max(1);
+    let retained_tombstone_rows = counts.tombstones.total;
+    let tombstone_scan_rows = if counts.from_cache {
+        0
+    } else {
+        retained_tombstone_rows
+    };
+    let tombstone_heavy = retained_tombstone_rows > live_rows.max(1);
     let freelist_heavy = counts
         .file_size_bytes
         .zip(counts.freelist_bytes)
@@ -7199,7 +7221,14 @@ pub(crate) fn graph_db_compaction_policy(
     }
     let mut proof = vec![
         format!("{live_rows} live graph row(s)"),
-        format!("{tombstone_scan_rows} retained tombstone row(s) scanned by status/doctor"),
+        format!(
+            "{retained_tombstone_rows} retained tombstone row(s); count source: {}; compaction count scan: {tombstone_scan_rows} row(s)",
+            if counts.from_cache {
+                "cached refresh stats"
+            } else {
+                "live row scan"
+            }
+        ),
         format!(
             "graph.db file_size={} byte(s), freelist={} byte(s)",
             counts.file_size_bytes.unwrap_or(0),
@@ -7219,11 +7248,12 @@ pub(crate) fn graph_db_compaction_policy(
     GraphDbCompactionPolicy {
         status,
         tombstone_scan_rows,
+        retained_tombstone_rows,
         live_rows,
         file_size_bytes: counts.file_size_bytes,
         freelist_bytes: counts.freelist_bytes,
         safe_to_prune_tombstones: prune_confirmed,
-        requires_convex_reconciliation: tombstone_scan_rows > 0 && !prune_confirmed,
+        requires_convex_reconciliation: retained_tombstone_rows > 0 && !prune_confirmed,
         recommendations,
         proof,
     }
@@ -7243,41 +7273,35 @@ fn sqlite_database_freelist_bytes(conn: &Connection) -> Result<u64> {
 
 fn sqlite_graph_tombstone_retention_diagnostics(
     conn: &Connection,
-    scope: &str,
+    counts: &GraphDbOperatorCounts,
 ) -> Result<Vec<String>> {
     if !sqlite_table_exists(conn, "graph_tombstones")? {
         return Ok(Vec::new());
     }
-    let cached = sqlite_graph_counts_from_cache(conn, scope)?;
-    let counts = match cached.clone() {
-        Some(counts) => counts,
-        None => sqlite_graph_counts(conn, scope)?,
-    };
     let live_rows = counts.nodes + counts.edges;
     let file_size = counts.file_size_bytes.unwrap_or(0);
     let freelist = counts.freelist_bytes.unwrap_or(0);
-    let stale_live_tombstones = if cached.is_some() {
+    let stale_live_tombstones = if counts.from_cache {
         0
     } else {
-        let mut live_keys = BTreeSet::new();
+        // Probe the live primary keys in SQLite instead of allocating every
+        // live node/edge key in Rust for legacy projections without stats.
+        let mut stale_live_tombstones = 0usize;
         if sqlite_table_exists(conn, "graph_nodes")? {
-            let mut stmt = conn.prepare("SELECT id FROM graph_nodes")?;
-            for row in stmt.query_map([], |row| row.get::<_, String>(0))? {
-                live_keys.insert(format!("node:{}", row?));
-            }
+            stale_live_tombstones += conn.query_row(
+                "SELECT COUNT(*) FROM graph_tombstones t WHERE t.row_kind = 'node'
+                 AND EXISTS (SELECT 1 FROM graph_nodes n WHERE n.id = substr(t.row_key, 6))",
+                [],
+                |row| row_usize(row, 0),
+            )?;
         }
         if sqlite_table_exists(conn, "graph_edges")? {
-            let mut stmt = conn.prepare("SELECT edge_key FROM graph_edges")?;
-            for row in stmt.query_map([], |row| row.get::<_, String>(0))? {
-                live_keys.insert(format!("edge:{}", row?));
-            }
-        }
-        let mut stale_live_tombstones = 0usize;
-        let mut stmt = conn.prepare("SELECT row_key FROM graph_tombstones ORDER BY row_key")?;
-        for row in stmt.query_map([], |row| row.get::<_, String>(0))? {
-            if live_keys.contains(&row?) {
-                stale_live_tombstones += 1;
-            }
+            stale_live_tombstones += conn.query_row(
+                "SELECT COUNT(*) FROM graph_tombstones t WHERE t.row_kind = 'edge'
+                 AND EXISTS (SELECT 1 FROM graph_edges e WHERE e.edge_key = substr(t.row_key, 6))",
+                [],
+                |row| row_usize(row, 0),
+            )?;
         }
         stale_live_tombstones
     };
@@ -7289,19 +7313,18 @@ fn sqlite_graph_tombstone_retention_diagnostics(
         ));
     }
     if counts.tombstones.total > live_rows.max(1) {
-        let source = if cached.is_some() {
+        let source = if counts.from_cache {
             "cached refresh stats"
         } else {
             "live row scan"
         };
         diagnostics.push(format!(
-            "tombstone retention exceeds live graph rows: {} tombstone(s) vs {} live row(s) from {}; graph.db file_size={} byte(s), freelist={} byte(s), status/doctor tombstone scans inspect {} extra row(s). Run convex-sync against the remote snapshot before rebuild/compaction if a remote consumer may still need deletion reconciliation.",
+            "tombstone retention exceeds live graph rows: {} tombstone(s) vs {} live row(s) from {}; graph.db file_size={} byte(s), freelist={} byte(s). Run convex-sync against the remote snapshot before rebuild/compaction if a remote consumer may still need deletion reconciliation.",
             counts.tombstones.total,
             live_rows,
             source,
             file_size,
-            freelist,
-            counts.tombstones.total
+            freelist
         ));
     }
     Ok(diagnostics)
@@ -7984,7 +8007,7 @@ pub(crate) fn append_sqlite_graph_doctor_checks(
     report.push_check(graph_db_doctor_check(
         "sqlite_source_watermark",
         source_watermark_diagnostics,
-        vec![rebuild.clone()],
+        vec![graph_db_refresh_command(root, scope)],
     ));
 
     let duplicate_diagnostics = sqlite_graph_duplicate_diagnostics(conn.conn())
@@ -8011,13 +8034,16 @@ pub(crate) fn append_sqlite_graph_doctor_checks(
         vec![backup_rebuild],
     ));
 
-    let tombstone_diagnostics =
-        sqlite_graph_tombstone_retention_diagnostics(conn.conn(), scope.unwrap_or("root"))
-            .unwrap_or_else(|err| {
-                vec![format!(
-                    "graph tombstone retention inspection failed: {err}"
-                )]
-            });
+    let counts = sqlite_graph_counts(conn.conn(), scope.unwrap_or("root"));
+    let tombstone_diagnostics = counts
+        .as_ref()
+        .map_err(|err| anyhow::anyhow!(err.to_string()))
+        .and_then(|counts| sqlite_graph_tombstone_retention_diagnostics(conn.conn(), counts))
+        .unwrap_or_else(|err| {
+            vec![format!(
+                "graph tombstone retention inspection failed: {err}"
+            )]
+        });
     report.push_check(GraphDbDoctorCheck {
         name: "sqlite_tombstone_retention".to_string(),
         status: if tombstone_diagnostics.is_empty() {
@@ -8029,7 +8055,7 @@ pub(crate) fn append_sqlite_graph_doctor_checks(
         diagnostics: tombstone_diagnostics,
         repair_commands: Vec::new(),
     });
-    let compaction_check = match sqlite_graph_counts(conn.conn(), scope.unwrap_or("root")) {
+    let compaction_check = match counts {
         Ok(counts) => {
             let policy = graph_db_compaction_policy(root, scope, &counts, false);
             GraphDbDoctorCheck {
@@ -8362,6 +8388,7 @@ pub(crate) fn graph_db_operator_report_from_disk(
     if !graph_db.exists() {
         let next_commands = graph_db_operator_next_commands(root, scope, true);
         let counts = GraphDbOperatorCounts {
+            from_cache: false,
             nodes: 0,
             edges: 0,
             tombstones: GraphDbTombstoneCounts {
@@ -8413,10 +8440,12 @@ pub(crate) fn graph_db_operator_report_from_disk(
         warnings.push(graph_db_read_recovery_diagnostic(recovery));
     }
     let mut freshness = sqlite_graph_freshness_from_conn(conn.conn(), scope.unwrap_or("root"))?;
+    let mut repair = graph_db_freshness_repair_command(&freshness, root, scope);
     apply_current_source_watermark(&mut freshness, root, root, scope, false);
     let schema_diagnostics = sqlite_graph_schema_diagnostics(conn.conn())
         .unwrap_or_else(|err| vec![format!("graph.db schema inspection failed: {err}")]);
     if !schema_diagnostics.is_empty() {
+        repair = graph_db_rebuild_command(root, scope);
         freshness.diagnostics.extend(schema_diagnostics);
         freshness.fail_closed = true;
         freshness.status = "stale".to_string();
@@ -8424,12 +8453,11 @@ pub(crate) fn graph_db_operator_report_from_disk(
     let counts = sqlite_graph_counts(conn.conn(), scope.unwrap_or("root"))?;
     let semantic_row_count = sqlite_graph_semantic_node_count(conn.conn()).ok();
     warnings.extend(
-        sqlite_graph_tombstone_retention_diagnostics(conn.conn(), scope.unwrap_or("root"))
-            .unwrap_or_else(|err| {
-                vec![format!(
-                    "graph tombstone retention inspection failed: {err}"
-                )]
-            }),
+        sqlite_graph_tombstone_retention_diagnostics(conn.conn(), &counts).unwrap_or_else(|err| {
+            vec![format!(
+                "graph tombstone retention inspection failed: {err}"
+            )]
+        }),
     );
     let status = if freshness.fail_closed {
         "stale"
@@ -8438,7 +8466,7 @@ pub(crate) fn graph_db_operator_report_from_disk(
     }
     .to_string();
     let next_commands = if freshness.fail_closed {
-        let mut commands = vec![graph_db_rebuild_command(root, scope)];
+        let mut commands = vec![repair];
         commands.extend(graph_db_operator_next_commands(root, scope, false));
         commands
     } else {
@@ -9798,6 +9826,7 @@ fn apply_current_source_watermark(
     scope: Option<&str>,
     session_only: bool,
 ) {
+    let repair = graph_db_freshness_repair_command(freshness, root, scope);
     let mismatch = match traversal_source_watermark(root, path_hint, scope, session_only) {
         Ok(Some(expected)) if freshness.source_watermark.as_deref() == Some(expected.as_str()) => {
             None
@@ -9805,15 +9834,15 @@ fn apply_current_source_watermark(
         Ok(Some(expected)) => Some(format!(
             "graph projection source watermark mismatch: expected {expected} got {}; run `{}`",
             freshness.source_watermark.as_deref().unwrap_or("<missing>"),
-            graph_db_rebuild_command(root, scope)
+            repair
         )),
         Ok(None) => Some(format!(
             "graph projection source watermark could not be derived from the current index; run `{}`",
-            graph_db_rebuild_command(root, scope)
+            repair
         )),
         Err(err) => Some(format!(
             "graph projection source watermark validation failed: {err}; run `{}`",
-            graph_db_rebuild_command(root, scope)
+            repair
         )),
     };
     if let Some(diagnostic) = mismatch {
@@ -24584,13 +24613,20 @@ dispatch #spec-test-build-install-commit-push
         assert!(stale.freshness.fail_closed);
         assert!(stale.freshness.diagnostics.iter().any(|diagnostic| {
             diagnostic.contains("source watermark mismatch")
-                && diagnostic.contains("refresh --rebuild")
+                && diagnostic.contains("refresh --json")
+                && !diagnostic.contains("--rebuild")
         }));
         assert!(
             stale
                 .next_commands
                 .iter()
-                .any(|command| command.contains("refresh --rebuild"))
+                .any(|command| command.contains("refresh --json"))
+        );
+        assert!(
+            stale
+                .next_commands
+                .iter()
+                .all(|command| !command.contains("--rebuild"))
         );
     }
 
@@ -24617,6 +24653,12 @@ dispatch #spec-test-build-install-commit-push
         )
         .unwrap();
         assert_eq!(report.status, "stale");
+        assert!(
+            report
+                .next_commands
+                .iter()
+                .any(|command| command.contains("refresh --rebuild"))
+        );
         assert!(
             report
                 .freshness
@@ -35374,14 +35416,9 @@ fn sample() {}
         let node = traversal_file_node(dir.path(), "src/lib.rs");
         graph.nodes.insert(node.handle.clone(), node);
 
-        let projection = traversal_projection_from_graph(
-            dir.path(),
-            dir.path(),
-            Some("alpha"),
-            false,
-            &graph,
-        )
-        .unwrap();
+        let projection =
+            traversal_projection_from_graph(dir.path(), dir.path(), Some("alpha"), false, &graph)
+                .unwrap();
         let file = projection
             .nodes
             .iter()
@@ -35396,6 +35433,7 @@ fn sample() {}
     #[test]
     fn graph_db_compaction_reports_large_dense_projection() {
         let counts = GraphDbOperatorCounts {
+            from_cache: true,
             nodes: 160_000,
             edges: 156_000,
             tombstones: GraphDbTombstoneCounts {
@@ -35424,7 +35462,7 @@ fn sample() {}
     }
 
     #[test]
-    fn graph_db_doctor_reports_non_fatal_checks_as_warning() {
+    fn graph_db_doctor_keeps_large_projection_informational() {
         let mut report = GraphDbDoctorReport::new(
             Path::new("/repo"),
             None,
@@ -35440,8 +35478,99 @@ fn sample() {}
             repair_commands: Vec::new(),
         });
         report.finalize();
-        assert_eq!(report.status, "warning");
+        assert_eq!(report.status, "ok");
         assert!(!report.fail_closed);
+        assert!(report.repair_commands.is_empty());
+    }
+
+    #[test]
+    fn graph_db_doctor_preserves_warning_and_fail_closed_precedence() {
+        for (status, fail_closed, expected) in [
+            ("warning", false, "warning"),
+            ("recommended", false, "warning"),
+            ("large_projection", true, "fail_closed"),
+        ] {
+            let mut report = GraphDbDoctorReport::new(
+                Path::new("/repo"),
+                None,
+                "sqlite",
+                Path::new("/repo/.tsift/graph.db"),
+                None,
+            );
+            report.push_check(GraphDbDoctorCheck {
+                name: "test_check".to_string(),
+                status: status.to_string(),
+                fail_closed,
+                diagnostics: vec!["finding without an automatic repair".to_string()],
+                repair_commands: Vec::new(),
+            });
+            report.finalize();
+            assert_eq!(report.status, expected);
+            assert_eq!(report.fail_closed, fail_closed);
+        }
+    }
+
+    #[test]
+    fn graph_db_cached_storage_checks_never_read_graph_rows() {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        let dir = setup_graph_index();
+        write_traversal_graph_store(dir.path(), dir.path(), None).unwrap();
+        let conn = Connection::open(dir.path().join(".tsift/graph.db")).unwrap();
+        conn.execute(
+            "UPDATE graph_operator_stats SET nodes = 100, edges = 100,
+             tombstone_nodes = 214319, tombstone_edges = 0 WHERE scope = 'root'",
+            [],
+        )
+        .unwrap();
+        conn.authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+            AuthAction::Read {
+                table_name: "graph_nodes" | "graph_edges" | "graph_tombstones",
+                ..
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+        let counts = sqlite_graph_counts(&conn, "root").unwrap();
+        assert!(counts.from_cache);
+        assert_eq!(counts.tombstones.total, 214319);
+        let diagnostics = sqlite_graph_tombstone_retention_diagnostics(&conn, &counts).unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|line| line.contains("cached refresh stats"))
+        );
+        let policy = graph_db_compaction_policy(dir.path(), None, &counts, false);
+        assert_eq!(policy.tombstone_scan_rows, 0);
+        assert_eq!(policy.retained_tombstone_rows, 214319);
+        assert_eq!(policy.status, "recommended");
+        assert!(policy.requires_convex_reconciliation);
+    }
+
+    #[test]
+    fn graph_db_legacy_storage_checks_find_revived_tombstones() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE graph_nodes (id TEXT PRIMARY KEY);
+             CREATE TABLE graph_edges (edge_key TEXT PRIMARY KEY);
+             CREATE TABLE graph_tombstones (row_key TEXT PRIMARY KEY, row_kind TEXT);
+             INSERT INTO graph_nodes VALUES ('live');
+             INSERT INTO graph_edges VALUES ('live-edge');
+             INSERT INTO graph_tombstones VALUES
+               ('node:live', 'node'), ('edge:live-edge', 'edge'), ('node:deleted', 'node');",
+        )
+        .unwrap();
+        let counts = sqlite_graph_counts(&conn, "root").unwrap();
+        assert!(!counts.from_cache);
+        assert_eq!(counts.tombstones.total, 3);
+        let diagnostics = sqlite_graph_tombstone_retention_diagnostics(&conn, &counts).unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|line| line.starts_with("2 tombstone(s) reference rows that are live again"))
+        );
+        let policy = graph_db_compaction_policy(Path::new("/repo"), None, &counts, false);
+        assert_eq!(policy.tombstone_scan_rows, 3);
+        assert_eq!(policy.retained_tombstone_rows, 3);
     }
 }
 

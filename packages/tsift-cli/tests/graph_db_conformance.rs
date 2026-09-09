@@ -1715,6 +1715,41 @@ fn graph_db_refresh_and_status_materialize_operator_report() {
 }
 
 #[test]
+fn graph_db_doctor_large_projection_is_healthy_and_uses_cached_counts() {
+    let project = graph_db_project();
+    graph_db_json(project.path(), Backend::Sqlite, vec!["refresh".to_string()]);
+    let conn = Connection::open(project.path().join(".tsift/graph.db")).unwrap();
+    // Exercise the real size policy without writing a gigabyte-sized fixture.
+    conn.execute(
+        "UPDATE graph_operator_stats SET nodes = 160000, edges = 156000,
+         tombstone_nodes = 100, tombstone_edges = 0,
+         file_size_bytes = 1073741824, freelist_bytes = 0 WHERE scope = 'root'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let status = graph_db_json(project.path(), Backend::Sqlite, vec!["status".to_string()]);
+    assert_eq!(status["counts"]["from_cache"], true, "{status}");
+    assert_eq!(status["compaction"]["tombstone_scan_rows"], 0, "{status}");
+    assert_eq!(
+        status["compaction"]["retained_tombstone_rows"], 100,
+        "{status}"
+    );
+    let doctor = graph_db_json(project.path(), Backend::Sqlite, vec!["doctor".to_string()]);
+    assert_eq!(doctor["status"], "ok", "{doctor}");
+    assert_eq!(doctor["fail_closed"], false, "{doctor}");
+    assert_eq!(doctor["repair_commands"], json!([]), "{doctor}");
+    let policy = doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "sqlite_compaction_policy")
+        .unwrap();
+    assert_eq!(policy["status"], "large_projection", "{doctor}");
+    assert_eq!(policy["repair_commands"], json!([]), "{doctor}");
+}
+
+#[test]
 fn graph_db_relative_path_refresh_watermark_matches_current_status() {
     let project = graph_db_project();
     fs::remove_dir_all(project.path().join(".tsift")).unwrap();
@@ -1781,6 +1816,30 @@ fn graph_db_relative_path_refresh_watermark_matches_current_status() {
 
     let stale_status = graph_db_json_relative(&["status"]);
     assert_eq!(stale_status["status"], "stale", "{stale_status}");
+    assert!(
+        stale_status["next_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|command| !command.as_str().unwrap().contains("--rebuild")),
+        "{stale_status}"
+    );
+
+    let stale_doctor = tsift_bin()
+        .args(["graph-db", "--path", ".", "--json", "doctor"])
+        .current_dir(project.path())
+        .output()
+        .unwrap();
+    assert!(!stale_doctor.status.success());
+    let doctor: Value = serde_json::from_slice(&stale_doctor.stdout).unwrap();
+    let repairs = doctor["repair_commands"].as_array().unwrap();
+    assert!(!repairs.is_empty(), "{doctor}");
+    assert!(
+        repairs
+            .iter()
+            .all(|command| !command.as_str().unwrap().contains("--rebuild")),
+        "{doctor}"
+    );
 
     let stale_kind = tsift_bin()
         .args([
@@ -1800,6 +1859,10 @@ fn graph_db_relative_path_refresh_watermark_matches_current_status() {
         "{}",
         String::from_utf8_lossy(&stale_kind.stderr)
     );
+    assert!(!String::from_utf8_lossy(&stale_kind.stderr).contains("--rebuild"));
+    let repaired = graph_db_json_relative(&["refresh"]);
+    assert_eq!(repaired["status"], "current", "{repaired}");
+    assert_eq!(graph_db_json_relative(&["doctor"])["status"], "ok");
 }
 
 #[test]

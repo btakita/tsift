@@ -114,10 +114,23 @@ JavaScript route extraction accepts router-like receivers (`app`, `router`,
 `server`, `api`, or names ending in `Router`) and ignores comments and unrelated
 method calls such as `URLSearchParams.get` and `.delete`.
 
-For a `large_projection`, doctor elevates overall health to `warning` and states
-that no automatic compaction remedy exists while the freelist is empty. The
-operator can narrow projected scope/property density or explicitly accept the
-live storage cost.
+For a `large_projection`, doctor preserves the informational per-check status
+and reports overall `ok` when all other checks are healthy, with no repair
+commands. Genuine `warning` and `recommended` checks still elevate health to
+`warning`, even without an automatic repair; any fail-closed check takes precedence.
+The operator can narrow projected scope/property density or accept the live
+storage cost.
+
+Storage reporting shares a single count result between compaction and retention
+checks. `counts.from_cache` identifies refresh-produced counts; cached checks do
+not read live graph or tombstone rows. `compaction.retained_tombstone_rows` records
+retained deletions, while `tombstone_scan_rows` reports rows counted by the
+compaction fallback (zero on cache hits), not all of doctor's integrity scans.
+Legacy projections without cached stats use live counts and SQL primary-key
+probes for revived tombstones without materializing all live keys in memory.
+Source-watermark drift recommends incremental `refresh --json` in status, doctor,
+and read diagnostics. Projection-version mismatch and invalid projection metadata
+continue to require `refresh --rebuild --json`.
 
 ### Graph DB Performance Release Gate
 

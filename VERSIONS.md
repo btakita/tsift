@@ -8,6 +8,10 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.97
+
+- **Keep large graph projections healthy and storage diagnostics accurate** ([#25](https://github.com/btakita/tsift/issues/25)). Informational `large_projection` checks no longer elevate doctor to `warning`; actionable warnings and fail-closed checks retain their severity. Compaction and retention share cached refresh counts, report retained tombstones separately from count-scan rows, and use indexed SQL probes instead of materializing live keys on the legacy fallback. Source-watermark drift recommends incremental refresh, while projection-version and schema failures retain rebuild guidance.
+
 ## 0.1.96
 
 - **Make graph freshness path-invariant and keep status actions executable** ([#24](https://github.com/btakita/tsift/issues/24)). Graph projection watermarks now canonicalize equivalent relative and absolute path hints, persist the exact path/mode domain used to build each projection, and apply that path-aware validator consistently to SQLite reads. `graph-db refresh` fails non-zero if its post-write projection is still stale, while summary extraction recommendations keep uncached counts out of the shell command field.
