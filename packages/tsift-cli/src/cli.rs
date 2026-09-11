@@ -836,7 +836,7 @@ pub enum Commands {
         /// Restrict graph evidence to a specific submodule
         #[arg(long)]
         scope: Option<String>,
-        /// Maximum affected test targets to display (0 = unlimited)
+        /// Maximum test targets, modules, signals, and evidence paths to display (0 = unlimited)
         #[arg(short, long, default_value = "20")]
         limit: usize,
         /// Output as JSON

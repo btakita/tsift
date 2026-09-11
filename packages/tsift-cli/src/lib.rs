@@ -19963,13 +19963,26 @@ fn cmd_impact(
 
     if format.compact {
         println!(
-            "impact mode:{} changed:{} symbols:{} tests:{}/{}",
+            "impact mode:{} changed:{} symbols:{} tests:{}/{} modules:{}/{} signals:{}/{}",
             diff_digest_mode_label(report.mode),
             report.changed_files.len(),
             report.changed_symbols.len(),
             report.affected_tests.len(),
-            report.affected_tests_total
+            report.affected_tests_total,
+            report.production_modules.len(),
+            report.production_modules_total,
+            report.test_signals.len(),
+            report.test_signals_total
         );
+        for module in &report.production_modules {
+            println!(
+                "module {} files:{} paths:{}/{}",
+                module.module,
+                module.files.len(),
+                module.evidence_paths.len(),
+                module.evidence_paths_total
+            );
+        }
         for target in &report.affected_tests {
             println!(
                 "{} reasons:{} command:{}",
@@ -19977,6 +19990,9 @@ fn cmd_impact(
                 target.reasons.len(),
                 target.commands.join(" && ")
             );
+        }
+        for signal in &report.test_signals {
+            println!("signal {} {} {}", signal.kind, signal.path, signal.detail);
         }
         for warning in &report.warnings {
             println!("warning {warning}");
@@ -19992,6 +20008,40 @@ fn cmd_impact(
         report.affected_tests.len(),
         report.affected_tests_total
     );
+    println!(
+        "  production modules:     {}/{}",
+        report.production_modules.len(),
+        report.production_modules_total
+    );
+    println!(
+        "  structured test signals:{}/{}",
+        report.test_signals.len(),
+        report.test_signals_total
+    );
+    if !report.production_modules.is_empty() {
+        println!();
+        println!("Production modules");
+        for module in &report.production_modules {
+            println!("{}", module.module);
+            println!("  files: {}", module.files.join(", "));
+            for reason in &module.reasons {
+                println!("  - {reason}");
+            }
+            for evidence in &module.evidence_paths {
+                let nodes = evidence
+                    .nodes
+                    .iter()
+                    .map(|node| match node.line {
+                        Some(line) => format!("{} ({}:{line})", node.symbol, node.file),
+                        None if node.file.is_empty() => node.symbol.clone(),
+                        None => format!("{} ({})", node.symbol, node.file),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                println!("  evidence: {nodes}");
+            }
+        }
+    }
     for target in &report.affected_tests {
         println!();
         println!("{}", target.path);
@@ -20004,6 +20054,16 @@ fn cmd_impact(
         for command in &target.commands {
             println!("  run: {}", command);
         }
+    }
+    if !report.test_signals.is_empty() {
+        println!();
+        println!("Test signals");
+        for signal in &report.test_signals {
+            println!("  {} [{}]: {}", signal.path, signal.kind, signal.detail);
+        }
+    }
+    if report.context_truncated {
+        println!("warning: impact context was truncated by --limit");
     }
     for warning in &report.warnings {
         println!("warning: {warning}");

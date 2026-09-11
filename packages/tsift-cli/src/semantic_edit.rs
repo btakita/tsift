@@ -317,6 +317,13 @@ pub(crate) struct SemanticEditVerificationImpact {
     pub(crate) changed_symbols: usize,
     pub(crate) affected_tests: usize,
     pub(crate) affected_tests_total: usize,
+    pub(crate) production_modules_total: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) production_modules: Vec<impact::ImpactProductionModule>,
+    pub(crate) test_signals_total: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub(crate) test_signals: Vec<impact::ImpactTestSignal>,
+    pub(crate) context_truncated: bool,
     pub(crate) truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub(crate) warnings: Vec<String>,
@@ -6315,6 +6322,11 @@ fn verify_semantic_edit_intents(
             changed_symbols: impact_report.changed_symbols.len(),
             affected_tests: impact_report.affected_tests.len(),
             affected_tests_total: impact_report.affected_tests_total,
+            production_modules_total: impact_report.production_modules_total,
+            production_modules: impact_report.production_modules,
+            test_signals_total: impact_report.test_signals_total,
+            test_signals: impact_report.test_signals,
+            context_truncated: impact_report.context_truncated,
             truncated: impact_report.truncated,
             warnings: impact_report.warnings,
         },

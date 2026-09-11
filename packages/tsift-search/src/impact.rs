@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tsift_digest::diff_digest::{self, DiffDigestOptions};
@@ -33,6 +33,42 @@ pub struct ImpactTestTarget {
     pub commands: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ImpactEvidenceNode {
+    pub symbol: String,
+    pub file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ImpactEvidencePath {
+    pub changed_symbol: String,
+    pub target_symbol: String,
+    pub target_file: String,
+    pub nodes: Vec<ImpactEvidenceNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImpactProductionModule {
+    pub module: String,
+    pub files: Vec<String>,
+    pub symbols: Vec<String>,
+    pub reasons: Vec<String>,
+    pub evidence_paths: Vec<ImpactEvidencePath>,
+    pub evidence_paths_total: usize,
+    pub evidence_paths_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ImpactTestSignal {
+    pub path: String,
+    pub kind: String,
+    pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed_symbol: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImpactReport {
     pub root: String,
@@ -43,6 +79,16 @@ pub struct ImpactReport {
     pub changed_symbols: Vec<String>,
     pub affected_tests_total: usize,
     pub affected_tests: Vec<ImpactTestTarget>,
+    #[serde(default)]
+    pub production_modules_total: usize,
+    #[serde(default)]
+    pub production_modules: Vec<ImpactProductionModule>,
+    #[serde(default)]
+    pub test_signals_total: usize,
+    #[serde(default)]
+    pub test_signals: Vec<ImpactTestSignal>,
+    #[serde(default)]
+    pub context_truncated: bool,
     pub truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
@@ -52,6 +98,32 @@ pub struct ImpactReport {
 struct ImpactTargetBuilder {
     reasons: BTreeSet<String>,
     symbols: BTreeSet<String>,
+}
+
+#[derive(Debug, Default)]
+struct ImpactProductionModuleBuilder {
+    files: BTreeSet<String>,
+    symbols: BTreeSet<String>,
+    reasons: BTreeSet<String>,
+    evidence_paths: BTreeSet<ImpactEvidencePath>,
+}
+
+impl ImpactProductionModuleBuilder {
+    fn add_file(&mut self, file: impl Into<String>) {
+        self.files.insert(file.into());
+    }
+
+    fn add_symbol(&mut self, symbol: impl Into<String>) {
+        self.symbols.insert(symbol.into());
+    }
+
+    fn add_reason(&mut self, reason: impl Into<String>) {
+        self.reasons.insert(reason.into());
+    }
+
+    fn add_evidence_path(&mut self, path: ImpactEvidencePath) {
+        self.evidence_paths.insert(path);
+    }
 }
 
 impl ImpactTargetBuilder {
@@ -105,6 +177,7 @@ pub fn compute_with_phases(
         .iter()
         .map(|file| file.path.clone())
         .collect::<Vec<_>>();
+    let changed_file_set = changed_files.iter().cloned().collect::<BTreeSet<_>>();
     let changed_symbols = diff
         .files
         .iter()
@@ -116,18 +189,39 @@ pub fn compute_with_phases(
         .iter()
         .map(|symbol| symbol.to_ascii_lowercase())
         .collect::<BTreeSet<_>>();
+    let mut changed_symbol_files = BTreeMap::<String, BTreeSet<String>>::new();
+    for file in &diff.files {
+        for symbol in &file.touched_symbols {
+            changed_symbol_files
+                .entry(symbol.to_ascii_lowercase())
+                .or_default()
+                .insert(file.path.clone());
+        }
+    }
     let changed_tokens = changed_reference_tokens(&changed_files, &changed_symbols);
 
     let test_scan_started = Instant::now();
     let mut targets = BTreeMap::<String, ImpactTargetBuilder>::new();
+    let mut production_targets = BTreeMap::<String, ImpactProductionModuleBuilder>::new();
+    let mut test_signals = BTreeSet::<ImpactTestSignal>::new();
     for file in &diff.files {
         let abs = root.join(&file.path);
-        if is_test_path(&file.path) || file_contains_inline_tests(&abs) {
+        let test_path = is_test_path(&file.path);
+        if test_path || file_contains_inline_tests(&abs) {
             let entry = targets.entry(file.path.clone()).or_default();
             entry.add_reason("changed test-bearing file");
             for symbol in &file.touched_symbols {
                 entry.add_symbol(symbol);
             }
+            test_signals.insert(ImpactTestSignal {
+                path: file.path.clone(),
+                kind: "changed_test".to_string(),
+                detail: "changed test-bearing file".to_string(),
+                changed_symbol: None,
+            });
+        }
+        if !test_path {
+            add_changed_production_file(&mut production_targets, &file.path, &file.touched_symbols);
         }
     }
     phases.push(ImpactPhaseTiming {
@@ -144,11 +238,31 @@ pub fn compute_with_phases(
         Ok(db_path) if db_path.exists() => {
             match index::IndexDb::open_read_only_resilient(&db_path) {
                 Ok(db) => {
+                    let edges = db.all_stored_edges()?;
                     let call_started = Instant::now();
-                    add_call_edge_impacts(&root, &db, &changed_symbol_set, &mut targets)?;
+                    add_call_edge_impacts(
+                        &root,
+                        &edges,
+                        &changed_symbol_set,
+                        &mut targets,
+                        &mut test_signals,
+                    );
+                    add_production_call_impacts(
+                        &root,
+                        &edges,
+                        &changed_symbol_files,
+                        &mut production_targets,
+                    );
                     call_edge_micros = call_started.elapsed().as_micros();
                     let route_started = Instant::now();
-                    add_route_handler_impacts(&root, &db, &changed_symbol_set, &mut targets)?;
+                    add_route_handler_impacts(
+                        &root,
+                        &db,
+                        &changed_symbol_set,
+                        &mut targets,
+                        &mut production_targets,
+                        &mut test_signals,
+                    )?;
                     route_handler_micros = route_started.elapsed().as_micros();
                 }
                 Err(err) => warnings.push(format!(
@@ -184,7 +298,15 @@ pub fn compute_with_phases(
     });
 
     let import_started = Instant::now();
-    add_import_impacts(&root, &source_root, &changed_tokens, &mut targets)?;
+    add_import_impacts(
+        &root,
+        &source_root,
+        &changed_file_set,
+        &changed_tokens,
+        &mut targets,
+        &mut production_targets,
+        &mut test_signals,
+    )?;
     phases.push(ImpactPhaseTiming {
         name: "import_impacts".to_string(),
         duration_micros: import_started.elapsed().as_micros(),
@@ -215,6 +337,16 @@ pub fn compute_with_phases(
         affected_tests.truncate(limit);
     }
 
+    let (production_modules_total, production_modules, production_context_truncated) =
+        bounded_production_modules(production_targets, limit);
+    let test_signals_total = test_signals.len();
+    let mut test_signals = test_signals.into_iter().collect::<Vec<_>>();
+    let test_signals_truncated = limit > 0 && test_signals.len() > limit;
+    if test_signals_truncated {
+        test_signals.truncate(limit);
+    }
+    let context_truncated = production_context_truncated || test_signals_truncated;
+
     let report = ImpactReport {
         root: root.display().to_string(),
         mode: diff.mode,
@@ -223,6 +355,11 @@ pub fn compute_with_phases(
         changed_symbols,
         affected_tests_total,
         affected_tests,
+        production_modules_total,
+        production_modules,
+        test_signals_total,
+        test_signals,
+        context_truncated,
         truncated,
         warnings,
     };
@@ -307,16 +444,66 @@ fn file_contains_inline_tests(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn production_module_name(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let parts = normalized
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    match parts.as_slice() {
+        [
+            group @ ("packages" | "crates" | "apps" | "services"),
+            name,
+            ..,
+        ] => {
+            format!("{group}/{name}")
+        }
+        [top, ..] if parts.len() > 1 => (*top).to_string(),
+        _ => ".".to_string(),
+    }
+}
+
+fn production_entry<'a>(
+    modules: &'a mut BTreeMap<String, ImpactProductionModuleBuilder>,
+    path: &str,
+) -> &'a mut ImpactProductionModuleBuilder {
+    modules.entry(production_module_name(path)).or_default()
+}
+
+fn add_changed_production_file(
+    modules: &mut BTreeMap<String, ImpactProductionModuleBuilder>,
+    path: &str,
+    symbols: &[String],
+) {
+    let entry = production_entry(modules, path);
+    entry.add_file(path);
+    entry.add_reason("contains changed source");
+    for symbol in symbols {
+        entry.add_symbol(symbol);
+        entry.add_evidence_path(ImpactEvidencePath {
+            changed_symbol: symbol.clone(),
+            target_symbol: symbol.clone(),
+            target_file: path.to_string(),
+            nodes: vec![ImpactEvidenceNode {
+                symbol: symbol.clone(),
+                file: path.to_string(),
+                line: None,
+            }],
+        });
+    }
+}
+
 fn add_call_edge_impacts(
     root: &Path,
-    db: &index::IndexDb,
+    edges: &[index::StoredEdge],
     changed_symbols: &BTreeSet<String>,
     targets: &mut BTreeMap<String, ImpactTargetBuilder>,
-) -> Result<()> {
+    test_signals: &mut BTreeSet<ImpactTestSignal>,
+) {
     if changed_symbols.is_empty() {
-        return Ok(());
+        return;
     }
-    for edge in db.all_stored_edges()? {
+    for edge in edges {
         if !changed_symbols.contains(&edge.callee_name.to_ascii_lowercase()) {
             continue;
         }
@@ -324,14 +511,99 @@ fn add_call_edge_impacts(
         if !is_test_path(&path) && !file_contains_inline_tests(&root.join(&path)) {
             continue;
         }
-        let entry = targets.entry(path).or_default();
+        let entry = targets.entry(path.clone()).or_default();
         entry.add_reason(format!(
             "call graph reaches changed symbol {}",
             edge.callee_name
         ));
-        entry.add_symbol(edge.callee_name);
+        entry.add_symbol(&edge.callee_name);
+        test_signals.insert(ImpactTestSignal {
+            path,
+            kind: "call_graph".to_string(),
+            detail: format!(
+                "{} calls changed symbol {}",
+                edge.caller_name, edge.callee_name
+            ),
+            changed_symbol: Some(edge.callee_name.clone()),
+        });
     }
-    Ok(())
+}
+
+const MAX_IMPACT_EVIDENCE_DEPTH: usize = 4;
+
+fn add_production_call_impacts(
+    root: &Path,
+    edges: &[index::StoredEdge],
+    changed_symbol_files: &BTreeMap<String, BTreeSet<String>>,
+    modules: &mut BTreeMap<String, ImpactProductionModuleBuilder>,
+) {
+    let mut incoming = BTreeMap::<String, Vec<&index::StoredEdge>>::new();
+    for edge in edges {
+        incoming
+            .entry(edge.callee_name.to_ascii_lowercase())
+            .or_default()
+            .push(edge);
+    }
+    for candidates in incoming.values_mut() {
+        candidates.sort_by(|left, right| {
+            left.caller_file
+                .cmp(&right.caller_file)
+                .then_with(|| left.caller_name.cmp(&right.caller_name))
+                .then_with(|| left.call_site_line.cmp(&right.call_site_line))
+        });
+    }
+
+    for (changed_key, seed_files) in changed_symbol_files {
+        let changed_symbol = incoming
+            .get(changed_key)
+            .and_then(|candidates| candidates.first())
+            .map(|edge| edge.callee_name.clone())
+            .unwrap_or_else(|| changed_key.clone());
+        let seed_file = seed_files.iter().next().cloned().unwrap_or_default();
+        let seed = ImpactEvidenceNode {
+            symbol: changed_symbol.clone(),
+            file: seed_file,
+            line: None,
+        };
+        let mut queue = VecDeque::from([(changed_key.clone(), vec![seed])]);
+        let mut visited = BTreeSet::from([changed_key.clone()]);
+
+        while let Some((callee, nodes)) = queue.pop_front() {
+            if nodes.len() >= MAX_IMPACT_EVIDENCE_DEPTH {
+                continue;
+            }
+            let Some(candidates) = incoming.get(&callee) else {
+                continue;
+            };
+            for edge in candidates {
+                let path = rel_path(root, Path::new(&edge.caller_file));
+                let mut next_nodes = nodes.clone();
+                next_nodes.push(ImpactEvidenceNode {
+                    symbol: edge.caller_name.clone(),
+                    file: path.clone(),
+                    line: usize::try_from(edge.caller_line).ok(),
+                });
+                if !is_test_path(&path) {
+                    let entry = production_entry(modules, &path);
+                    entry.add_file(&path);
+                    entry.add_symbol(&edge.caller_name);
+                    entry.add_reason(format!("calls changed symbol {changed_symbol}"));
+                    entry.add_evidence_path(ImpactEvidencePath {
+                        changed_symbol: changed_symbol.clone(),
+                        target_symbol: edge.caller_name.clone(),
+                        target_file: path,
+                        nodes: next_nodes.clone(),
+                    });
+                }
+                let caller_key = edge.caller_name.to_ascii_lowercase();
+                if next_nodes.len() <= MAX_IMPACT_EVIDENCE_DEPTH
+                    && visited.insert(caller_key.clone())
+                {
+                    queue.push_back((caller_key, next_nodes));
+                }
+            }
+        }
+    }
 }
 
 fn add_route_handler_impacts(
@@ -339,6 +611,8 @@ fn add_route_handler_impacts(
     db: &index::IndexDb,
     changed_symbols: &BTreeSet<String>,
     targets: &mut BTreeMap<String, ImpactTargetBuilder>,
+    modules: &mut BTreeMap<String, ImpactProductionModuleBuilder>,
+    test_signals: &mut BTreeSet<ImpactTestSignal>,
 ) -> Result<()> {
     if changed_symbols.is_empty() {
         return Ok(());
@@ -348,12 +622,38 @@ fn add_route_handler_impacts(
             continue;
         }
         let path = rel_path(root, Path::new(&route.file));
-        let entry = targets.entry(path).or_default();
-        entry.add_reason(format!(
+        let detail = format!(
             "route {} handled by changed symbol {}",
             route.route_path, route.handler_name
-        ));
-        entry.add_symbol(route.handler_name);
+        );
+        let test_path = is_test_path(&path);
+        if test_path || file_contains_inline_tests(&root.join(&path)) {
+            let entry = targets.entry(path.clone()).or_default();
+            entry.add_reason(&detail);
+            entry.add_symbol(&route.handler_name);
+            test_signals.insert(ImpactTestSignal {
+                path: path.clone(),
+                kind: "route".to_string(),
+                detail: detail.clone(),
+                changed_symbol: Some(route.handler_name.clone()),
+            });
+        }
+        if !test_path {
+            let entry = production_entry(modules, &path);
+            entry.add_file(&path);
+            entry.add_symbol(&route.handler_name);
+            entry.add_reason(detail);
+            entry.add_evidence_path(ImpactEvidencePath {
+                changed_symbol: route.handler_name.clone(),
+                target_symbol: route.handler_name.clone(),
+                target_file: path.clone(),
+                nodes: vec![ImpactEvidenceNode {
+                    symbol: route.handler_name.clone(),
+                    file: path,
+                    line: usize::try_from(route.line).ok(),
+                }],
+            });
+        }
     }
     Ok(())
 }
@@ -361,15 +661,18 @@ fn add_route_handler_impacts(
 fn add_import_impacts(
     root: &Path,
     source_root: &Path,
+    changed_files: &BTreeSet<String>,
     changed_tokens: &BTreeSet<String>,
     targets: &mut BTreeMap<String, ImpactTargetBuilder>,
+    modules: &mut BTreeMap<String, ImpactProductionModuleBuilder>,
+    test_signals: &mut BTreeSet<ImpactTestSignal>,
 ) -> Result<()> {
     if changed_tokens.is_empty() {
         return Ok(());
     }
     for entry in walk::walk_files(source_root)? {
         let path = rel_path(root, &entry.path);
-        if !is_test_path(&path) && !file_contains_inline_tests(&entry.path) {
+        if changed_files.contains(&path) {
             continue;
         }
         let content = std::fs::read_to_string(&entry.path)
@@ -378,12 +681,70 @@ fn add_import_impacts(
         if matched.is_empty() {
             continue;
         }
-        let target = targets.entry(path).or_default();
-        for token in matched {
-            target.add_reason(format!("imports changed module or symbol {token}"));
+        let test_path = is_test_path(&path);
+        if test_path || file_contains_inline_tests(&entry.path) {
+            let target = targets.entry(path.clone()).or_default();
+            for token in &matched {
+                let detail = format!("imports changed module or symbol {token}");
+                target.add_reason(&detail);
+                test_signals.insert(ImpactTestSignal {
+                    path: path.clone(),
+                    kind: "import".to_string(),
+                    detail,
+                    changed_symbol: Some(token.clone()),
+                });
+            }
+        }
+        if !test_path {
+            let target = production_entry(modules, &path);
+            target.add_file(&path);
+            for token in matched {
+                target.add_symbol(&token);
+                target.add_reason(format!("imports changed module or symbol {token}"));
+            }
         }
     }
     Ok(())
+}
+
+fn bounded_production_modules(
+    modules: BTreeMap<String, ImpactProductionModuleBuilder>,
+    limit: usize,
+) -> (usize, Vec<ImpactProductionModule>, bool) {
+    let total = modules.len();
+    let mut module_entries = modules.into_iter().collect::<Vec<_>>();
+    let modules_truncated = limit > 0 && module_entries.len() > limit;
+    if modules_truncated {
+        module_entries.truncate(limit);
+    }
+
+    let mut remaining_paths = if limit == 0 { usize::MAX } else { limit };
+    let mut context_truncated = modules_truncated;
+    let modules = module_entries
+        .into_iter()
+        .map(|(module, builder)| {
+            let evidence_paths_total = builder.evidence_paths.len();
+            let take = evidence_paths_total.min(remaining_paths);
+            let evidence_paths = builder
+                .evidence_paths
+                .into_iter()
+                .take(take)
+                .collect::<Vec<_>>();
+            remaining_paths = remaining_paths.saturating_sub(take);
+            let evidence_paths_truncated = evidence_paths.len() < evidence_paths_total;
+            context_truncated |= evidence_paths_truncated;
+            ImpactProductionModule {
+                module,
+                files: builder.files.into_iter().collect(),
+                symbols: builder.symbols.into_iter().collect(),
+                reasons: builder.reasons.into_iter().collect(),
+                evidence_paths,
+                evidence_paths_total,
+                evidence_paths_truncated,
+            }
+        })
+        .collect();
+    (total, modules, context_truncated)
 }
 
 fn import_tokens_for_file(
@@ -546,6 +907,11 @@ mod tests {
         )
         .unwrap();
         fs::write(
+            dir.path().join("src/service.rs"),
+            "use crate::add;\npub fn calculate() -> i32 { add(1, 2) }\n",
+        )
+        .unwrap();
+        fs::write(
             dir.path().join("tests/add_test.rs"),
             "use tsift_runner_fixture::add;\n#[test]\nfn adds_numbers() { let value = add(1, 2); assert_eq!(value, 3); }\n",
         )
@@ -590,6 +956,72 @@ mod tests {
             target.reasons
         );
         assert_eq!(target.commands, vec!["cargo test --test add_test"]);
+        assert!(report.test_signals.iter().any(|signal| {
+            signal.path == "tests/add_test.rs"
+                && signal.kind == "call_graph"
+                && signal.changed_symbol.as_deref() == Some("add")
+        }));
+
+        let production = report
+            .production_modules
+            .iter()
+            .find(|module| module.module == "src")
+            .expect("expected grouped src production module");
+        assert!(production.files.contains(&"src/lib.rs".to_string()));
+        assert!(production.files.contains(&"src/service.rs".to_string()));
+        let path = production
+            .evidence_paths
+            .iter()
+            .find(|path| path.target_symbol == "calculate")
+            .expect("expected reverse call evidence for calculate");
+        assert_eq!(
+            path.nodes
+                .iter()
+                .map(|node| node.symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec!["add", "calculate"]
+        );
+    }
+
+    #[test]
+    fn production_context_uses_one_shared_limit_for_modules_and_paths() {
+        let mut modules = BTreeMap::new();
+        for (module, file) in [("apps/a", "apps/a/src.rs"), ("apps/b", "apps/b/src.rs")] {
+            let entry = modules
+                .entry(module.to_string())
+                .or_insert_with(ImpactProductionModuleBuilder::default);
+            entry.add_file(file);
+            for symbol in ["one", "two"] {
+                entry.add_evidence_path(ImpactEvidencePath {
+                    changed_symbol: symbol.to_string(),
+                    target_symbol: symbol.to_string(),
+                    target_file: file.to_string(),
+                    nodes: Vec::new(),
+                });
+            }
+        }
+
+        let (total, bounded, truncated) = bounded_production_modules(modules, 1);
+        assert_eq!(total, 2);
+        assert_eq!(bounded.len(), 1);
+        assert_eq!(bounded[0].evidence_paths.len(), 1);
+        assert_eq!(bounded[0].evidence_paths_total, 2);
+        assert!(bounded[0].evidence_paths_truncated);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn production_module_names_group_workspace_units() {
+        assert_eq!(
+            production_module_name("packages/search/src/lib.rs"),
+            "packages/search"
+        );
+        assert_eq!(
+            production_module_name("crates/core/src/lib.rs"),
+            "crates/core"
+        );
+        assert_eq!(production_module_name("src/lib.rs"), "src");
+        assert_eq!(production_module_name("build.rs"), ".");
     }
 
     #[test]
