@@ -291,8 +291,8 @@ do [#t275]. spec-test-build-install-commit-push
         self.coverage.mark("status/current_instructions");
     }
 
-    /// The block points at the generated runbook, so a current marker with no
-    /// runbook on disk must still read as stale and recommend `tsift init`.
+    /// The skill points at the generated reference, so a current marker with
+    /// no reference on disk must still read as stale and recommend `tsift init`.
     fn status_missing_runbook(&mut self) {
         let dir = self.empty_project_dir("no-runbook");
         write_instruction_file(&dir, init::TSIFT_VERSION);
@@ -348,10 +348,12 @@ do [#t275]. spec-test-build-install-commit-push
 }
 
 fn write_instruction_file(dir: &Path, version: &str) {
+    let skill = dir.join(init::SKILL_RELATIVE_PATH);
+    fs::create_dir_all(skill.parent().unwrap()).unwrap();
     fs::write(
-        dir.join("AGENTS.md"),
+        skill,
         format!(
-            "<!-- tsift:code-navigation v={version} -->\n## Code Navigation\n<!-- /tsift:code-navigation -->\n"
+            "---\nname: tsift\ndescription: Test.\n---\n<!-- tsift:skill v={version} -->\n# tsift\n<!-- /tsift:skill -->\n"
         ),
     )
     .unwrap();

@@ -2894,8 +2894,8 @@ pub(crate) fn cmd_init(
     // #wsinit: `--workspace` already means workspace-wide for the index, and
     // `status` maintains index state for every scope. Instructions used to stop
     // at the superproject, so submodules stayed on releases-old text — and
-    // AGENTS.md tells an agent to work from the submodule root, which is
-    // exactly the file that never got refreshed.
+    // the repository-local skill tells an agent to work from the submodule
+    // root, which is exactly the surface that never got refreshed.
     if workspace {
         init_workspace_scopes(&resolved)?;
     }
@@ -2912,13 +2912,13 @@ fn print_init_updates(result: &init::InitResult) {
             update.file.display(),
             update.action,
             match update.action {
-                init::InitAction::Created => "tsift Code Navigation section added",
-                init::InitAction::Updated => "tsift Code Navigation section updated to latest",
+                init::InitAction::Created => "tsift skill surface added",
+                init::InitAction::Updated => "tsift skill surface updated to latest",
                 init::InitAction::AlreadyPresent => "no changes needed",
                 init::InitAction::Removed =>
-                    "duplicate tsift Code Navigation section removed — this file already inherits AGENTS.md",
+                    "legacy tsift Code Navigation section removed",
                 init::InitAction::Deferred =>
-                    "defers to AGENTS.md — no tsift Code Navigation section added",
+                    "no managed tsift content found",
             }
         );
     }
@@ -2929,11 +2929,11 @@ fn print_init_updates(result: &init::InitResult) {
     }
 }
 
-/// Refresh the tracked instruction surface in every workspace scope
+/// Refresh the repository-local skill in every workspace scope
 /// (`#wsinit`).
 ///
 /// Harness integrations (`--codex`, `--opencode`) stay at the root the operator
-/// invoked them from; only the Code Navigation block and its runbook fan out,
+/// invoked them from; only the tsift skill and its reference fan out,
 /// because that is what `status` reports on and what a submodule-local harness
 /// actually loads. A scope opts out with `instructions = false` under its
 /// `.tsift/config.toml` override.

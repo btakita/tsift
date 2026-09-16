@@ -661,7 +661,7 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Initialize tsift in a project — ensure Code Navigation in AGENTS.md and CLAUDE.md
+    /// Initialize tsift in a project — install the repository-local tsift skill
     Init {
         /// Path to the project directory (defaults to current directory)
         #[arg(default_value = ".")]
@@ -1034,7 +1034,7 @@ pub enum Commands {
         /// Skip automatic index fixes (auto-fix is now the default)
         #[arg(long)]
         no_fix: bool,
-        /// Also refresh tracked Code Navigation instruction files (same writes as `tsift init`)
+        /// Also refresh the tracked repository-local tsift skill (same writes as `tsift init`)
         #[arg(long)]
         fix_instructions: bool,
         /// [deprecated] Index auto-fix is the default; this now only adds --fix-instructions

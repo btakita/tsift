@@ -21516,12 +21516,12 @@ fn status_instructions_need_fix(report: &status::StatusReport) -> bool {
     !matches!(report.instructions, init::InstructionStatus::Current { .. })
 }
 
-/// Refresh the tracked Code Navigation instruction surface.
+/// Refresh the tracked repository-local tsift skill.
 ///
-/// This writes version-controlled files (`AGENTS.md`, `CLAUDE.md`, the managed
-/// runbook), so it is never part of bare `tsift status`. Every tracked path it
-/// touches is named on stderr — a move or rewrite must not show up as an
-/// unexplained diff.
+/// This writes `.agents/skills/tsift/` and may remove only tsift-owned legacy
+/// blocks from `AGENTS.md`, `AGENTS.override.md`, or `CLAUDE.md`, so it is never
+/// part of bare `tsift status`. Every tracked path it touches is named on
+/// stderr — a move or rewrite must not show up as an unexplained diff.
 pub(crate) fn apply_status_instruction_fixes(
     root: &Path,
     report: &status::StatusReport,
@@ -21564,7 +21564,7 @@ pub(crate) fn report_tracked_instruction_writes(
         let verb = match update.action {
             init::InitAction::Created => "created",
             init::InitAction::Updated => "rewrote",
-            init::InitAction::Removed => "removed duplicate section in",
+            init::InitAction::Removed => "removed legacy section in",
             init::InitAction::AlreadyPresent | init::InitAction::Deferred => continue,
         };
         eprintln!(

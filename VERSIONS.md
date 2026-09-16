@@ -8,6 +8,10 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.98
+
+- **Move tsift navigation guidance from ambient instruction files into a repository skill.** `tsift init` now writes `.agents/skills/tsift/SKILL.md` plus its `references/code-navigation.md`, migrates both historical runbook locations, and removes only tsift-owned legacy blocks from `AGENTS.md`, `AGENTS.override.md`, and `CLAUDE.md`. Existing team instructions are preserved, unmanaged same-path skills fail closed, workspace scopes receive their own discoverable skill, and status still requires an explicit instruction-fix command before changing tracked files.
+
 ## 0.1.97
 
 - **Keep large graph projections healthy and storage diagnostics accurate** ([#25](https://github.com/btakita/tsift/issues/25)). Informational `large_projection` checks no longer elevate doctor to `warning`; actionable warnings and fail-closed checks retain their severity. Compaction and retention share cached refresh counts, report retained tombstones separately from count-scan rows, and use indexed SQL probes instead of materializing live keys on the legacy fallback. Source-watermark drift recommends incremental refresh, while projection-version and schema failures retain rebuild guidance.

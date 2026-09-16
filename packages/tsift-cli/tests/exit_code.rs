@@ -6669,20 +6669,23 @@ fn status_fix_refreshes_stale_instructions_after_version_bump_in_json() {
 
     let agents = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
     assert!(
-        agents.contains(&format!(
-            "<!-- tsift:code-navigation v={} -->",
+        !agents.contains("tsift:code-navigation") && !agents.contains("Old guidance."),
+        "AGENTS.md was: {agents}"
+    );
+    let skill = fs::read_to_string(dir.path().join(".agents/skills/tsift/SKILL.md")).unwrap();
+    assert!(
+        skill.contains(&format!(
+            "<!-- tsift:skill v={} -->",
             env!("CARGO_PKG_VERSION")
         )),
-        "AGENTS.md was: {agents}"
-    );
-    assert!(
-        !agents.contains("v=0.1.41") && !agents.contains("Old guidance."),
-        "AGENTS.md was: {agents}"
+        "SKILL.md was: {skill}"
     );
 
-    // The refreshed block points at the runbook, so the fix must produce it.
-    let runbook =
-        fs::read_to_string(dir.path().join(".agent/runbooks/code-navigation.md")).unwrap();
+    let runbook = fs::read_to_string(
+        dir.path()
+            .join(".agents/skills/tsift/references/code-navigation.md"),
+    )
+    .unwrap();
     assert!(
         runbook.contains(&format!(
             "<!-- tsift:code-navigation-runbook v={} -->",
@@ -6697,7 +6700,7 @@ fn status_fix_refreshes_stale_instructions_after_version_bump_in_json() {
 }
 
 #[test]
-fn init_writes_the_runbook_and_does_not_duplicate_into_a_claude_md_that_imports_agents_md() {
+fn init_writes_the_skill_and_removes_legacy_claude_block() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("AGENTS.md"), "# Agents\n").unwrap();
     fs::write(
@@ -6717,7 +6720,7 @@ fn init_writes_the_runbook_and_does_not_duplicate_into_a_claude_md_that_imports_
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("duplicate tsift Code Navigation section removed"),
+        stdout.contains("legacy tsift Code Navigation section removed"),
         "stdout was: {stdout}"
     );
 
@@ -6732,20 +6735,9 @@ fn init_writes_the_runbook_and_does_not_duplicate_into_a_claude_md_that_imports_
         "CLAUDE.md was: {claude}"
     );
 
-    let agents = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
-    assert!(
-        agents.contains("<!-- tsift:code-navigation v="),
-        "AGENTS.md was: {agents}"
-    );
-    assert!(
-        agents.contains(".agent/runbooks/code-navigation.md"),
-        "AGENTS.md was: {agents}"
-    );
-    assert!(
-        dir.path()
-            .join(".agent/runbooks/code-navigation.md")
-            .exists()
-    );
+    assert_eq!(fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(), "# Agents\n");
+    assert!(dir.path().join(".agents/skills/tsift/SKILL.md").exists());
+    assert!(dir.path().join(".agents/skills/tsift/references/code-navigation.md").exists());
 }
 
 #[test]
@@ -6905,10 +6897,8 @@ fn status_does_not_rewrite_tracked_instruction_files_by_default() {
         "AGENTS.md must be byte-identical after a bare status"
     );
     assert!(
-        !dir.path()
-            .join(".agent/runbooks/code-navigation.md")
-            .exists(),
-        "bare status must not create the managed runbook"
+        !dir.path().join(".agents/skills/tsift/SKILL.md").exists(),
+        "bare status must not create the managed skill"
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -6944,14 +6934,18 @@ fn status_fix_instructions_names_every_tracked_file_it_writes() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("status fix: rewrote AGENTS.md (v0.1.41 -> v"),
+        stderr.contains("status fix: removed legacy section in AGENTS.md (v0.1.41 -> v"),
         "stderr was: {stderr}"
     );
     assert!(
         stderr.contains(&format!(
-            "status fix: created .agent/runbooks/code-navigation.md (v0.1.41 -> v{})",
+            "status fix: created .agents/skills/tsift/SKILL.md (v0.1.41 -> v{})",
             env!("CARGO_PKG_VERSION")
         )),
+        "stderr was: {stderr}"
+    );
+    assert!(
+        stderr.contains("status fix: created .agents/skills/tsift/references/code-navigation.md"),
         "stderr was: {stderr}"
     );
 
@@ -6995,12 +6989,16 @@ fn status_fix_instructions_names_the_legacy_runbook_relocation() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains(
-            "status fix: moved runbooks/code-navigation.md -> .agent/runbooks/code-navigation.md"
+            "status fix: moved runbooks/code-navigation.md -> .agents/skills/tsift/references/code-navigation.md"
         ),
         "a tracked deletion must be named, not silent; stderr was: {stderr}"
     );
     assert!(!dir.path().join("runbooks/code-navigation.md").exists());
-    let moved = fs::read_to_string(dir.path().join(".agent/runbooks/code-navigation.md")).unwrap();
+    let moved = fs::read_to_string(
+        dir.path()
+            .join(".agents/skills/tsift/references/code-navigation.md"),
+    )
+    .unwrap();
     assert!(
         moved.contains("Hand-written trailer."),
         "unmanaged text must survive the move; runbook was: {moved}"
@@ -7029,14 +7027,14 @@ fn init_names_the_legacy_runbook_relocation() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("runbooks/code-navigation.md: moved -> .agent/runbooks/code-navigation.md"),
+        stdout.contains("runbooks/code-navigation.md: moved -> .agents/skills/tsift/references/code-navigation.md"),
         "stdout was: {stdout}"
     );
 }
 
 /// The instructions tsift writes must not teach a flag tsift deprecated.
 #[test]
-fn generated_code_navigation_block_does_not_recommend_the_deprecated_status_fix_flag() {
+fn generated_skill_does_not_recommend_the_deprecated_status_fix_flag() {
     let dir = tempfile::tempdir().unwrap();
     let output = tsift_bin()
         .args(["init", dir.path().to_str().unwrap()])
@@ -7048,18 +7046,21 @@ fn generated_code_navigation_block_does_not_recommend_the_deprecated_status_fix_
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let agents = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
-    let runbook =
-        fs::read_to_string(dir.path().join(".agent/runbooks/code-navigation.md")).unwrap();
-    for surface in [&agents, &runbook] {
+    let skill = fs::read_to_string(dir.path().join(".agents/skills/tsift/SKILL.md")).unwrap();
+    let runbook = fs::read_to_string(
+        dir.path()
+            .join(".agents/skills/tsift/references/code-navigation.md"),
+    )
+    .unwrap();
+    for surface in [&skill, &runbook] {
         assert!(
             !surface.contains("tsift status --fix"),
             "generated instructions still teach the deprecated flag: {surface}"
         );
     }
     assert!(
-        agents.contains("`tsift init` to refresh the tracked Code Navigation block"),
-        "AGENTS.md was: {agents}"
+        skill.contains("`tsift init` to refresh the repository-local tsift skill"),
+        "SKILL.md was: {skill}"
     );
 }
 
@@ -7551,7 +7552,7 @@ url = https://example.com/deploy
 
 // #wsinit regression: `tsift init --workspace` refreshed instruction files only
 // in the superproject while `status` maintained index state for every scope, so
-// submodules stayed on releases-old text — and AGENTS.md tells an agent to work
+// submodules stayed on releases-old text — and the repository skill tells an agent to work
 // from the submodule root, which is exactly the file that never got refreshed.
 #[test]
 fn init_workspace_refreshes_every_scope_instruction_surface() {
@@ -7572,15 +7573,17 @@ fn init_workspace_refreshes_every_scope_instruction_surface() {
     assert!(stdout.contains("scope beta:"), "{stdout}");
 
     for scope in ["alpha", "beta"] {
-        let agents = dir.path().join(format!("src/{scope}/AGENTS.md"));
+        let skill = dir
+            .path()
+            .join(format!("src/{scope}/.agents/skills/tsift/SKILL.md"));
         assert!(
-            agents.exists(),
+            skill.exists(),
             "init --workspace must write {}",
-            agents.display()
+            skill.display()
         );
         let runbook = dir
             .path()
-            .join(format!("src/{scope}/.agent/runbooks/code-navigation.md"));
+            .join(format!("src/{scope}/.agents/skills/tsift/references/code-navigation.md"));
         assert!(
             runbook.exists(),
             "init --workspace must write {}",
@@ -7625,10 +7628,16 @@ fn init_workspace_skips_scopes_that_opt_out_of_instructions() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("scope alpha: skipped"), "{stdout}");
     assert!(
-        !dir.path().join("src/alpha/AGENTS.md").exists(),
+        !dir.path()
+            .join("src/alpha/.agents/skills/tsift/SKILL.md")
+            .exists(),
         "an opted-out scope must not be written"
     );
-    assert!(dir.path().join("src/beta/AGENTS.md").exists());
+    assert!(
+        dir.path()
+            .join("src/beta/.agents/skills/tsift/SKILL.md")
+            .exists()
+    );
 }
 
 // #graphfed regression: `search` had `--federated`, `explain` and `graph` did
