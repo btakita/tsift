@@ -65,9 +65,9 @@ reaches is what it can actually do:
 
 | Fans out to | Meaning | Languages |
 |---|---|---|
-| `tsift-astgrep` + `tsift-graph` + `tsift-search` | Indexable **and** structural. Searchable, graphable, and eligible for the symbol-resolved edit kinds | rust, python, typescript, javascript, kotlin, bash, go, markdown |
+| `tsift-astgrep` + `tsift-graph` + `tsift-search` | Indexable **and** structural. Searchable, graphable, and eligible for the symbol-resolved edit kinds | rust, python, typescript, javascript, kotlin, bash, go, csharp, markdown |
 | `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig, gdscript — `ast-grep-language` ships no Zig or GDScript grammar |
-| `tsift-astgrep` only | **Structural-only**: `ast-grep search`/`rewrite` and the `structural_rewrite` edit intent work; the language is not indexed, not searchable, and not graphable | c, cpp, csharp, css, dart, elixir, haskell, hcl, html, java, json, lua, nix, php, ruby, scala, solidity, swift, yaml |
+| `tsift-astgrep` only | **Structural-only**: `ast-grep search`/`rewrite` and the `structural_rewrite` edit intent work; the language is not indexed, not searchable, and not graphable | c, cpp, css, dart, elixir, haskell, hcl, html, java, json, lua, nix, php, ruby, scala, solidity, swift, yaml |
 
 Structural-only is a deliberate tier, not an oversight. A tree-sitter grammar is
 enough to match and rewrite a shape, but indexing additionally needs per-language
@@ -88,6 +88,11 @@ no tag queries, so `search`, `explain`, and `graph` were blind to every Go symbo
 in a Go module and `call_edges` stayed empty, while `status` still reported the
 scope as `fresh`. It now carries symbol and call queries, an identifier-node-kind
 set, and the indexed executor tier.
+
+C# followed the same path under `#csharpindex`: `.cs` files now contribute type,
+method, property, enum-member, and local-function symbols plus invocation call
+edges. Its identifier-aware rename edits declarations and calls while leaving
+comments, strings, and same-named property reads untouched.
 
 Promoting a structural-only language therefore means adding the graph/search
 side. That unlocks `rename_symbol` immediately — it reads occurrences out of the

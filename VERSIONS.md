@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **Promote C# to full indexed navigation support.** `.cs` files now provide symbols and call edges to search/graph commands, and the semantic edit planner supports identifier-aware `rename_symbol` alongside structural rewrites.
+
 ## 0.1.98
 
 - **Move tsift navigation guidance from ambient instruction files into a repository skill.** `tsift init` now writes `.agents/skills/tsift/SKILL.md` plus its `references/code-navigation.md`, migrates both historical runbook locations, and removes only tsift-owned legacy blocks from `AGENTS.md`, `AGENTS.override.md`, and `CLAUDE.md`. Existing team instructions are preserved, unmanaged same-path skills fail closed, workspace scopes receive their own discoverable skill, and status still requires an explicit instruction-fix command before changing tracked files.

@@ -553,7 +553,9 @@ fn resolve_edges_uncached(symbols: &[Symbol], call_sites: &[CallSite]) -> Vec<Ca
     for site in call_sites {
         let caller = symbols
             .iter()
-            .filter(|s| s.kind == "function" || s.kind == "class" || s.kind == "mod")
+            .filter(|s| {
+                matches!(s.kind.as_str(), "function" | "method" | "class" | "mod")
+            })
             .filter(|s| site.line >= s.line && site.line <= s.end_line)
             .min_by_key(|s| s.end_line - s.line);
         if let Some(caller) = caller {

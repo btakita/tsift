@@ -5642,6 +5642,7 @@ dependencies = [
  "serde",
  "tree-sitter",
  "tree-sitter-bash",
+ "tree-sitter-c-sharp",
  "tree-sitter-gdscript",
  "tree-sitter-go",
  "tree-sitter-javascript",

@@ -1477,13 +1477,13 @@ const SEMANTIC_EDIT_LANGUAGE_CONTRACTS: &[SemanticEditLanguageContract] = &[
         executor: SemanticEditExecutorLanguage::CSharp,
         id: "csharp",
         name: "C#",
-        graph_lang: None,
+        graph_lang: Some(graph::Lang::CSharp),
         temp_suffix: ".cs",
         aliases: &["csharp", "cs", "c#"],
         extensions: &["cs"],
-        recognized_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
-        apply_supported_intents: SEMANTIC_EDIT_STRUCTURAL_KINDS,
-        family: SemanticEditLanguageFamily::Structural,
+        recognized_intents: SEMANTIC_EDIT_INDEXED_KINDS,
+        apply_supported_intents: SEMANTIC_EDIT_INDEXED_KINDS,
+        family: SemanticEditLanguageFamily::Indexed,
         formatter: SemanticEditFormatterContract::None,
     },
     SemanticEditLanguageContract {
@@ -2271,6 +2271,22 @@ const SEMANTIC_EDIT_RENAME_FIXTURES: &[SemanticEditRenameFixture] = &[
         ],
     },
     SemanticEditRenameFixture {
+        executor: SemanticEditExecutorLanguage::CSharp,
+        alias: "csharp",
+        source: "class Counter {\n    static int WidgetCount() => 3;\n    static int Caller() => WidgetCount();\n    // WidgetCount comment\n    static string Label = \"WidgetCount\";\n}\nclass Data {\n    public int WidgetCount { get; set; }\n    public int Read() => this.WidgetCount;\n}\n",
+        symbol: "WidgetCount",
+        symbol_kind: "method",
+        new_name: "GadgetCount",
+        expected_replacements: 2,
+        renamed: &["static int GadgetCount()", "=> GadgetCount();"],
+        untouched: &[
+            "// WidgetCount comment",
+            "\"WidgetCount\"",
+            "int WidgetCount { get; set; }",
+            "this.WidgetCount",
+        ],
+    },
+    SemanticEditRenameFixture {
         executor: SemanticEditExecutorLanguage::GdScript,
         alias: "gdscript",
         // `func widget_count` and `var widget_count` are both `name` nodes;
@@ -2738,6 +2754,16 @@ fn semantic_edit_language_contracts_resolve_current_executor_surface() {
             "cmd/main.go",
             SemanticEditExecutorLanguage::Go,
             "go",
+            SEMANTIC_EDIT_INDEXED_KINDS,
+            SEMANTIC_EDIT_INDEXED_KINDS,
+            SemanticEditFormatterContract::None,
+        ),
+        // #csharpindex moved C# from the structural-only tier to the indexed tier.
+        (
+            "csharp",
+            "Program.cs",
+            SemanticEditExecutorLanguage::CSharp,
+            "csharp",
             SEMANTIC_EDIT_INDEXED_KINDS,
             SEMANTIC_EDIT_INDEXED_KINDS,
             SemanticEditFormatterContract::None,
@@ -7607,7 +7633,7 @@ mod structural_rewrite_tests {
         // instead. A collapsed table would satisfy both loops vacuously.
         assert_eq!(
             SEMANTIC_EDIT_RENAME_FIXTURES.len(),
-            11,
+            12,
             "the rename conformance table has {} rows",
             SEMANTIC_EDIT_RENAME_FIXTURES.len()
         );

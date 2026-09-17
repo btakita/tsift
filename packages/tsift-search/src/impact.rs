@@ -432,6 +432,8 @@ fn is_import_line(lang: Lang, line: &str) -> bool {
                     .split_once(' ')
                     .is_some_and(|(_alias, rest)| rest.starts_with('"') && rest.ends_with('"'))
         }
+        #[cfg(feature = "lang-csharp")]
+        Lang::CSharp => trimmed.starts_with("using ") || trimmed.starts_with("global using "),
         // GDScript has no `import`: a script pulls in another script by
         // extending it or by `preload`/`load`ing a `res://` path.
         #[cfg(feature = "lang-gdscript")]

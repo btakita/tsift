@@ -37,6 +37,8 @@ pub enum Lang {
     Bash,
     #[cfg(feature = "lang-go")]
     Go,
+    #[cfg(feature = "lang-csharp")]
+    CSharp,
     #[cfg(feature = "lang-gdscript")]
     GdScript,
     #[cfg(feature = "lang-markdown")]
@@ -67,6 +69,8 @@ impl Lang {
             "sh" | "bash" | "zsh" => Some(Self::Bash),
             #[cfg(feature = "lang-go")]
             "go" => Some(Self::Go),
+            #[cfg(feature = "lang-csharp")]
+            "cs" => Some(Self::CSharp),
             #[cfg(feature = "lang-gdscript")]
             "gd" => Some(Self::GdScript),
             #[cfg(feature = "lang-markdown")]
@@ -97,6 +101,8 @@ impl Lang {
             Self::Bash => tree_sitter_bash::LANGUAGE.into(),
             #[cfg(feature = "lang-go")]
             Self::Go => tree_sitter_go::LANGUAGE.into(),
+            #[cfg(feature = "lang-csharp")]
+            Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => tree_sitter_gdscript::LANGUAGE.into(),
             #[cfg(feature = "lang-markdown")]
@@ -126,6 +132,8 @@ impl Lang {
             Self::Bash => "bash",
             #[cfg(feature = "lang-go")]
             Self::Go => "go",
+            #[cfg(feature = "lang-csharp")]
+            Self::CSharp => "csharp",
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => "gdscript",
             #[cfg(feature = "lang-markdown")]
@@ -221,6 +229,21 @@ impl Lang {
                 (var_declaration (var_spec name: (identifier) @variable.name))
             "#
             }
+            #[cfg(feature = "lang-csharp")]
+            Self::CSharp => {
+                r#"
+                (class_declaration name: (identifier) @class.name)
+                (struct_declaration name: (identifier) @struct.name)
+                (interface_declaration name: (identifier) @interface.name)
+                (enum_declaration name: (identifier) @enum.name)
+                (record_declaration name: (identifier) @record.name)
+                (delegate_declaration name: (identifier) @delegate.name)
+                (method_declaration name: (identifier) @method.name)
+                (local_function_statement name: (identifier) @function.name)
+                (property_declaration name: (identifier) @property.name)
+                (enum_member_declaration name: (identifier) @enum_member.name)
+            "#
+            }
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => {
                 // `class_name Foo` declares the script's own type and is the
@@ -292,6 +315,15 @@ impl Lang {
                 r#"
 (call_expression function: (identifier) @call.name)
 (call_expression function: (selector_expression field: (field_identifier) @call.name))
+"#,
+            ),
+            #[cfg(feature = "lang-csharp")]
+            Self::CSharp => Some(
+                r#"
+(invocation_expression function: (identifier) @call.name)
+(invocation_expression function: (member_access_expression name: (identifier) @call.name))
+(invocation_expression function: (generic_name (identifier) @call.name))
+(invocation_expression function: (member_access_expression name: (generic_name (identifier) @call.name)))
 "#,
             ),
             #[cfg(feature = "lang-gdscript")]
@@ -467,6 +499,8 @@ impl Lang {
             Self::Bash,
             #[cfg(feature = "lang-go")]
             Self::Go,
+            #[cfg(feature = "lang-csharp")]
+            Self::CSharp,
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript,
             #[cfg(feature = "lang-markdown")]
@@ -578,6 +612,7 @@ mod tests {
             ("bash", "bash"),
             ("zsh", "bash"),
             ("go", "go"),
+            ("cs", "csharp"),
             ("gd", "gdscript"),
             ("md", "markdown"),
             ("mdx", "markdown"),
@@ -965,6 +1000,76 @@ func main() {
         assert!(
             callees.contains(&"Println"),
             "selector calls resolve to the field name, got {callees:?}"
+        );
+    }
+
+    // #csharpindex: C# is a fully indexed language, not only an ast-grep
+    // grammar. Keep representative type, callable, and value declarations in
+    // this fixture so grammar upgrades cannot silently erase the index surface.
+    #[cfg(feature = "lang-csharp")]
+    #[test]
+    fn test_extract_csharp_symbols() {
+        let source = br#"namespace Native;
+
+public interface IOpener { void Open(); }
+public record Handle(string Value);
+public delegate void Changed();
+public enum State { Ready }
+public struct Clipboard {
+    public string Text { get; set; }
+    public Clipboard(string text) { Text = text; }
+    public void Set(string text) { Text = text; }
+    public static void Reset() { }
+}
+"#;
+        let symbols = Lang::CSharp.extract_symbols(source).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        for expected in [
+            "IOpener", "Handle", "Changed", "State", "Ready", "Clipboard", "Text",
+            "Set", "Reset",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}, got {names:?}");
+        }
+        let kind_of = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .kind
+                .clone()
+        };
+        assert_eq!(kind_of("IOpener"), "interface");
+        assert_eq!(kind_of("Handle"), "record");
+        assert_eq!(kind_of("Changed"), "delegate");
+        assert_eq!(kind_of("Set"), "method");
+        assert_eq!(kind_of("Text"), "property");
+    }
+
+    #[cfg(feature = "lang-csharp")]
+    #[test]
+    fn test_extract_csharp_call_edges() {
+        let source = br#"class Program {
+    static int Helper() => 1;
+    static int Main() {
+        Console.WriteLine("hi");
+        return Helper();
+    }
+}
+"#;
+        let symbols = Lang::CSharp.extract_symbols(source).unwrap();
+        let call_sites = crate::extract_call_sites(Lang::CSharp, source).unwrap();
+        let edges = crate::resolve_edges(&symbols, &call_sites);
+        let pairs: Vec<String> = edges
+            .iter()
+            .map(|edge| format!("{} -> {}", edge.caller, edge.callee))
+            .collect();
+        assert!(
+            pairs.contains(&"Main -> Helper".to_string()),
+            "expected a Main -> Helper call edge, got {pairs:?}"
+        );
+        assert!(
+            call_sites.iter().any(|site| site.callee == "WriteLine"),
+            "member invocations must expose their method name: {call_sites:?}"
         );
     }
 

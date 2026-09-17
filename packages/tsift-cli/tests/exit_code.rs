@@ -14081,6 +14081,69 @@ fn go_sources_are_indexed_searchable_and_renamable() {
 }
 
 #[test]
+fn csharp_sources_are_indexed_searchable_and_renamable() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("Program.cs"),
+        "class Program {\n    static int WidgetCount() => 3;\n    static int Main() { return WidgetCount(); }\n}\n",
+    )
+    .unwrap();
+    let root = dir.path().to_str().unwrap();
+
+    let indexed = tsift_bin().args(["index", root]).output().unwrap();
+    assert!(
+        indexed.status.success(),
+        "index stderr: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+
+    let search = tsift_bin()
+        .args(["search", "WidgetCount", "--path", root, "--json"])
+        .output()
+        .unwrap();
+    assert!(search.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&search.stdout).unwrap();
+    assert!(
+        json.to_string().contains("Program.cs"),
+        "a C# symbol must be a search candidate: {json}"
+    );
+
+    let graph = tsift_bin()
+        .args(["graph", "WidgetCount", root, "--callers", "--json"])
+        .output()
+        .unwrap();
+    assert!(graph.status.success());
+    let graph_json: serde_json::Value = serde_json::from_slice(&graph.stdout).unwrap();
+    assert!(
+        graph_json.to_string().contains("Main"),
+        "C# call edges must be extracted: {graph_json}"
+    );
+
+    let input = r#"{"intents":[{"kind":"rename_symbol","symbol":"WidgetCount","file":"Program.cs","new_name":"GadgetCount"}]}"#;
+    let output = run_tsift_stdin(
+        &[
+            "--envelope",
+            "edit-intents",
+            "--path",
+            root,
+            "--json",
+            "--apply",
+        ],
+        input,
+    );
+    assert!(
+        output.status.success(),
+        "a C# rename must be planned and applied: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rewritten = fs::read_to_string(dir.path().join("Program.cs")).unwrap();
+    assert!(
+        rewritten.contains("GadgetCount") && !rewritten.contains("WidgetCount"),
+        "{rewritten}"
+    );
+}
+
+#[test]
 fn edit_intents_rename_leaves_a_same_named_field_and_local_alone() {
     // The grammar spells a Rust struct field and a method call the same way
     // (`field_identifier`), and a GDScript `func` and a local `var` the same

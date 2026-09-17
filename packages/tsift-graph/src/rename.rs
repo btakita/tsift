@@ -61,8 +61,8 @@ impl RenameTarget {
             "signal" => Self::Signal,
             "struct" | "enum" | "enum_class" | "trait" | "class" | "data_class"
             | "sealed_class" | "interface" | "type_alias" | "union" | "object"
-            | "companion_object" | "impl" => Self::Type,
-            "const" | "static" | "variable" => Self::Value,
+            | "companion_object" | "impl" | "record" | "delegate" => Self::Type,
+            "const" | "static" | "variable" | "property" | "enum_member" => Self::Value,
             _ => Self::Unresolved,
         }
     }
@@ -130,6 +130,8 @@ pub fn identifier_node_kinds(lang: Lang) -> &'static [&'static str] {
         // deliberately absent — renaming a package is a directory move.
         #[cfg(feature = "lang-go")]
         Lang::Go => &["identifier", "type_identifier", "field_identifier"],
+        #[cfg(feature = "lang-csharp")]
+        Lang::CSharp => &["identifier"],
         // GDScript splits the two: `name` is the declared name of a statement
         // or block, `identifier` is every reference to one.
         #[cfg(feature = "lang-gdscript")]
@@ -202,11 +204,63 @@ fn occurrence_matches_target(
         Lang::Zig => zig_occurrence_matches_target(node, source, target),
         #[cfg(feature = "lang-go")]
         Lang::Go => go_occurrence_matches_target(node, source, target),
+        #[cfg(feature = "lang-csharp")]
+        Lang::CSharp => csharp_occurrence_matches_target(node, target),
         _ => {
             let _ = node;
             true
         }
     }
+}
+
+#[cfg(feature = "lang-csharp")]
+fn csharp_occurrence_matches_target(node: Node, target: RenameTarget) -> bool {
+    let Some(parent) = node.parent() else {
+        return true;
+    };
+
+    let declaration_target = match parent.kind() {
+        "method_declaration" | "local_function_statement" => Some(RenameTarget::Callable),
+        "class_declaration"
+        | "struct_declaration"
+        | "interface_declaration"
+        | "enum_declaration"
+        | "record_declaration"
+        | "delegate_declaration" => Some(RenameTarget::Type),
+        "property_declaration" | "enum_member_declaration" => Some(RenameTarget::Value),
+        _ => None,
+    };
+    if let Some(declaration_target) = declaration_target {
+        return target == declaration_target;
+    }
+
+    if parent.kind() == "invocation_expression"
+        && parent
+            .child_by_field_name("function")
+            .is_some_and(|function| function.id() == node.id())
+    {
+        return target == RenameTarget::Callable;
+    }
+
+    if parent.kind() == "member_access_expression"
+        && parent
+            .child_by_field_name("name")
+            .is_some_and(|name| name.id() == node.id())
+    {
+        let is_call = parent.parent().is_some_and(|call| {
+            call.kind() == "invocation_expression"
+                && call
+                    .child_by_field_name("function")
+                    .is_some_and(|function| function.id() == parent.id())
+        });
+        return match target {
+            RenameTarget::Callable => is_call,
+            RenameTarget::Value => !is_call,
+            RenameTarget::Type | RenameTarget::Signal | RenameTarget::Unresolved => true,
+        };
+    }
+
+    true
 }
 
 /// Go spells a struct field declaration, a field read, a method name, and a
@@ -1022,6 +1076,38 @@ pub fn replace_occurrences(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "lang-csharp")]
+    #[test]
+    fn csharp_callable_rename_skips_properties_strings_and_comments() {
+        let source = r#"class Counter {
+    static int WidgetCount() => 3;
+    static int Caller() => WidgetCount();
+    // WidgetCount stays prose.
+    static string Label = "WidgetCount";
+}
+class Data {
+    public int WidgetCount { get; set; }
+    public int Read() => this.WidgetCount;
+}
+"#;
+        let found = identifier_occurrences_for(
+            Lang::CSharp,
+            source.as_bytes(),
+            "WidgetCount",
+            RenameTarget::Callable,
+        )
+        .unwrap();
+        let (out, replaced) = replace_occurrences(source, &found, "GadgetCount");
+
+        assert_eq!(replaced, 2, "got {found:?}\n{out}");
+        assert!(out.contains("static int GadgetCount()"), "{out}");
+        assert!(out.contains("=> GadgetCount();"), "{out}");
+        assert!(out.contains("int WidgetCount { get; set; }"), "{out}");
+        assert!(out.contains("this.WidgetCount"), "{out}");
+        assert!(out.contains("// WidgetCount stays prose."), "{out}");
+        assert!(out.contains("\"WidgetCount\""), "{out}");
+    }
 
     #[cfg(feature = "lang-rust")]
     const RUST_SOURCE: &str = r#"/// doc widget_count
