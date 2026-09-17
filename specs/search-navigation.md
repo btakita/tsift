@@ -324,7 +324,7 @@ On plugin load and on the `installation.updated` lifecycle hook, the plugin runs
 name: tsift
 description: Use tsift for token-efficient repository navigation, code search and reading, call graphs, diffs, logs, tests, session context, and workspace memory. Use when exploring or changing a codebase with tsift installed.
 ---
-<!-- tsift:skill v=0.1.98 -->
+<!-- tsift:skill v=0.1.99 -->
 # tsift
 
 Run `tsift status` at session start from the owning repo root.
@@ -338,7 +338,7 @@ Command detail lives in [`references/code-navigation.md`](references/code-naviga
 `.agents/skills/tsift/references/code-navigation.md` holds the detail the skill defers to, under its own marker pair so generated content can be refreshed while preserving hand-written text outside the markers:
 
 ```markdown
-<!-- tsift:code-navigation-runbook v=0.1.98 -->
+<!-- tsift:code-navigation-runbook v=0.1.99 -->
 # Code Navigation
 
 Managed by `tsift init` (versioned markers) — do not hand-edit between the markers; re-run `tsift init` to refresh. Text outside the markers is preserved.
