@@ -6283,7 +6283,12 @@ fn workspace_index_federates_nested_ignored_submodule_scopes() {
         .iter()
         .find(|symbol| symbol["name"] == "nested_only")
         .unwrap_or_else(|| panic!("nested symbol missing from federated search: {json}"));
-    assert!(nested_symbol["file"].as_str().unwrap().ends_with("vendor/nested/lib.rs"));
+    assert!(
+        nested_symbol["file"]
+            .as_str()
+            .unwrap()
+            .ends_with("vendor/nested/lib.rs")
+    );
 
     let explain = tsift_bin()
         .args([
@@ -6669,7 +6674,10 @@ fn status_fix_refreshes_stale_instructions_after_version_bump_in_json() {
 
     let agents = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
     assert!(
-        !agents.contains("tsift:code-navigation") && !agents.contains("Old guidance."),
+        agents.contains(&format!(
+            "<!-- tsift:code-navigation v={} -->",
+            env!("CARGO_PKG_VERSION")
+        )) && !agents.contains("Old guidance."),
         "AGENTS.md was: {agents}"
     );
     let skill = fs::read_to_string(dir.path().join(".agents/skills/tsift/SKILL.md")).unwrap();
@@ -6710,7 +6718,12 @@ fn init_writes_the_skill_and_removes_legacy_claude_block() {
     .unwrap();
 
     let output = tsift_bin()
-        .args(["init", dir.path().to_str().unwrap()])
+        .args([
+            "init",
+            "--instructions",
+            "shared",
+            dir.path().to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     assert!(
@@ -6735,9 +6748,57 @@ fn init_writes_the_skill_and_removes_legacy_claude_block() {
         "CLAUDE.md was: {claude}"
     );
 
-    assert_eq!(fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(), "# Agents\n");
+    let agents = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+    assert!(agents.starts_with("# Agents\n"), "AGENTS.md was: {agents}");
+    assert!(
+        agents.contains("tsift:code-navigation"),
+        "AGENTS.md was: {agents}"
+    );
     assert!(dir.path().join(".agents/skills/tsift/SKILL.md").exists());
-    assert!(dir.path().join(".agents/skills/tsift/references/code-navigation.md").exists());
+    assert!(
+        dir.path()
+            .join(".agents/skills/tsift/references/code-navigation.md")
+            .exists()
+    );
+}
+
+#[test]
+fn init_defaults_new_repositories_to_personal_without_tracked_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let user_skills = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("README.md"), "# fixture\n").unwrap();
+    init_git_repo(dir.path());
+
+    let output = tsift_bin()
+        .args(["init", dir.path().to_str().unwrap()])
+        .env("TSIFT_USER_SKILLS_DIR", user_skills.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "init stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("instructions: personal"));
+    assert!(user_skills.path().join("tsift/SKILL.md").exists());
+    assert!(!dir.path().join("AGENTS.md").exists());
+    assert!(!dir.path().join(".gitignore").exists());
+
+    let status = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert!(status.stdout.is_empty(), "git status was not clean");
+
+    let status = tsift_bin()
+        .args(["status", "--no-fix", dir.path().to_str().unwrap()])
+        .env("TSIFT_USER_SKILLS_DIR", user_skills.path())
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert!(String::from_utf8_lossy(&status.stdout).contains("instructions: current"));
 }
 
 #[test]
@@ -6934,7 +6995,7 @@ fn status_fix_instructions_names_every_tracked_file_it_writes() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("status fix: removed legacy section in AGENTS.md (v0.1.41 -> v"),
+        stderr.contains("status fix: rewrote AGENTS.md (v0.1.41 -> v"),
         "stderr was: {stderr}"
     );
     assert!(
@@ -7017,7 +7078,12 @@ fn init_names_the_legacy_runbook_relocation() {
     .unwrap();
 
     let output = tsift_bin()
-        .args(["init", dir.path().to_str().unwrap()])
+        .args([
+            "init",
+            "--instructions",
+            "shared",
+            dir.path().to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     assert!(
@@ -7037,7 +7103,12 @@ fn init_names_the_legacy_runbook_relocation() {
 fn generated_skill_does_not_recommend_the_deprecated_status_fix_flag() {
     let dir = tempfile::tempdir().unwrap();
     let output = tsift_bin()
-        .args(["init", dir.path().to_str().unwrap()])
+        .args([
+            "init",
+            "--instructions",
+            "shared",
+            dir.path().to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     assert!(
@@ -7467,7 +7538,10 @@ fn init_respects_git_info_exclude_and_reports_the_source() {
     fs::write(dir.path().join(".git/info/exclude"), ".tsift/\n").unwrap();
 
     let root = dir.path().to_str().unwrap();
-    let output = tsift_bin().args(["init", root]).output().unwrap();
+    let output = tsift_bin()
+        .args(["init", "--instructions", "shared", root])
+        .output()
+        .unwrap();
 
     assert!(
         output.status.success(),
@@ -7560,7 +7634,7 @@ fn init_workspace_refreshes_every_scope_instruction_surface() {
     let root = dir.path().to_str().unwrap();
 
     let output = tsift_bin()
-        .args(["init", "--workspace", root])
+        .args(["init", "--instructions", "shared", "--workspace", root])
         .output()
         .unwrap();
     assert!(
@@ -7581,9 +7655,9 @@ fn init_workspace_refreshes_every_scope_instruction_surface() {
             "init --workspace must write {}",
             skill.display()
         );
-        let runbook = dir
-            .path()
-            .join(format!("src/{scope}/.agents/skills/tsift/references/code-navigation.md"));
+        let runbook = dir.path().join(format!(
+            "src/{scope}/.agents/skills/tsift/references/code-navigation.md"
+        ));
         assert!(
             runbook.exists(),
             "init --workspace must write {}",
@@ -7621,7 +7695,7 @@ fn init_workspace_skips_scopes_that_opt_out_of_instructions() {
     .unwrap();
 
     let output = tsift_bin()
-        .args(["init", "--workspace", root])
+        .args(["init", "--instructions", "shared", "--workspace", root])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -7796,13 +7870,7 @@ fn scoped_graph_db_read_without_projection_reports_refresh_remedy() {
     let root = dir.path().to_str().unwrap();
     let output = tsift_bin()
         .args([
-            "graph-db",
-            "--path",
-            root,
-            "--scope",
-            "alpha",
-            "node",
-            "missing",
+            "graph-db", "--path", root, "--scope", "alpha", "node", "missing",
         ])
         .output()
         .unwrap();
@@ -7812,7 +7880,10 @@ fn scoped_graph_db_read_without_projection_reports_refresh_remedy() {
     assert!(stderr.contains("projection is missing"), "{stderr}");
     assert!(stderr.contains("tsift graph-db --path"), "{stderr}");
     assert!(stderr.contains(root), "{stderr}");
-    assert!(stderr.contains("--scope \"alpha\" refresh --json"), "{stderr}");
+    assert!(
+        stderr.contains("--scope \"alpha\" refresh --json"),
+        "{stderr}"
+    );
     assert!(!stderr.contains("unable to open database file"), "{stderr}");
 }
 

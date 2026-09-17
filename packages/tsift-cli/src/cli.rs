@@ -4,6 +4,15 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::output::ResponseBudgetPreset;
 
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub enum InstructionModeArg {
+    #[default]
+    Auto,
+    Personal,
+    Shared,
+    Off,
+}
+
 #[derive(Parser)]
 #[command(
     name = "tsift",
@@ -675,6 +684,12 @@ pub enum Commands {
         /// Resolve to the workspace root and install a workspace-wide hook
         #[arg(long)]
         workspace: bool,
+        /// Instruction deployment policy: personal is user-scoped and leaves
+        /// the repository untouched; shared installs tracked team guidance;
+        /// off removes only tsift-owned guidance. Auto preserves existing
+        /// shared installs and otherwise selects personal.
+        #[arg(long, value_enum, default_value = "auto")]
+        instructions: InstructionModeArg,
     },
     /// Cached LLM analysis — pre-computed summaries, entities, relationships
     Summarize {

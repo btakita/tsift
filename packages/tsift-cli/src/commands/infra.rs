@@ -17,7 +17,7 @@ use tsift_quality::lint;
 use tsift_sqlite as substrate;
 use tsift_status::status;
 
-use crate::cli::{GraphDbBackend, GraphDbQuery};
+use crate::cli::{GraphDbBackend, GraphDbQuery, InstructionModeArg};
 use crate::output::{OutputFormat, ToolEnvelopeSummary};
 use crate::{
     ConvexHttpTransport, ConvexSyncOptions, EditBatch, EditResult, EditStatus,
@@ -2836,6 +2836,7 @@ pub(crate) fn cmd_init(
     codex: bool,
     opencode: bool,
     workspace: bool,
+    instructions: InstructionModeArg,
 ) -> Result<()> {
     let resolved = if workspace {
         init::resolve_workspace_dir(path)?
@@ -2846,7 +2847,21 @@ pub(crate) fn cmd_init(
         println!("resolved: {} → {}", path.display(), resolved.display());
     }
     let codex_workspace = codex && (workspace || init::has_submodules(&resolved)?);
-    let result = init::init_with_integrations(&resolved, codex, codex_workspace, opencode)?;
+    let instruction_mode = match instructions {
+        InstructionModeArg::Auto => init::InstructionMode::Auto,
+        InstructionModeArg::Personal => init::InstructionMode::Personal,
+        InstructionModeArg::Shared => init::InstructionMode::Shared,
+        InstructionModeArg::Off => init::InstructionMode::Off,
+    };
+    let result = init::init_with_mode(
+        &resolved,
+        codex,
+        codex_workspace,
+        opencode,
+        instruction_mode,
+        None,
+    )?;
+    println!("instructions: {}", result.instruction_mode.as_str());
     print_init_updates(&result);
     if let Some(codex_result) = &result.codex_hooks {
         let scope_label = match codex_result.scope {
@@ -2896,7 +2911,7 @@ pub(crate) fn cmd_init(
     // at the superproject, so submodules stayed on releases-old text — and
     // the repository-local skill tells an agent to work from the submodule
     // root, which is exactly the surface that never got refreshed.
-    if workspace {
+    if workspace && result.instruction_mode == init::InstructionMode::Shared {
         init_workspace_scopes(&resolved)?;
     }
     Ok(())
@@ -2915,10 +2930,8 @@ fn print_init_updates(result: &init::InitResult) {
                 init::InitAction::Created => "tsift skill surface added",
                 init::InitAction::Updated => "tsift skill surface updated to latest",
                 init::InitAction::AlreadyPresent => "no changes needed",
-                init::InitAction::Removed =>
-                    "legacy tsift Code Navigation section removed",
-                init::InitAction::Deferred =>
-                    "no managed tsift content found",
+                init::InitAction::Removed => "legacy tsift Code Navigation section removed",
+                init::InitAction::Deferred => "no managed tsift content found",
             }
         );
     }

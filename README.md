@@ -54,8 +54,11 @@ tsift convex-sync . --chunk-size 100 --json
 
 For agent-doc projects, run `tsift status` from the repository root at session
 start. It repairs its own `.tsift/` index state and never rewrites tracked
-files; if it reports stale or missing instructions, run `tsift init`, which
-names every tracked file it rewrites or moves. OpenCode users can run `tsift init --opencode` to
+files; if it reports stale or missing instructions, run `tsift init`. New
+repositories default to a user-scoped skill with no tracked instruction edits;
+existing managed repositories stay shared. Use `--instructions shared` for a
+tracked team skill plus `AGENTS.md` router, or `--instructions off` for CLI-only
+operation. OpenCode users can run `tsift init --instructions shared --opencode` to
 install project-local `.opencode/commands/tsift-*.md` shortcuts for status,
 session-review, context-pack, diff-digest, test-digest, log-digest, and
 rewrite-run workflows; existing same-name command files without tsift ownership

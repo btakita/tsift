@@ -1199,7 +1199,8 @@ pub fn run() -> Result<()> {
             codex,
             opencode,
             workspace,
-        }) => cmd_init(&path, codex, opencode, workspace),
+            instructions,
+        }) => cmd_init(&path, codex, opencode, workspace, instructions),
         Some(Commands::Lint {
             file,
             index,
@@ -21513,7 +21514,10 @@ fn status_workspace_scope_ids_needing_fix(
 }
 
 fn status_instructions_need_fix(report: &status::StatusReport) -> bool {
-    !matches!(report.instructions, init::InstructionStatus::Current { .. })
+    !matches!(
+        report.instructions,
+        init::InstructionStatus::Current { .. } | init::InstructionStatus::Disabled
+    )
 }
 
 /// Refresh the tracked repository-local tsift skill.
@@ -21533,8 +21537,9 @@ pub(crate) fn apply_status_instruction_fixes(
         init::InstructionStatus::Stale { found, expected } => (found.clone(), expected.clone()),
         _ => (None, init::TSIFT_VERSION.to_string()),
     };
-    eprintln!("status fix: refreshing tsift instructions (tracked files)");
-    let result = init::init(root, false, false)?;
+    eprintln!("status fix: refreshing tsift instructions");
+    let result =
+        init::init_with_mode(root, false, false, false, init::InstructionMode::Auto, None)?;
     report_tracked_instruction_writes(root, &result, found.as_deref(), &expected);
     Ok(true)
 }

@@ -366,6 +366,7 @@ fn scope_instruction_label(status: &InstructionStatus) -> String {
         } => format!("stale (v{found})"),
         InstructionStatus::Stale { found: None, .. } => "stale (pre-versioned)".to_string(),
         InstructionStatus::Missing => "missing".to_string(),
+        InstructionStatus::Disabled => "off".to_string(),
     }
 }
 
@@ -793,10 +794,15 @@ fn build_recommendations(
 ) -> Recommendations {
     // #wsinit: a superproject block can be current while three submodules sit
     // two releases behind, so scope drift has to reach the `run:` line too.
-    let refresh = !matches!(instructions, InstructionStatus::Current { .. })
-        || scope_instructions
-            .iter()
-            .any(|scope| !matches!(scope.instructions, InstructionStatus::Current { .. }));
+    let refresh = !matches!(
+        instructions,
+        InstructionStatus::Current { .. } | InstructionStatus::Disabled
+    ) || scope_instructions.iter().any(|scope| {
+        !matches!(
+            scope.instructions,
+            InstructionStatus::Current { .. } | InstructionStatus::Disabled
+        )
+    });
     let index_cmd = if workspace {
         "tsift index --workspace ."
     } else {
@@ -1419,6 +1425,9 @@ pub fn format_human(report: &StatusReport, compact: bool) -> String {
         InstructionStatus::Missing => {
             out.push_str("instructions: missing (run tsift init)\n");
         }
+        InstructionStatus::Disabled => {
+            out.push_str("instructions: off\n");
+        }
     }
 
     // #wsinit: index freshness is reported per scope; instruction state was not,
@@ -1427,7 +1436,12 @@ pub fn format_human(report: &StatusReport, compact: bool) -> String {
         let drifted = report
             .scope_instructions
             .iter()
-            .filter(|scope| !matches!(scope.instructions, InstructionStatus::Current { .. }))
+            .filter(|scope| {
+                !matches!(
+                    scope.instructions,
+                    InstructionStatus::Current { .. } | InstructionStatus::Disabled
+                )
+            })
             .collect::<Vec<_>>();
         if !drifted.is_empty() {
             if compact {

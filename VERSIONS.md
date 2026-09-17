@@ -9,6 +9,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 ## Unreleased
 
 - **Promote C# to full indexed navigation support.** `.cs` files now provide symbols and call edges to search/graph commands, and the semantic edit planner supports identifier-aware `rename_symbol` alongside structural rewrites.
+- **Add team-safe instruction deployment modes.** `tsift init --instructions personal|shared|off` makes new repositories personal by default, preserves existing managed installs as shared, keeps personal/off mode out of tracked instruction files, and never generates `AGENTS.override.md`.
 
 ## 0.1.98
 

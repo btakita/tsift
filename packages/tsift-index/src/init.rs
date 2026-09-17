@@ -14,14 +14,21 @@ const SKILL_END_MARKER: &str = "<!-- /tsift:skill -->";
 const RUNBOOK_MARKER_PREFIX: &str = "<!-- tsift:code-navigation-runbook ";
 const RUNBOOK_END_MARKER: &str = "<!-- /tsift:code-navigation-runbook -->";
 pub const SKILL_RELATIVE_PATH: &str = ".agents/skills/tsift/SKILL.md";
-pub const RUNBOOK_RELATIVE_PATH: &str =
-    ".agents/skills/tsift/references/code-navigation.md";
+pub const RUNBOOK_RELATIVE_PATH: &str = ".agents/skills/tsift/references/code-navigation.md";
+pub const INSTRUCTION_MODE_RELATIVE_PATH: &str = ".tsift/instruction-mode";
 const LEGACY_RUNBOOK_RELATIVE_PATH: &str = ".agent/runbooks/code-navigation.md";
 const OLDEST_RUNBOOK_RELATIVE_PATH: &str = "runbooks/code-navigation.md";
 pub const TSIFT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn versioned_skill(dir: &Path) -> String {
-    let verification = verification_paragraph(dir);
+    versioned_skill_with_verification(verification_paragraph(dir))
+}
+
+fn versioned_personal_skill() -> String {
+    versioned_skill_with_verification(String::new())
+}
+
+fn versioned_skill_with_verification(verification: String) -> String {
     format!(
         r#"---
 name: tsift
@@ -52,7 +59,14 @@ Only read full source files when tsift results are insufficient.
 }
 
 fn versioned_runbook_section(dir: &Path) -> String {
-    let verification = verification_runbook_section(dir);
+    versioned_runbook_with_verification(verification_runbook_section(dir))
+}
+
+fn versioned_personal_runbook() -> String {
+    versioned_runbook_with_verification(String::new())
+}
+
+fn versioned_runbook_with_verification(verification: String) -> String {
     format!(
         r#"<!-- tsift:code-navigation-runbook v={version} -->
 # Code Navigation
@@ -219,6 +233,38 @@ pub enum InstructionStatus {
     },
     #[serde(rename = "missing")]
     Missing,
+    #[serde(rename = "disabled")]
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InstructionMode {
+    #[default]
+    Auto,
+    Personal,
+    Shared,
+    Off,
+}
+
+impl InstructionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Personal => "personal",
+            Self::Shared => "shared",
+            Self::Off => "off",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "auto" => Some(Self::Auto),
+            "personal" => Some(Self::Personal),
+            "shared" => Some(Self::Shared),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
 }
 
 const GITIGNORE_ENTRY: &str = ".tsift/";
@@ -229,6 +275,7 @@ const CODEX_AUTOINDEX_HELPER_VERSION: u32 = 3;
 const OPENCODE_COMMAND_MARKER_PREFIX: &str = "<!-- tsift:opencode-command";
 
 pub struct InitResult {
+    pub instruction_mode: InstructionMode,
     pub updates: Vec<InstructionUpdate>,
     /// The legacy runbook path this run relocated, when a migration happened.
     /// Reported so a tracked-file move is never a silent diff.
@@ -362,6 +409,99 @@ fn ensure_gitignore(dir: &Path) -> Result<(bool, Option<String>)> {
     Ok((true, None))
 }
 
+fn ensure_local_tsift_ignore(dir: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .output();
+    let Ok(output) = output else {
+        return Ok(());
+    };
+    if !output.status.success() {
+        return Ok(());
+    }
+    let exclude = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    let exclude = if exclude.is_absolute() {
+        exclude
+    } else {
+        dir.join(exclude)
+    };
+    if let Some(parent) = exclude.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut content = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if content.lines().any(|line| line.trim() == GITIGNORE_ENTRY) {
+        return Ok(());
+    }
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(GITIGNORE_ENTRY);
+    content.push('\n');
+    std::fs::write(exclude, content)?;
+    Ok(())
+}
+
+fn has_managed_repository_instructions(dir: &Path) -> bool {
+    [
+        SKILL_RELATIVE_PATH,
+        "AGENTS.md",
+        "AGENTS.override.md",
+        "CLAUDE.md",
+    ]
+    .into_iter()
+    .filter_map(|path| std::fs::read_to_string(dir.join(path)).ok())
+    .any(|content| content.contains(SKILL_MARKER_PREFIX) || content.contains(SECTION_MARKER_PREFIX))
+}
+
+pub fn resolve_instruction_mode(dir: &Path, requested: InstructionMode) -> Result<InstructionMode> {
+    if requested != InstructionMode::Auto {
+        return Ok(requested);
+    }
+    let state = dir.join(INSTRUCTION_MODE_RELATIVE_PATH);
+    if let Ok(content) = std::fs::read_to_string(&state) {
+        let mode = InstructionMode::parse(&content).ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid instruction mode `{}` in {}",
+                content.trim(),
+                state.display()
+            )
+        })?;
+        if mode != InstructionMode::Auto {
+            return Ok(mode);
+        }
+    }
+    Ok(if has_managed_repository_instructions(dir) {
+        InstructionMode::Shared
+    } else {
+        InstructionMode::Personal
+    })
+}
+
+fn persist_instruction_mode(dir: &Path, mode: InstructionMode) -> Result<()> {
+    let state = dir.join(INSTRUCTION_MODE_RELATIVE_PATH);
+    if let Some(parent) = state.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(state, format!("{}\n", mode.as_str()))?;
+    Ok(())
+}
+
+fn resolve_user_skills_dir(override_dir: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = override_dir {
+        return Ok(path.to_path_buf());
+    }
+    if let Some(path) = std::env::var_os("TSIFT_USER_SKILLS_DIR") {
+        return Ok(PathBuf::from(path));
+    }
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .ok_or_else(|| {
+            anyhow::anyhow!("cannot locate the user home directory for personal mode")
+        })?;
+    Ok(PathBuf::from(home).join(".agents/skills"))
+}
+
 pub fn resolve_project_dir(path: &Path) -> Result<PathBuf> {
     let dir = input_dir(path)?;
 
@@ -387,7 +527,14 @@ pub fn has_submodules(dir: &Path) -> Result<bool> {
 }
 
 pub fn init(dir: &Path, codex: bool, codex_workspace: bool) -> Result<InitResult> {
-    init_with_integrations(dir, codex, codex_workspace, false)
+    init_with_mode(
+        dir,
+        codex,
+        codex_workspace,
+        false,
+        InstructionMode::Shared,
+        None,
+    )
 }
 
 pub fn init_with_integrations(
@@ -396,36 +543,103 @@ pub fn init_with_integrations(
     codex_workspace: bool,
     opencode: bool,
 ) -> Result<InitResult> {
-    let (gitignore_added, gitignore_ignore_source) = ensure_gitignore(dir)?;
+    init_with_mode(
+        dir,
+        codex,
+        codex_workspace,
+        opencode,
+        InstructionMode::Shared,
+        None,
+    )
+}
+
+pub fn init_with_mode(
+    dir: &Path,
+    codex: bool,
+    codex_workspace: bool,
+    opencode: bool,
+    requested_mode: InstructionMode,
+    user_skills_dir: Option<&Path>,
+) -> Result<InitResult> {
+    let mut instruction_mode = resolve_instruction_mode(dir, requested_mode)?;
+    if requested_mode == InstructionMode::Auto
+        && instruction_mode == InstructionMode::Personal
+        && (codex || opencode)
+    {
+        instruction_mode = InstructionMode::Shared;
+    }
+    if instruction_mode != InstructionMode::Shared && (codex || opencode) {
+        bail!(
+            "--codex and --opencode require --instructions shared; {} mode never writes project integration files",
+            instruction_mode.as_str()
+        );
+    }
+
+    let (gitignore_added, gitignore_ignore_source) = if instruction_mode == InstructionMode::Shared
+    {
+        ensure_gitignore(dir)?
+    } else {
+        ensure_local_tsift_ignore(dir)?;
+        (false, None)
+    };
     let mut updates = Vec::new();
-    let runbook_migrated = migrate_legacy_runbook(dir)?;
-
-    let skill = dir.join(SKILL_RELATIVE_PATH);
-    updates.push(InstructionUpdate {
-        file: skill.clone(),
-        action: ensure_skill_file(&skill, dir)?,
-    });
-
-    let runbook = dir.join(RUNBOOK_RELATIVE_PATH);
-    let runbook_action = ensure_runbook_file(&runbook, dir)?;
-    updates.push(InstructionUpdate {
-        file: runbook.clone(),
-        action: if runbook_migrated.is_some() && runbook_action == InitAction::AlreadyPresent {
-            InitAction::Updated
-        } else {
-            runbook_action
-        },
-    });
-
-    for legacy_file in ["AGENTS.md", "AGENTS.override.md", "CLAUDE.md"] {
-        let file = dir.join(legacy_file);
-        if file.exists() {
-            let action = remove_instruction_section(&file)?;
-            if action != InitAction::Deferred {
-                updates.push(InstructionUpdate { file, action });
+    let runbook_migrated = if instruction_mode == InstructionMode::Shared {
+        let runbook_migrated = migrate_legacy_runbook(dir)?;
+        let skill = dir.join(SKILL_RELATIVE_PATH);
+        updates.push(InstructionUpdate {
+            file: skill.clone(),
+            action: ensure_skill_file(&skill, dir)?,
+        });
+        let runbook = dir.join(RUNBOOK_RELATIVE_PATH);
+        let runbook_action = ensure_runbook_file(&runbook, dir)?;
+        updates.push(InstructionUpdate {
+            file: runbook.clone(),
+            action: if runbook_migrated.is_some() && runbook_action == InitAction::AlreadyPresent {
+                InitAction::Updated
+            } else {
+                runbook_action
+            },
+        });
+        let agents = dir.join("AGENTS.md");
+        updates.push(InstructionUpdate {
+            file: agents.clone(),
+            action: ensure_shared_agents_router(&agents)?,
+        });
+        for legacy_file in ["AGENTS.override.md", "CLAUDE.md"] {
+            let file = dir.join(legacy_file);
+            if file
+                .symlink_metadata()
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+                && std::fs::canonicalize(&file).ok() == std::fs::canonicalize(&agents).ok()
+            {
+                continue;
+            }
+            if file.exists() {
+                let action = remove_instruction_section(&file)?;
+                if action != InitAction::Deferred {
+                    updates.push(InstructionUpdate { file, action });
+                }
             }
         }
-    }
+        Some(runbook_migrated).flatten()
+    } else {
+        remove_repository_instruction_surfaces(dir, &mut updates)?;
+        if instruction_mode == InstructionMode::Personal {
+            let user_root = resolve_user_skills_dir(user_skills_dir)?;
+            let skill = user_root.join("tsift/SKILL.md");
+            updates.push(InstructionUpdate {
+                file: skill.clone(),
+                action: ensure_personal_skill_file(&skill)?,
+            });
+            let runbook = user_root.join("tsift/references/code-navigation.md");
+            updates.push(InstructionUpdate {
+                file: runbook.clone(),
+                action: ensure_personal_runbook_file(&runbook)?,
+            });
+        }
+        None
+    };
+    persist_instruction_mode(dir, instruction_mode)?;
 
     let codex_hooks = if codex {
         let scope = if codex_workspace {
@@ -449,6 +663,7 @@ pub fn init_with_integrations(
     };
 
     Ok(InitResult {
+        instruction_mode,
         updates,
         migrated_runbook: runbook_migrated,
         gitignore_added,
@@ -463,13 +678,11 @@ fn migrate_legacy_runbook(dir: &Path) -> Result<Option<RunbookMigration>> {
     if canonical.exists() {
         return Ok(None);
     }
-    let Some((legacy_relative, legacy)) = [
-        LEGACY_RUNBOOK_RELATIVE_PATH,
-        OLDEST_RUNBOOK_RELATIVE_PATH,
-    ]
-    .into_iter()
-    .map(|relative| (relative, dir.join(relative)))
-    .find(|(_, path)| path.exists())
+    let Some((legacy_relative, legacy)) =
+        [LEGACY_RUNBOOK_RELATIVE_PATH, OLDEST_RUNBOOK_RELATIVE_PATH]
+            .into_iter()
+            .map(|relative| (relative, dir.join(relative)))
+            .find(|(_, path)| path.exists())
     else {
         return Ok(None);
     };
@@ -523,11 +736,147 @@ fn remove_instruction_section(file: &Path) -> Result<InitAction> {
     Ok(InitAction::Removed)
 }
 
+fn versioned_shared_agents_router() -> String {
+    format!(
+        "{SECTION_MARKER_PREFIX}v={TSIFT_VERSION} -->\n## Code Navigation\n\nUse the repository tsift skill at [`.agents/skills/tsift/SKILL.md`](.agents/skills/tsift/SKILL.md) for code search, source reading, call graphs, diffs, logs, and test output.\n{SECTION_END_MARKER}"
+    )
+}
+
+fn ensure_shared_agents_router(file: &Path) -> Result<InitAction> {
+    let section = versioned_shared_agents_router();
+    if !file.exists() {
+        std::fs::write(file, format!("{section}\n"))?;
+        return Ok(InitAction::Created);
+    }
+    let content = std::fs::read_to_string(file)?;
+    if let Some(start) = content.find(SECTION_MARKER_PREFIX) {
+        let Some(end_rel) = content[start..].find(SECTION_END_MARKER) else {
+            bail!(
+                "Found {} in {} but no matching {} — fix manually",
+                SECTION_MARKER_PREFIX,
+                file.display(),
+                SECTION_END_MARKER
+            );
+        };
+        let end = start + end_rel + SECTION_END_MARKER.len();
+        let next = format!("{}{}{}", &content[..start], section, &content[end..]);
+        if next == content {
+            return Ok(InitAction::AlreadyPresent);
+        }
+        std::fs::write(file, next)?;
+        return Ok(InitAction::Updated);
+    }
+    let separator = if content.ends_with("\n\n") {
+        ""
+    } else if content.ends_with('\n') {
+        "\n"
+    } else {
+        "\n\n"
+    };
+    std::fs::write(file, format!("{content}{separator}{section}\n"))?;
+    Ok(InitAction::Created)
+}
+
+fn remove_managed_file(file: &Path, marker: &str, end_marker: &str) -> Result<InitAction> {
+    if !file.exists() {
+        return Ok(InitAction::Deferred);
+    }
+    let content = std::fs::read_to_string(file)?;
+    if !content.contains(marker) {
+        return Ok(InitAction::Deferred);
+    }
+    if !content.contains(end_marker) {
+        bail!(
+            "Found {} in {} but no matching {} — fix manually",
+            marker,
+            file.display(),
+            end_marker
+        );
+    }
+    std::fs::remove_file(file)?;
+    Ok(InitAction::Removed)
+}
+
+fn remove_managed_section_file(file: &Path, marker: &str, end_marker: &str) -> Result<InitAction> {
+    if !file.exists() {
+        return Ok(InitAction::Deferred);
+    }
+    let content = std::fs::read_to_string(file)?;
+    let Some(start) = content.find(marker) else {
+        return Ok(InitAction::Deferred);
+    };
+    let Some(end_rel) = content[start..].find(end_marker) else {
+        bail!(
+            "Found {} in {} but no matching {} — fix manually",
+            marker,
+            file.display(),
+            end_marker
+        );
+    };
+    let end = start + end_rel + end_marker.len();
+    let before = content[..start].trim_end();
+    let after = content[end..].trim_start_matches('\n');
+    if before.is_empty() && after.trim().is_empty() {
+        std::fs::remove_file(file)?;
+    } else {
+        let mut next = String::new();
+        next.push_str(before);
+        if !before.is_empty() && !after.is_empty() {
+            next.push_str("\n\n");
+        }
+        next.push_str(after);
+        if !next.ends_with('\n') {
+            next.push('\n');
+        }
+        std::fs::write(file, next)?;
+    }
+    Ok(InitAction::Removed)
+}
+
+fn remove_repository_instruction_surfaces(
+    dir: &Path,
+    updates: &mut Vec<InstructionUpdate>,
+) -> Result<()> {
+    let skill = dir.join(SKILL_RELATIVE_PATH);
+    let action = remove_managed_file(&skill, SKILL_MARKER_PREFIX, SKILL_END_MARKER)?;
+    if action != InitAction::Deferred {
+        updates.push(InstructionUpdate {
+            file: skill,
+            action,
+        });
+    }
+    let runbook = dir.join(RUNBOOK_RELATIVE_PATH);
+    let action = remove_managed_section_file(&runbook, RUNBOOK_MARKER_PREFIX, RUNBOOK_END_MARKER)?;
+    if action != InitAction::Deferred {
+        updates.push(InstructionUpdate {
+            file: runbook,
+            action,
+        });
+    }
+    for name in ["AGENTS.md", "AGENTS.override.md", "CLAUDE.md"] {
+        let file = dir.join(name);
+        if file.exists() {
+            let action = remove_instruction_section(&file)?;
+            if action != InitAction::Deferred {
+                updates.push(InstructionUpdate { file, action });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn ensure_runbook_file(file: &Path, dir: &Path) -> Result<InitAction> {
+    ensure_runbook_content(file, versioned_runbook_section(dir))
+}
+
+fn ensure_personal_runbook_file(file: &Path) -> Result<InitAction> {
+    ensure_runbook_content(file, versioned_personal_runbook())
+}
+
+fn ensure_runbook_content(file: &Path, section: String) -> Result<InitAction> {
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let section = versioned_runbook_section(dir);
     if !file.exists() {
         std::fs::write(file, format!("{}\n", section))?;
         return Ok(InitAction::Created);
@@ -563,7 +912,14 @@ fn ensure_runbook_file(file: &Path, dir: &Path) -> Result<InitAction> {
 }
 
 fn ensure_skill_file(file: &Path, dir: &Path) -> Result<InitAction> {
-    let content = versioned_skill(dir);
+    ensure_skill_content(file, versioned_skill(dir))
+}
+
+fn ensure_personal_skill_file(file: &Path) -> Result<InitAction> {
+    ensure_skill_content(file, versioned_personal_skill())
+}
+
+fn ensure_skill_content(file: &Path, content: String) -> Result<InitAction> {
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1052,18 +1408,49 @@ pub fn extract_runbook_version(content: &str) -> Option<String> {
 /// The skill points at the generated reference, so a missing or out-of-date
 /// reference makes the instruction surface stale even when `SKILL.md` itself
 /// is current.
-fn runbook_is_current(dir: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(dir.join(RUNBOOK_RELATIVE_PATH)) else {
+fn runbook_path_is_current(path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
         return false;
     };
     extract_runbook_version(&content).is_some_and(|v| v == TSIFT_VERSION)
 }
 
 pub fn check_instruction_version(dir: &Path) -> InstructionStatus {
-    let skill = dir.join(SKILL_RELATIVE_PATH);
+    // A user-scoped skill may exist for other repositories. Until this
+    // repository has either persisted a mode or carries a managed shared
+    // surface, status must still report that project setup is missing.
+    if !dir.join(INSTRUCTION_MODE_RELATIVE_PATH).exists()
+        && !has_managed_repository_instructions(dir)
+    {
+        return InstructionStatus::Missing;
+    }
+    let mode =
+        resolve_instruction_mode(dir, InstructionMode::Auto).unwrap_or(InstructionMode::Auto);
+    if mode == InstructionMode::Off {
+        return InstructionStatus::Disabled;
+    }
+    let (skill, runbook, shared) = if mode == InstructionMode::Personal {
+        let Ok(root) = resolve_user_skills_dir(None) else {
+            return InstructionStatus::Missing;
+        };
+        (
+            root.join("tsift/SKILL.md"),
+            root.join("tsift/references/code-navigation.md"),
+            false,
+        )
+    } else {
+        (
+            dir.join(SKILL_RELATIVE_PATH),
+            dir.join(RUNBOOK_RELATIVE_PATH),
+            true,
+        )
+    };
     let content = match std::fs::read_to_string(&skill) {
         Ok(c) => c,
         Err(_) => {
+            if !shared {
+                return InstructionStatus::Missing;
+            }
             let mut legacy_found = false;
             let mut legacy_version = None;
             for content in ["AGENTS.md", "AGENTS.override.md", "CLAUDE.md"]
@@ -1091,7 +1478,12 @@ pub fn check_instruction_version(dir: &Path) -> InstructionStatus {
     }
     match extract_instruction_version(&content) {
         Some(v) if v == TSIFT_VERSION => {
-            if runbook_is_current(dir) {
+            let router_current = !shared
+                || std::fs::read_to_string(dir.join("AGENTS.md"))
+                    .ok()
+                    .and_then(|content| extract_legacy_instruction_version(&content))
+                    .is_some_and(|version| version == TSIFT_VERSION);
+            if runbook_path_is_current(&runbook) && router_current {
                 InstructionStatus::Current { version: v }
             } else {
                 InstructionStatus::Stale {
@@ -1115,10 +1507,7 @@ fn extract_legacy_instruction_version(content: &str) -> Option<String> {
     let start = content.find(SECTION_MARKER_PREFIX)?;
     let rest = &content[start + SECTION_MARKER_PREFIX.len()..];
     let close = rest.find("-->")?;
-    rest[..close]
-        .trim()
-        .strip_prefix("v=")
-        .map(str::to_string)
+    rest[..close].trim().strip_prefix("v=").map(str::to_string)
 }
 
 #[cfg(test)]
@@ -1141,10 +1530,10 @@ mod tests {
     }
 
     #[test]
-    fn init_creates_repository_skill_without_agents_md() {
+    fn init_creates_shared_skill_and_agents_router() {
         let dir = TempDir::new().unwrap();
         let result = init(dir.path(), false, false).unwrap();
-        assert_eq!(result.updates.len(), 2);
+        assert_eq!(result.updates.len(), 3);
         assert!(matches!(result.updates[0].action, InitAction::Created));
         assert!(result.updates[0].file.ends_with(SKILL_RELATIVE_PATH));
         let content = std::fs::read_to_string(&result.updates[0].file).unwrap();
@@ -1155,7 +1544,82 @@ mod tests {
         assert!(content.contains("`tsift init` to refresh the repository-local tsift skill"));
         assert!(!content.contains("make check"));
         assert!(!content.contains("gh run list"));
+        let agents = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(agents.contains(SECTION_MARKER_PREFIX));
+        assert!(agents.contains(".agents/skills/tsift/SKILL.md"));
+    }
+
+    #[test]
+    fn personal_mode_installs_user_skill_without_repository_instruction_files() {
+        let dir = TempDir::new().unwrap();
+        let user = TempDir::new().unwrap();
+        let result = init_with_mode(
+            dir.path(),
+            false,
+            false,
+            false,
+            InstructionMode::Personal,
+            Some(user.path()),
+        )
+        .unwrap();
+
+        assert_eq!(result.instruction_mode, InstructionMode::Personal);
         assert!(!dir.path().join("AGENTS.md").exists());
+        assert!(!dir.path().join(SKILL_RELATIVE_PATH).exists());
+        assert!(!dir.path().join(".gitignore").exists());
+        assert!(user.path().join("tsift/SKILL.md").exists());
+        assert!(
+            user.path()
+                .join("tsift/references/code-navigation.md")
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(INSTRUCTION_MODE_RELATIVE_PATH)).unwrap(),
+            "personal\n"
+        );
+    }
+
+    #[test]
+    fn off_mode_removes_only_managed_repository_instruction_surfaces() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "# Team rules\n").unwrap();
+        init(dir.path(), false, false).unwrap();
+
+        let result =
+            init_with_mode(dir.path(), false, false, false, InstructionMode::Off, None).unwrap();
+
+        assert_eq!(result.instruction_mode, InstructionMode::Off);
+        assert!(!dir.path().join(SKILL_RELATIVE_PATH).exists());
+        assert!(!dir.path().join(RUNBOOK_RELATIVE_PATH).exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(),
+            "# Team rules\n"
+        );
+        assert_eq!(
+            check_instruction_version(dir.path()),
+            InstructionStatus::Disabled
+        );
+    }
+
+    #[test]
+    fn auto_preserves_managed_repositories_as_shared() {
+        let dir = TempDir::new().unwrap();
+        init(dir.path(), false, false).unwrap();
+        std::fs::remove_file(dir.path().join(INSTRUCTION_MODE_RELATIVE_PATH)).unwrap();
+
+        assert_eq!(
+            resolve_instruction_mode(dir.path(), InstructionMode::Auto).unwrap(),
+            InstructionMode::Shared
+        );
+    }
+
+    #[test]
+    fn auto_selects_personal_for_a_new_repository() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(
+            resolve_instruction_mode(dir.path(), InstructionMode::Auto).unwrap(),
+            InstructionMode::Personal
+        );
     }
 
     #[test]
@@ -1220,7 +1684,11 @@ mod tests {
 
         let error = init(dir.path(), false, false).err().unwrap().to_string();
         assert!(error.contains("Refusing to replace unmanaged tsift skill"));
-        assert!(std::fs::read_to_string(skill).unwrap().contains("Do not replace."));
+        assert!(
+            std::fs::read_to_string(skill)
+                .unwrap()
+                .contains("Do not replace.")
+        );
     }
 
     #[test]
@@ -1356,6 +1824,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), &runbook_only).unwrap();
+        persist_instruction_mode(dir.path(), InstructionMode::Shared).unwrap();
         assert!(matches!(
             check_instruction_version(dir.path()),
             InstructionStatus::Missing
@@ -1407,14 +1876,15 @@ mod tests {
     }
 
     #[test]
-    fn init_leaves_unmanaged_agents_md_unchanged() {
+    fn init_preserves_unmanaged_agents_md_and_adds_router() {
         let dir = TempDir::new().unwrap();
         let agents = dir.path().join("AGENTS.md");
         std::fs::write(&agents, "# My Project\n\nSome instructions.\n").unwrap();
         let result = init(dir.path(), false, false).unwrap();
-        assert_eq!(action_for(&result, "AGENTS.md"), None);
+        assert_eq!(action_for(&result, "AGENTS.md"), Some(InitAction::Created));
         let content = std::fs::read_to_string(&agents).unwrap();
-        assert_eq!(content, "# My Project\n\nSome instructions.\n");
+        assert!(content.starts_with("# My Project\n\nSome instructions.\n"));
+        assert!(content.contains(SECTION_MARKER_PREFIX));
         assert!(dir.path().join(SKILL_RELATIVE_PATH).exists());
     }
 
@@ -1424,19 +1894,24 @@ mod tests {
         std::fs::write(dir.path().join("AGENTS.md"), "# Agents\n").unwrap();
         std::fs::write(dir.path().join("CLAUDE.md"), "# Claude\n").unwrap();
         let result = init(dir.path(), false, false).unwrap();
-        assert_eq!(result.updates.len(), 2);
-        assert_eq!(std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(), "# Agents\n");
-        assert_eq!(std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap(), "# Claude\n");
+        assert_eq!(result.updates.len(), 3);
+        let agents = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(agents.starts_with("# Agents\n"));
+        assert!(agents.contains(SECTION_MARKER_PREFIX));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap(),
+            "# Claude\n"
+        );
     }
 
     #[test]
-    fn init_does_not_create_agents_or_modify_unmanaged_claude() {
+    fn init_creates_agents_router_without_modifying_unmanaged_claude() {
         let dir = TempDir::new().unwrap();
         let claude = dir.path().join("CLAUDE.md");
         std::fs::write(&claude, "# Claude\n").unwrap();
         let result = init(dir.path(), false, false).unwrap();
-        assert_eq!(result.updates.len(), 2);
-        assert!(!dir.path().join("AGENTS.md").exists());
+        assert_eq!(result.updates.len(), 3);
+        assert!(dir.path().join("AGENTS.md").exists());
         assert_eq!(action_for(&result, "CLAUDE.md"), None);
         assert_eq!(std::fs::read_to_string(claude).unwrap(), "# Claude\n");
     }
@@ -1457,7 +1932,9 @@ mod tests {
             "CLAUDE.md must not repeat instructions it already imports"
         );
         assert!(content.contains("# Claude extras"));
-        assert_eq!(std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(), "# Agents\n");
+        let agents = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(agents.starts_with("# Agents\n"));
+        assert!(agents.contains(SECTION_MARKER_PREFIX));
     }
 
     #[test]
@@ -1501,7 +1978,8 @@ mod tests {
         assert_eq!(action_for(&result, "CLAUDE.md"), None);
 
         let content = std::fs::read_to_string(&agents).unwrap();
-        assert_eq!(content, "# Agents\n");
+        assert!(content.starts_with("# Agents\n"));
+        assert!(content.contains(SECTION_MARKER_PREFIX));
     }
 
     #[test]
@@ -1512,13 +1990,20 @@ mod tests {
 
         let r1 = init(dir.path(), false, false).unwrap();
         assert!(matches!(r1.updates[0].action, InitAction::Created));
-        let content_after_first = std::fs::read_to_string(dir.path().join(SKILL_RELATIVE_PATH)).unwrap();
+        let content_after_first =
+            std::fs::read_to_string(dir.path().join(SKILL_RELATIVE_PATH)).unwrap();
 
         let r2 = init(dir.path(), false, false).unwrap();
         assert!(matches!(r2.updates[0].action, InitAction::AlreadyPresent));
-        let content_after_second = std::fs::read_to_string(dir.path().join(SKILL_RELATIVE_PATH)).unwrap();
+        let content_after_second =
+            std::fs::read_to_string(dir.path().join(SKILL_RELATIVE_PATH)).unwrap();
         assert_eq!(content_after_first, content_after_second);
-        assert_eq!(std::fs::read_to_string(&agents).unwrap(), "# Project\n");
+        let agents_after_second = std::fs::read_to_string(&agents).unwrap();
+        assert!(agents_after_second.starts_with("# Project\n"));
+        assert_eq!(
+            agents_after_second.matches(SECTION_MARKER_PREFIX).count(),
+            1
+        );
     }
 
     #[test]
@@ -1533,10 +2018,10 @@ mod tests {
 
         let result = init(dir.path(), false, false).unwrap();
         assert!(matches!(result.updates[0].action, InitAction::Created));
-        assert_eq!(action_for(&result, "AGENTS.md"), Some(InitAction::Removed));
+        assert_eq!(action_for(&result, "AGENTS.md"), Some(InitAction::Updated));
         let content = std::fs::read_to_string(&agents).unwrap();
         assert!(!content.contains("Old content here."));
-        assert!(!content.contains(SECTION_MARKER_PREFIX));
+        assert!(content.contains(SECTION_MARKER_PREFIX));
         let skill = std::fs::read_to_string(dir.path().join(SKILL_RELATIVE_PATH)).unwrap();
         assert!(skill.contains("tsift --envelope search"));
     }
@@ -1752,7 +2237,7 @@ mod tests {
         assert!(content.contains("Before content."));
         assert!(content.contains("## Footer"));
         assert!(content.contains("After content."));
-        assert!(!content.contains(SECTION_MARKER_PREFIX));
+        assert!(content.contains(SECTION_MARKER_PREFIX));
         assert!(dir.path().join(SKILL_RELATIVE_PATH).exists());
     }
 
@@ -2347,6 +2832,7 @@ mod tests {
     #[test]
     fn check_version_missing_when_no_files() {
         let dir = TempDir::new().unwrap();
+        persist_instruction_mode(dir.path(), InstructionMode::Shared).unwrap();
         let status = check_instruction_version(dir.path());
         assert_eq!(status, InstructionStatus::Missing);
     }
@@ -2354,6 +2840,7 @@ mod tests {
     #[test]
     fn check_version_missing_when_no_section() {
         let dir = TempDir::new().unwrap();
+        persist_instruction_mode(dir.path(), InstructionMode::Shared).unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "# Project\n").unwrap();
         let status = check_instruction_version(dir.path());
         assert_eq!(status, InstructionStatus::Missing);
@@ -2370,9 +2857,9 @@ mod tests {
         .unwrap();
         let result = init(dir.path(), false, false).unwrap();
         assert!(matches!(result.updates[0].action, InitAction::Created));
-        assert_eq!(action_for(&result, "AGENTS.md"), Some(InitAction::Removed));
+        assert_eq!(action_for(&result, "AGENTS.md"), Some(InitAction::Updated));
         let content = std::fs::read_to_string(&agents).unwrap();
-        assert!(!content.contains(SECTION_MARKER_PREFIX));
+        assert!(content.contains(SECTION_MARKER_PREFIX));
         assert!(!content.contains("Old content."));
         let skill = std::fs::read_to_string(dir.path().join(SKILL_RELATIVE_PATH)).unwrap();
         let expected_marker = format!("<!-- tsift:skill v={} -->", TSIFT_VERSION);

@@ -252,6 +252,7 @@ do [#t275]. spec-test-build-install-commit-push
 
     fn status_missing_instructions(&mut self) {
         let dir = self.empty_project_dir("missing");
+        write_instruction_mode(&dir, "shared");
         let report = status::check_status(&dir).unwrap();
         assert!(matches!(
             report.instructions,
@@ -348,6 +349,14 @@ do [#t275]. spec-test-build-install-commit-push
 }
 
 fn write_instruction_file(dir: &Path, version: &str) {
+    write_instruction_mode(dir, "shared");
+    fs::write(
+        dir.join("AGENTS.md"),
+        format!(
+            "<!-- tsift:code-navigation v={version} -->\n## Code Navigation\n<!-- /tsift:code-navigation -->\n"
+        ),
+    )
+    .unwrap();
     let skill = dir.join(init::SKILL_RELATIVE_PATH);
     fs::create_dir_all(skill.parent().unwrap()).unwrap();
     fs::write(
@@ -366,6 +375,12 @@ fn write_instruction_file(dir: &Path, version: &str) {
         ),
     )
     .unwrap();
+}
+
+fn write_instruction_mode(dir: &Path, mode: &str) {
+    let state = dir.join(init::INSTRUCTION_MODE_RELATIVE_PATH);
+    fs::create_dir_all(state.parent().unwrap()).unwrap();
+    fs::write(state, format!("{mode}\n")).unwrap();
 }
 
 fn required_coverage() -> &'static [&'static str] {

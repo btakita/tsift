@@ -264,15 +264,18 @@ In JSON mode, `--quiet` also omits the `changes` array and uses compact (non-pre
 
 ## Init (Project Setup)
 
-`tsift init` installs a repository-local tsift skill under `.agents/skills/tsift/`, so compatible harnesses discover a focused workflow without tsift creating or appending to `AGENTS.md`, `AGENTS.override.md`, or `CLAUDE.md`.
+`tsift init` uses a team-safe instruction deployment policy. `auto` preserves an existing tsift-managed repository integration as `shared`; a new repository defaults to `personal` and receives no tracked instruction changes.
 
 ```bash
-tsift init                              # install .agents/skills/tsift in the current project
+tsift init                              # auto: personal for new repos, shared for existing installs
+tsift init --instructions personal      # install ~/.agents/skills/tsift; no tracked repo changes
+tsift init --instructions shared        # install tracked skill/reference + AGENTS.md router
+tsift init --instructions off           # remove only tsift-owned repository guidance
 tsift init <path>                       # install at the resolved project root (dir or file)
 tsift init src/sub/tasks/plan.md        # resolves to submodule root src/sub/
-tsift init --codex                      # also inject auto-reindex hook into .codex/hooks.json
-tsift init --codex --workspace          # resolve to workspace root + install one workspace hook
-tsift init --opencode                   # install .opencode/commands/tsift-*.md shortcuts
+tsift init --instructions shared --codex             # also inject auto-reindex hook
+tsift init --instructions shared --codex --workspace # workspace hook + shared scope skills
+tsift init --instructions shared --opencode          # install OpenCode shortcuts
 opencode plugin opencode-tsift          # install the same shortcuts after the npm package is published
 ```
 
@@ -292,18 +295,19 @@ promoting the target to the outer superproject.
 
 ### Behavior
 
-1. Ensures `.tsift/` is ignored. Before changing `.gitignore`, it asks Git for the effective ignore decision, so `.git/info/exclude`, a global excludes file, a parent rule, or a broader tracked pattern remains authoritative. When another source already ignores the path, `init` leaves `.gitignore` untouched and reports that source.
-2. Writes `.agents/skills/tsift/SKILL.md` with `name` and `description` frontmatter plus the hot-path navigation workflow. An existing file is updated only when it carries tsift's ownership marker; an unmanaged same-path skill fails closed and is never overwritten.
-3. Writes `.agents/skills/tsift/references/code-navigation.md` with the detailed workflow under `<!-- tsift:code-navigation-runbook -->` markers. Existing `.agent/runbooks/code-navigation.md` and `runbooks/code-navigation.md` files migrate to this reference path so hand-written text outside the managed markers survives.
-4. Removes only tsift-owned legacy `<!-- tsift:code-navigation -->` regions from existing `AGENTS.md`, `AGENTS.override.md`, and `CLAUDE.md`; surrounding team instructions remain. Missing instruction files are not created.
+1. Persists the selected policy in ignored `.tsift/instruction-mode`. `auto` reads it first, then detects existing managed repository markers, and otherwise selects `personal`.
+2. `personal` installs `~/.agents/skills/tsift/SKILL.md` plus its bundled reference and adds `.tsift/` only to Git's local exclude file. It does not create or edit tracked repository instruction files.
+3. `shared` ensures `.tsift/` is ignored, writes `.agents/skills/tsift/SKILL.md` plus `references/code-navigation.md`, and adds a small marker-owned router to `AGENTS.md`. An unmanaged same-path skill fails closed and surrounding team content is preserved.
+4. `off` removes only tsift-owned repository skill/reference files and marker regions. It does not remove a user-scoped personal skill because other repositories may use it.
 5. Idempotent — running twice produces no changes on the second run.
-6. With `--codex`: merges a `UserPromptSubmit` auto-reindex hook into `.codex/hooks.json` (creates the file and directory if needed, updates stale tsift commands in place, removes duplicate tsift hook entries, idempotent).
-7. With `--opencode`: installs marker-owned `.opencode/commands/tsift-*.md` command templates. Existing marker-owned files are updated idempotently; unmanaged same-name files fail closed instead of being overwritten.
-8. When the resolved target has `.gitmodules`, the Codex hook uses workspace-aware index commands so one root hook covers initialized submodules.
-9. The skill tells harnesses to switch to the owning repo or submodule root before running tsift/build/test commands and steers them toward envelope-backed artifacts instead of raw high-volume output.
-10. Verification guidance is capability-based. It names only repository and host commands that can be proven available.
-11. `SKILL.md` is a hot-path router and defers detailed workflows to `references/code-navigation.md`.
-12. With `--workspace`, the skill surface is refreshed in every enabled workspace scope. Harness integrations stay at the root; only the tsift skill and reference fan out.
+6. `--codex` and `--opencode` imply `shared` when the policy is `auto`, because those integrations write project files. Explicit `personal` or `off` combinations fail closed.
+7. With `--codex`: merges a `UserPromptSubmit` auto-reindex hook into `.codex/hooks.json` (creates the file and directory if needed, updates stale tsift commands in place, removes duplicate tsift hook entries, idempotent).
+8. With `--opencode`: installs marker-owned `.opencode/commands/tsift-*.md` command templates. Existing marker-owned files are updated idempotently; unmanaged same-name files fail closed instead of being overwritten.
+9. When the resolved target has `.gitmodules`, the Codex hook uses workspace-aware index commands so one root hook covers initialized submodules.
+10. The skill tells harnesses to switch to the owning repo or submodule root before running tsift/build/test commands and steers them toward envelope-backed artifacts instead of raw high-volume output.
+11. Verification guidance is capability-based. It names only repository and host commands that can be proven available.
+12. `SKILL.md` is a hot-path router and defers detailed workflows to `references/code-navigation.md`.
+13. With `--workspace`, shared skill surfaces are refreshed in every enabled workspace scope. Personal/off modes do not fan out tracked instruction changes.
 
 The OpenCode command shortcut set is intentionally prompt-template based rather than a background hook: OpenCode already reads project `AGENTS.md`, and the managed commands give operators explicit `/tsift-status`, `/tsift-session-review`, `/tsift-context-pack`, `/tsift-diff-digest`, `/tsift-test-digest`, `/tsift-log-digest`, `/tsift-rewrite-run`, `/tsift-explain`, `/tsift-symbol-read`, and `/tsift-graph` entrypoints that route common workflows through bounded tsift evidence without depending on raw terminal replay.
 
