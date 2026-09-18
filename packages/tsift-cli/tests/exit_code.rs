@@ -158,6 +158,14 @@ fn release_publish_gate_requires_secret_variable_and_dry_run() {
         "release asset builds should target the public root package"
     );
     assert!(
+        workflow.contains("dist/*.tar.gz")
+            && workflow.contains("dist/*.tar.gz.sha256")
+            && workflow.contains("dist/*.zip")
+            && workflow.contains("dist/*.zip.sha256")
+            && !workflow.contains("files: dist/*"),
+        "GitHub release uploads should match archive files, not staging directories"
+    );
+    assert!(
         workflow.contains("vars.TSIFT_ENABLE_CRATES_PUBLISH == 'true'"),
         "publish job should remain opt-in through the repo variable"
     );
