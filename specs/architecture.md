@@ -335,9 +335,23 @@ CREATE TABLE dir_state (
 
 ### Transactional Index Updates
 
-`apply_changes` and `rebuild` wrap all SQLite mutations in a SAVEPOINT. If any insert, delete, metadata read, or directory-state write fails mid-batch, the entire mutation is rolled back. The index stays at its pre-call state instead of landing in a partially-updated mix of old and new symbols.
+`apply_changes` and `rebuild` wrap SQLite mutations in a SAVEPOINT. If any insert, delete, metadata read, or directory-state write fails, the in-flight mutation is rolled back rather than landing a partially-updated mix of old and new symbols.
 
 `rebuild` nests its own SAVEPOINT around the inner `apply_changes` SAVEPOINT. If a rebuild fails after the bulk DELETEs but before the re-index finishes, both layers are rolled back and the prior index contents are preserved.
+
+**Commits are chunked (`INDEX_APPLY_COMMIT_CHUNK_FILES`, 512 files).** `apply_changes` releases and re-enters its outermost savepoint on a file boundary every chunk, so the rollback unit is the current chunk, not the whole call. A change set that fits inside one chunk — the overwhelmingly common incremental case — is still all-or-nothing.
+
+Chunking is a durability requirement, not an optimization. `wal_autocheckpoint` (256 pages) only fires when a write transaction commits, so a single transaction spanning an entire index build pins every dirty page in the WAL. Once the WAL outgrows its index hash blocks, SQLite's `walFindFrame` degrades into a backwards scan of those blocks on *every* page read and the build goes quadratic. A 2026-09-20 `$HOME`-rooted build demonstrated the failure mode: 11 hours at 97% CPU, an 8 GB WAL against a 4 KB database, 101 TB of `rchar` across 24.7 billion read syscalls, 89% of cycles in `walFindFrame`, and **zero rows ever committed**. Bounded chunks let the autocheckpoint reclaim the WAL and keep the apply linear in changed files.
+
+Within a chunk, `file_state` is written **last** for each file. It is the "fully indexed at this mtime" marker, so it must never precede the symbol, zone-map, FTS, call-edge, and route rows it vouches for: a marker that outran its rows would make the next apply skip the file as unchanged forever.
+
+### Workspace Root Resolution
+
+`lint::project_root_from_canonical_path` and `lint::harness_root_from_canonical_path` resolve a path to its workspace by walking ancestors for a `.tsift/` directory, `.git`, or `.gitmodules`.
+
+A `.tsift/` directory is only a workspace marker at a **non-ambient** path. `ambient_state_roots()` names the ambient ones — `$TMPDIR`, `$HOME`, and the filesystem root. tsift itself writes user-level state into `~/.tsift/` (the GPU lease, prompt-cache history, artifacts), which creates that directory; without the guard, the first tsift run that touched user-level state made `$HOME` resolve as a workspace root, and any raw read of a file under `$HOME` but outside a repository (`~/.claude/projects/<slug>/memory/*.md`, for example) rooted at `$HOME` and tried to index the entire home directory.
+
+The guard is scoped to the `.tsift` marker only. An explicit `.git`/`.gitmodules` repository at an ambient path is user-created and still resolves as a workspace root.
 
 ### Large Repo Optimization: Prune Surface Held in Safe Mode
 

@@ -159,13 +159,53 @@ fn guess_annotation_kind(entity: &str) -> AnnotationKind {
     }
 }
 
+/// Directories that hold tsift's own ambient state rather than a workspace.
+///
+/// tsift writes user-level state to `~/.tsift/` (the GPU lease, prompt-cache
+/// history, artifacts), which *creates that directory*. The ancestor walks below
+/// treat a `.tsift/` directory as a workspace marker, so once any tsift run has
+/// touched the user-level state, `$HOME` itself starts resolving as a workspace
+/// root — and a raw read of any file under `$HOME` but outside a repository
+/// (`~/.claude/projects/<slug>/memory/*.md`, say) roots at `$HOME` and indexes
+/// the entire home directory. The filesystem root is ambient for the same
+/// reason. `$TMPDIR` was already special-cased here; these are the same defect.
+///
+/// Only the `.tsift` marker is suppressed: an explicit `.git`/`.gitmodules`
+/// repository at one of these paths is still a real, user-created workspace.
+fn ambient_state_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(temp_root) = std::env::temp_dir().canonicalize() {
+        roots.push(temp_root);
+    }
+    if let Some(home) = home_dir_canonical() {
+        roots.push(home);
+    }
+    roots.push(PathBuf::from("/"));
+    roots
+}
+
+fn home_dir_canonical() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").filter(|value| !value.is_empty())?;
+    let home = PathBuf::from(home);
+    home.canonicalize().ok().or(Some(home))
+}
+
 fn project_root_from_canonical_path(canonical: &Path) -> Option<PathBuf> {
+    project_root_from_canonical_path_within(canonical, &ambient_state_roots())
+}
+
+fn project_root_from_canonical_path_within(
+    canonical: &Path,
+    ambient_roots: &[PathBuf],
+) -> Option<PathBuf> {
     let start = canonical_path_start_dir(canonical);
     let temp_root = std::env::temp_dir().canonicalize().ok();
 
     for ancestor in start.ancestors() {
         let ambient_temp_root = temp_root.as_deref() == Some(ancestor) && ancestor != start;
-        if (ancestor.join(".tsift").is_dir() || ancestor.join(".gitmodules").is_file())
+        let ambient_tsift_dir = ambient_roots.iter().any(|root| root == ancestor);
+        if ((ancestor.join(".tsift").is_dir() && !ambient_tsift_dir)
+            || ancestor.join(".gitmodules").is_file())
             && !ambient_temp_root
         {
             return Some(ancestor.to_path_buf());
@@ -179,11 +219,21 @@ fn project_root_from_canonical_path(canonical: &Path) -> Option<PathBuf> {
 }
 
 fn harness_root_from_canonical_path(canonical: &Path) -> Option<PathBuf> {
+    harness_root_from_canonical_path_within(canonical, &ambient_state_roots())
+}
+
+fn harness_root_from_canonical_path_within(
+    canonical: &Path,
+    ambient_roots: &[PathBuf],
+) -> Option<PathBuf> {
     let start = canonical_path_start_dir(canonical);
     let mut workspace_root = None;
 
     for ancestor in start.ancestors() {
-        if ancestor.join(".tsift").is_dir() || ancestor.join(".git").exists() {
+        let ambient_tsift_dir = ambient_roots.iter().any(|root| root == ancestor);
+        if (ancestor.join(".tsift").is_dir() && !ambient_tsift_dir)
+            || ancestor.join(".git").exists()
+        {
             return Some(ancestor.to_path_buf());
         }
         if workspace_root.is_none() && ancestor.join(".gitmodules").is_file() {
@@ -408,6 +458,104 @@ mod tests {
         assert_eq!(annotations[0].text, "scan_skills");
         assert_eq!(annotations[0].column, 5);
         assert_eq!(annotations[0].suggestion, "`scan_skills`");
+    }
+
+    /// tsift writes user-level state (GPU lease, prompt-cache history,
+    /// artifacts) into `~/.tsift/`, which creates that directory. Before the
+    /// ambient-root guard, the ancestor walk read that directory as a workspace
+    /// marker, so a file under `$HOME` but outside any repository resolved its
+    /// root to `$HOME` itself — and `tsift source-read --path $HOME` then tried
+    /// to index the entire home directory.
+    #[test]
+    fn ambient_tsift_state_dir_is_not_a_workspace_root() {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        fs::create_dir_all(home_path.join(".tsift")).unwrap();
+        let nested = home_path.join(".claude/projects/slug/memory");
+        fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("note.md");
+        fs::write(&file, "note").unwrap();
+
+        let ambient = vec![home_path.clone()];
+
+        assert_eq!(
+            project_root_from_canonical_path_within(&file, &ambient),
+            None,
+            "a `.tsift` state dir in an ambient root must not make it a workspace root"
+        );
+        assert_eq!(
+            harness_root_from_canonical_path_within(&file, &ambient),
+            None,
+            "the harness walk must apply the same ambient-root guard"
+        );
+    }
+
+    /// The guard is scoped to the `.tsift` marker only: a real repository the
+    /// user created at an ambient root is still a workspace.
+    #[test]
+    fn ambient_root_with_real_repo_marker_is_still_a_workspace_root() {
+        let home = tempfile::tempdir().unwrap();
+        let home_path = home.path().canonicalize().unwrap();
+        fs::create_dir_all(home_path.join(".tsift")).unwrap();
+        fs::create_dir_all(home_path.join(".git")).unwrap();
+        let nested = home_path.join("dotfiles/zsh");
+        fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("rc.zsh");
+        fs::write(&file, "echo hi").unwrap();
+
+        let ambient = vec![home_path.clone()];
+
+        assert_eq!(
+            project_root_from_canonical_path_within(&file, &ambient).as_deref(),
+            Some(home_path.as_path())
+        );
+        assert_eq!(
+            harness_root_from_canonical_path_within(&file, &ambient).as_deref(),
+            Some(home_path.as_path())
+        );
+    }
+
+    /// A `.tsift` directory in an ordinary project still marks that project.
+    #[test]
+    fn non_ambient_tsift_dir_still_marks_a_workspace_root() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        fs::create_dir_all(root_path.join(".tsift")).unwrap();
+        let nested = root_path.join("src");
+        fs::create_dir_all(&nested).unwrap();
+        let file = nested.join("lib.rs");
+        fs::write(&file, "fn main() {}").unwrap();
+
+        // Ambient set deliberately excludes this root.
+        let ambient: Vec<PathBuf> = vec![PathBuf::from("/nonexistent-ambient")];
+
+        assert_eq!(
+            project_root_from_canonical_path_within(&file, &ambient).as_deref(),
+            Some(root_path.as_path())
+        );
+        assert_eq!(
+            harness_root_from_canonical_path_within(&file, &ambient).as_deref(),
+            Some(root_path.as_path())
+        );
+    }
+
+    /// Wiring check: the real ambient set must actually carry `$HOME`, or the
+    /// guard above is inert in production.
+    #[test]
+    fn ambient_state_roots_include_home_and_filesystem_root() {
+        let roots = ambient_state_roots();
+        assert!(
+            roots.contains(&PathBuf::from("/")),
+            "filesystem root missing from ambient roots: {roots:?}"
+        );
+        if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
+            let home = PathBuf::from(home);
+            let home = home.canonicalize().unwrap_or(home);
+            assert!(
+                roots.contains(&home),
+                "home dir {home:?} missing from ambient roots: {roots:?}"
+            );
+        }
     }
 
     #[test]

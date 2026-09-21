@@ -47,6 +47,18 @@ impl Drop for SnapshotCopyGuard {
 
 const INDEX_DB_WAL_AUTOCHECKPOINT_PAGES: i64 = 256;
 
+/// Files applied per index transaction.
+///
+/// `wal_autocheckpoint` only fires when a write transaction commits, so a
+/// single transaction spanning the whole apply pins every dirty page in the
+/// WAL. Once the WAL outgrows its index hash blocks, SQLite's `walFindFrame`
+/// degrades into a backwards scan of those blocks on *every* page read and the
+/// apply goes quadratic: a 2026-09-20 `$HOME`-rooted build spun 11h at 97% CPU
+/// with an 8GB WAL, 24.7B read syscalls, and zero rows ever committed.
+/// Committing in bounded chunks lets the autocheckpoint reclaim the WAL and
+/// keeps the apply linear in the number of changed files.
+const INDEX_APPLY_COMMIT_CHUNK_FILES: usize = 512;
+
 type InspectScopeKey = (PathBuf, PathBuf, bool);
 type CachedInspectResult = std::result::Result<ReadOnlyInspectResult, String>;
 
@@ -1106,6 +1118,7 @@ impl IndexDb {
                 "INSERT INTO route_nodes (framework, method, route_path, handler_name, file, line, handler_line) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
             )?;
             let mut warnings = Vec::new();
+            let mut applied_since_commit = 0usize;
             let resolve_edges_cache = graph::ResolveEdgesCache::new();
 
             for change in &summary.changes {
@@ -1116,13 +1129,6 @@ impl IndexDb {
                             .with_context(|| format!("stat {}", change.path.display()))?;
                         let mtime = metadata.modified()?;
                         let (secs, nanos) = system_time_to_pair(mtime);
-                        insert_file.execute(rusqlite::params![
-                            &path_str,
-                            secs,
-                            nanos,
-                            change.language.as_deref().unwrap_or("unknown"),
-                        ])?;
-
                         delete_symbols.execute(rusqlite::params![&path_str])?;
                         delete_zonemap.execute(rusqlite::params![&path_str])?;
                         delete_fts.execute(rusqlite::params![&path_str])?;
@@ -1260,6 +1266,20 @@ impl IndexDb {
                                 }
                             }
                         }
+
+                        // `file_state` is the "fully indexed at this mtime" marker
+                        // and is written last, so the marker never precedes the rows
+                        // it vouches for. Chunk commits below only ever land on a
+                        // file boundary, which keeps that ordering invariant to the
+                        // chunk size: a committed chunk can never claim a file is
+                        // indexed while its symbols/zonemap/FTS/edges are missing
+                        // (which the next apply would skip as unchanged forever).
+                        insert_file.execute(rusqlite::params![
+                            &path_str,
+                            secs,
+                            nanos,
+                            change.language.as_deref().unwrap_or("unknown"),
+                        ])?;
                     }
                     ChangeKind::Deleted => {
                         delete_file.execute(rusqlite::params![&path_str])?;
@@ -1269,6 +1289,16 @@ impl IndexDb {
                         delete_edges.execute(rusqlite::params![&path_str])?;
                         delete_routes.execute(rusqlite::params![&path_str])?;
                     }
+                }
+
+                // Commit on a file boundary so `wal_autocheckpoint` can reclaim the
+                // WAL. Releasing the outermost savepoint commits; re-entering it
+                // keeps the rest of the loop transactional.
+                applied_since_commit += 1;
+                if applied_since_commit >= INDEX_APPLY_COMMIT_CHUNK_FILES {
+                    self.conn
+                        .execute_batch("RELEASE sp_apply; SAVEPOINT sp_apply")?;
+                    applied_since_commit = 0;
                 }
             }
 
@@ -3247,6 +3277,42 @@ def list_items():
         assert_eq!(db.file_count().unwrap(), 4);
     }
 
+    /// A single transaction spanning the whole apply pins every dirty page in
+    /// the WAL, so `wal_autocheckpoint` never fires; once the WAL outgrows its
+    /// index hash blocks, `walFindFrame` turns each page read into a backwards
+    /// scan and the apply goes quadratic. The apply must therefore commit on
+    /// bounded file-count chunks. Proof that it does: interrupt an apply whose
+    /// change set spans more than one chunk and the completed chunks must have
+    /// survived. Before chunked commits this left zero rows.
+    #[test]
+    fn apply_changes_commits_in_bounded_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_count = INDEX_APPLY_COMMIT_CHUNK_FILES + 64;
+        for idx in 0..file_count {
+            fs::write(
+                dir.path().join(format!("f{idx}.rs")),
+                format!("fn f{idx}() {{}}"),
+            )
+            .unwrap();
+        }
+        let db = db_in(dir.path());
+
+        let _guard = arm_apply_changes_failpoint();
+        let err = db.apply_changes(dir.path()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("injected apply_changes failure after file mutations")
+        );
+
+        let committed = db.file_count().unwrap();
+        assert_eq!(
+            committed, INDEX_APPLY_COMMIT_CHUNK_FILES,
+            "expected the completed chunk to be durable, got {committed} of {file_count}"
+        );
+    }
+
+    /// The chunk boundary must not break the atomicity a caller still gets when
+    /// the whole change set fits inside one chunk.
     #[test]
     fn apply_changes_rolls_back_on_failure() {
         let dir = setup_tree();
