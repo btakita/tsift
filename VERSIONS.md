@@ -8,6 +8,12 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.100
+
+- **Stop the `$HOME`-rooted index thrash.** tsift's own user-level state directory (`~/.tsift/`, holding the GPU lease, prompt-cache history, and artifacts) satisfied the `.tsift/` workspace marker, so any path under `$HOME` but outside a repository resolved its root to `$HOME` and tsift tried to index the entire home directory. `ambient_state_roots()` now suppresses that marker at `$TMPDIR`, `$HOME`, and the filesystem root; an explicit `.git`/`.gitmodules` repository at one of those paths is user-created and still resolves as a workspace.
+- **Bound WAL growth during an index apply.** `apply_changes` wrapped the entire apply in one savepoint, so `wal_autocheckpoint` never fired and `walFindFrame` degraded into a backwards scan of the WAL index on every page read — an observed build spun 11 hours at 97% CPU with an 8GB WAL and committed nothing. The apply now commits on a file boundary every 512 files, and each file's `file_state` marker row is written after the rows it vouches for.
+- **Refuse an ambient state root as an index root.** `TSIFT_ALLOW_AMBIENT_ROOT=1` overrides. The check runs at `IndexDb::open` (so a refused run creates no index db or lock) and again at the apply/rebuild boundary, where it precedes `rebuild`'s bulk DELETEs so a refused root never clears a healthy index.
+
 ## 0.1.99
 
 - **Promote C# to full indexed navigation support.** `.cs` files now provide symbols and call edges to search/graph commands, and the semantic edit planner supports identifier-aware `rename_symbol` alongside structural rewrites.
