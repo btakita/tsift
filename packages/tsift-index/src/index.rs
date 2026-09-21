@@ -512,6 +512,7 @@ fn hash_projection_query(
 
 impl IndexDb {
     pub fn open(db_path: &Path) -> Result<Self> {
+        crate::roots::ensure_indexable_db_path(db_path)?;
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating index dir: {}", parent.display()))?;
@@ -1031,6 +1032,7 @@ impl IndexDb {
         prune: bool,
         excluded_roots: &[PathBuf],
     ) -> Result<IndexSummary> {
+        crate::roots::ensure_indexable_root(root)?;
         let stored = self.load_stored_files()?;
 
         let (entries, pruned_dirs, dir_mtimes, prune_stats, skipped) = if prune {
@@ -1344,6 +1346,9 @@ impl IndexDb {
         root: &Path,
         excluded_roots: &[PathBuf],
     ) -> Result<IndexSummary> {
+        // Checked before the bulk DELETEs so a refused root never clears a
+        // healthy index on its way to failing.
+        crate::roots::ensure_indexable_root(root)?;
         self.conn.execute_batch("SAVEPOINT sp_rebuild")?;
         let result: Result<IndexSummary> = (|| {
             self.conn.execute("DELETE FROM file_state", [])?;
@@ -3275,6 +3280,43 @@ def list_items():
         let summary = db.apply_changes(dir.path()).unwrap();
         assert_eq!(summary.new, 1);
         assert_eq!(db.file_count().unwrap(), 4);
+    }
+
+    /// The ambient-root guard is a backstop at the index *build* boundary, not
+    /// only in root resolution: it must refuse however the root was chosen.
+    #[test]
+    fn apply_changes_refuses_an_ambient_state_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = db_in(dir.path());
+
+        let err = db.apply_changes(Path::new("/")).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("refusing to index ambient state root"),
+            "unexpected message: {message}"
+        );
+        assert_eq!(db.file_count().unwrap(), 0);
+    }
+
+    /// `rebuild` clears every table before re-indexing, so the guard has to run
+    /// before those DELETEs — a refused root must not destroy a healthy index.
+    #[test]
+    fn rebuild_refuses_an_ambient_state_root_without_clearing_the_index() {
+        let dir = setup_tree();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+        assert_eq!(db.file_count().unwrap(), 3);
+
+        let err = db.rebuild(Path::new("/")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("refusing to index ambient state root")
+        );
+        assert_eq!(
+            db.file_count().unwrap(),
+            3,
+            "a refused rebuild must leave the existing index intact"
+        );
     }
 
     /// A single transaction spanning the whole apply pins every dirty page in

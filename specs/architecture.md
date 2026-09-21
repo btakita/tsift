@@ -345,13 +345,19 @@ Chunking is a durability requirement, not an optimization. `wal_autocheckpoint` 
 
 Within a chunk, `file_state` is written **last** for each file. It is the "fully indexed at this mtime" marker, so it must never precede the symbol, zone-map, FTS, call-edge, and route rows it vouches for: a marker that outran its rows would make the next apply skip the file as unchanged forever.
 
-### Workspace Root Resolution
+### Ambient State Roots
 
-`lint::project_root_from_canonical_path` and `lint::harness_root_from_canonical_path` resolve a path to its workspace by walking ancestors for a `.tsift/` directory, `.git`, or `.gitmodules`.
+tsift writes user-level state into `~/.tsift/` (the GPU lease, prompt-cache history, artifacts), which *creates that directory*. Root resolution looks for a `.tsift/` directory, so once any tsift run has touched user-level state, `$HOME` starts looking like a workspace. `tsift_index::roots::ambient_state_roots()` names the paths that are ambient state rather than a workspace: **`$TMPDIR`, `$HOME`, and the filesystem root**.
 
-A `.tsift/` directory is only a workspace marker at a **non-ambient** path. `ambient_state_roots()` names the ambient ones — `$TMPDIR`, `$HOME`, and the filesystem root. tsift itself writes user-level state into `~/.tsift/` (the GPU lease, prompt-cache history, artifacts), which creates that directory; without the guard, the first tsift run that touched user-level state made `$HOME` resolve as a workspace root, and any raw read of a file under `$HOME` but outside a repository (`~/.claude/projects/<slug>/memory/*.md`, for example) rooted at `$HOME` and tried to index the entire home directory.
+Two independent defenses use that set. They are deliberately not the same check — the second must hold even if the first regresses.
 
-The guard is scoped to the `.tsift` marker only. An explicit `.git`/`.gitmodules` repository at an ambient path is user-created and still resolves as a workspace root.
+**1. Resolution never picks an ambient root from a bare `.tsift/` marker.** `lint::project_root_from_canonical_path` and `lint::harness_root_from_canonical_path` walk ancestors for `.tsift/`, `.git`, or `.gitmodules`. The `.tsift/` marker is ignored at an ambient path. Without this, a raw read of a file under `$HOME` but outside a repository (`~/.claude/projects/<slug>/memory/*.md`, for example) resolved its root to `$HOME` and tsift tried to index the entire home directory.
+
+The suppression is scoped to the `.tsift` marker only. An explicit `.git`/`.gitmodules` repository at an ambient path — a dotfiles repo at `$HOME` — is user-created and still resolves as a workspace root.
+
+**2. The index build boundary refuses an ambient root outright.** `roots::ensure_indexable_root` runs at the top of `IndexDb::apply_changes_inner` and `IndexDb::rebuild_excluding`, so it refuses *however the root was chosen* — an operator typo, `cd ~ && tsift index`, a hook that computed the root wrongly, or a future regression in resolution itself. In `rebuild` it runs **before** the bulk DELETEs, so a refused root never clears a healthy index on its way to failing.
+
+Indexing `$HOME` walks every cache, checkout, and build directory the user owns. It has no legitimate use and one observed cost (see Transactional Index Updates). The refusal names its escape hatch: **`TSIFT_ALLOW_AMBIENT_ROOT=1`** (also `true`/`yes`/`on`) overrides it. Only the ambient paths themselves are refused — a directory *under* `$TMPDIR` or `$HOME`, which is where nearly every real project lives, is indexable as usual.
 
 ### Large Repo Optimization: Prune Surface Held in Safe Mode
 

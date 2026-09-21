@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use tsift_index::roots::ambient_state_roots;
 use tsift_index::{config, index::IndexDb};
 
 #[derive(Debug, Clone, Serialize)]
@@ -157,37 +158,6 @@ fn guess_annotation_kind(entity: &str) -> AnnotationKind {
     } else {
         AnnotationKind::Bold
     }
-}
-
-/// Directories that hold tsift's own ambient state rather than a workspace.
-///
-/// tsift writes user-level state to `~/.tsift/` (the GPU lease, prompt-cache
-/// history, artifacts), which *creates that directory*. The ancestor walks below
-/// treat a `.tsift/` directory as a workspace marker, so once any tsift run has
-/// touched the user-level state, `$HOME` itself starts resolving as a workspace
-/// root — and a raw read of any file under `$HOME` but outside a repository
-/// (`~/.claude/projects/<slug>/memory/*.md`, say) roots at `$HOME` and indexes
-/// the entire home directory. The filesystem root is ambient for the same
-/// reason. `$TMPDIR` was already special-cased here; these are the same defect.
-///
-/// Only the `.tsift` marker is suppressed: an explicit `.git`/`.gitmodules`
-/// repository at one of these paths is still a real, user-created workspace.
-fn ambient_state_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Ok(temp_root) = std::env::temp_dir().canonicalize() {
-        roots.push(temp_root);
-    }
-    if let Some(home) = home_dir_canonical() {
-        roots.push(home);
-    }
-    roots.push(PathBuf::from("/"));
-    roots
-}
-
-fn home_dir_canonical() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").filter(|value| !value.is_empty())?;
-    let home = PathBuf::from(home);
-    home.canonicalize().ok().or(Some(home))
 }
 
 fn project_root_from_canonical_path(canonical: &Path) -> Option<PathBuf> {
@@ -537,25 +507,6 @@ mod tests {
             harness_root_from_canonical_path_within(&file, &ambient).as_deref(),
             Some(root_path.as_path())
         );
-    }
-
-    /// Wiring check: the real ambient set must actually carry `$HOME`, or the
-    /// guard above is inert in production.
-    #[test]
-    fn ambient_state_roots_include_home_and_filesystem_root() {
-        let roots = ambient_state_roots();
-        assert!(
-            roots.contains(&PathBuf::from("/")),
-            "filesystem root missing from ambient roots: {roots:?}"
-        );
-        if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-            let home = PathBuf::from(home);
-            let home = home.canonicalize().unwrap_or(home);
-            assert!(
-                roots.contains(&home),
-                "home dir {home:?} missing from ambient roots: {roots:?}"
-            );
-        }
     }
 
     #[test]
