@@ -28973,6 +28973,65 @@ tier = "private"
         assert!(result.is_ok(), "WAL snapshot fallback failed: {:?}", result.err());
     }
 
+    /// `#ciwalflakeregress`: the WAL fallback test reddened CI because its
+    /// readiness wait was a latency assertion — 1s for a spawned thread to open
+    /// SQLite, switch journal modes, create and populate a probe table, take an
+    /// exclusive lock, and confirm the WAL sidecar. A contended runner blew that
+    /// budget and the suite reported a lock-hook timeout on an unrelated commit.
+    ///
+    /// This reproduces the contention deterministically instead of waiting for a
+    /// slow runner: the holder sleeps 1.5s before touching SQLite, all of it
+    /// inside the readiness window. Under the old 1s cap the search fails with
+    /// `waiting for search post-precheck lock hook`; under the 30s deadlock
+    /// bound it completes and still exercises the WAL snapshot fallback, because
+    /// the holder keeps the lock until this test's guard drops.
+    #[test]
+    fn search_cmd_wal_fallback_survives_setup_latency_past_the_old_readiness_cap() {
+        assert!(
+            SEARCH_POST_PRECHECK_LOCK_INJECTED_SETUP_DELAY > Duration::from_secs(1),
+            "injected setup delay must exceed the pre-2171338 1s readiness cap to              reproduce the flake, got {:?}",
+            SEARCH_POST_PRECHECK_LOCK_INJECTED_SETUP_DELAY
+        );
+        assert!(
+            SEARCH_POST_PRECHECK_LOCK_INJECTED_SETUP_DELAY < SEARCH_POST_PRECHECK_LOCK_BOUND,
+            "injected setup delay must stay under the deadlock bound, got {:?} vs {:?}",
+            SEARCH_POST_PRECHECK_LOCK_INJECTED_SETUP_DELAY,
+            SEARCH_POST_PRECHECK_LOCK_BOUND
+        );
+
+        let dir = setup_graph_index();
+        let _hook = install_search_post_precheck_wal_lock_with_setup_delay(
+            dir.path().join(".tsift/index.db"),
+            SEARCH_POST_PRECHECK_LOCK_INJECTED_SETUP_DELAY,
+        );
+
+        let result = cmd_search(
+            "main".to_string(),
+            Some(dir.path().to_path_buf()),
+            5,
+            Some("lexical".to_string()),
+            None,
+            false,
+            false,
+            false,
+            0,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        assert!(
+            result.is_ok(),
+            "WAL snapshot fallback failed under {:?} of injected setup latency: {:?}",
+            SEARCH_POST_PRECHECK_LOCK_INJECTED_SETUP_DELAY,
+            result.err()
+        );
+    }
+
     #[test]
     fn search_cmd_fails_fast_when_autoindex_disabled_and_index_is_stale() {
         let dir = setup_graph_index();
@@ -36499,6 +36558,11 @@ enum SearchPostPrecheckLockMode {
 struct SearchPostPrecheckLockHook {
     db_path: PathBuf,
     mode: SearchPostPrecheckLockMode,
+    /// Latency injected before the holder thread starts its SQLite setup
+    /// (`#ciwalflakeregress`). This is how a test reproduces a contended CI
+    /// runner on demand: the delay is spent inside the readiness window, so it
+    /// is charged against `SEARCH_POST_PRECHECK_LOCK_BOUND`.
+    setup_delay: Duration,
 }
 
 #[cfg(test)]
@@ -36520,25 +36584,45 @@ impl Drop for SearchPostPrecheckLockGuard {
 
 #[cfg(test)]
 fn install_search_post_precheck_lock(db_path: PathBuf) -> SearchPostPrecheckLockGuard {
-    install_search_post_precheck_lock_hook(db_path, SearchPostPrecheckLockMode::RollbackJournal)
+    install_search_post_precheck_lock_hook(
+        db_path,
+        SearchPostPrecheckLockMode::RollbackJournal,
+        Duration::ZERO,
+    )
 }
 
 #[cfg(test)]
 fn install_search_post_precheck_wal_lock(db_path: PathBuf) -> SearchPostPrecheckLockGuard {
-    install_search_post_precheck_lock_hook(db_path, SearchPostPrecheckLockMode::Wal)
+    install_search_post_precheck_lock_hook(db_path, SearchPostPrecheckLockMode::Wal, Duration::ZERO)
+}
+
+/// Installs the WAL hook with `setup_delay` of injected latency before the
+/// holder thread touches SQLite (`#ciwalflakeregress`). Used to prove the
+/// readiness wait is a deadlock bound and not a latency assertion.
+#[cfg(test)]
+fn install_search_post_precheck_wal_lock_with_setup_delay(
+    db_path: PathBuf,
+    setup_delay: Duration,
+) -> SearchPostPrecheckLockGuard {
+    install_search_post_precheck_lock_hook(db_path, SearchPostPrecheckLockMode::Wal, setup_delay)
 }
 
 #[cfg(test)]
 fn install_search_post_precheck_lock_hook(
     db_path: PathBuf,
     mode: SearchPostPrecheckLockMode,
+    setup_delay: Duration,
 ) -> SearchPostPrecheckLockGuard {
     SEARCH_POST_PRECHECK_LOCK_HOOK.with(|hook| {
         assert!(
             hook.borrow().is_none(),
             "search post-precheck lock hook already installed"
         );
-        *hook.borrow_mut() = Some(SearchPostPrecheckLockHook { db_path, mode });
+        *hook.borrow_mut() = Some(SearchPostPrecheckLockHook {
+            db_path,
+            mode,
+            setup_delay,
+        });
     });
     SearchPostPrecheckLockGuard
 }
@@ -36554,6 +36638,15 @@ fn install_search_post_precheck_lock_hook(
 #[cfg(test)]
 const SEARCH_POST_PRECHECK_LOCK_BOUND: Duration = Duration::from_secs(30);
 
+/// Setup latency injected by the `#ciwalflakeregress` regression test. It must
+/// exceed the 1s readiness cap this hook used before commit 2171338 — that is
+/// the whole point: under the old cap the search fails with
+/// `waiting for search post-precheck lock hook`, under the 30s deadlock bound
+/// it completes. Keep it above 1s and far below
+/// `SEARCH_POST_PRECHECK_LOCK_BOUND`.
+#[cfg(test)]
+const SEARCH_POST_PRECHECK_LOCK_INJECTED_SETUP_DELAY: Duration = Duration::from_millis(1_500);
+
 #[cfg(test)]
 pub(crate) fn maybe_apply_search_post_precheck_test_hooks() -> Result<()> {
     let Some(hook) = SEARCH_POST_PRECHECK_LOCK_HOOK.with(|hook| hook.borrow_mut().take()) else {
@@ -36566,6 +36659,12 @@ pub(crate) fn maybe_apply_search_post_precheck_test_hooks() -> Result<()> {
     // the assertion while exercising none of the fallback it claims to test.
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
     std::thread::spawn(move || {
+        // Injected before any SQLite work so it is charged against the
+        // readiness window, exactly where a contended runner loses its time
+        // (`#ciwalflakeregress`).
+        if !hook.setup_delay.is_zero() {
+            std::thread::sleep(hook.setup_delay);
+        }
         let conn = Connection::open(&hook.db_path).expect("opening db for search lock hook");
         match hook.mode {
             SearchPostPrecheckLockMode::RollbackJournal => {
