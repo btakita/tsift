@@ -1,6 +1,7 @@
 use crate::config;
 use anyhow::{Result, bail};
 use serde::Serialize;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -1190,6 +1191,19 @@ fn ensure_personal_runbook_file(file: &Path) -> Result<InitAction> {
     ensure_runbook_content(file, versioned_personal_runbook())
 }
 
+fn replace_file_atomically(file: &Path, content: &str) -> Result<()> {
+    let parent = file.parent().ok_or_else(|| {
+        anyhow::anyhow!("managed instruction path has no parent: {}", file.display())
+    })?;
+    let permissions = std::fs::metadata(file)?.permissions();
+    let mut replacement = tempfile::NamedTempFile::new_in(parent)?;
+    replacement.write_all(content.as_bytes())?;
+    replacement.as_file_mut().sync_all()?;
+    replacement.as_file_mut().set_permissions(permissions)?;
+    replacement.persist(file)?;
+    Ok(())
+}
+
 fn ensure_runbook_content(file: &Path, section: String) -> Result<InitAction> {
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1208,7 +1222,7 @@ fn ensure_runbook_content(file: &Path, section: String) -> Result<InitAction> {
         new_content.push('\n');
         new_content.push_str(&section);
         new_content.push('\n');
-        std::fs::write(file, new_content)?;
+        replace_file_atomically(file, &new_content)?;
         return Ok(InitAction::Created);
     };
     let Some(end_rel) = content[start..].find(RUNBOOK_END_MARKER) else {
@@ -1224,7 +1238,7 @@ fn ensure_runbook_content(file: &Path, section: String) -> Result<InitAction> {
     if new_content == content {
         return Ok(InitAction::AlreadyPresent);
     }
-    std::fs::write(file, new_content)?;
+    replace_file_atomically(file, &new_content)?;
     Ok(InitAction::Updated)
 }
 
@@ -1264,7 +1278,7 @@ fn ensure_skill_content(file: &Path, content: String) -> Result<InitAction> {
     if existing == next {
         return Ok(InitAction::AlreadyPresent);
     }
-    std::fs::write(file, next)?;
+    replace_file_atomically(file, &next)?;
     Ok(InitAction::Updated)
 }
 
@@ -2012,9 +2026,8 @@ mod tests {
 
         assert_eq!(result.harness_links.len(), HarnessSkillTarget::ALL.len());
         for link in &result.harness_links {
-            let content = std::fs::read_to_string(link.link.join("SKILL.md")).unwrap_or_else(|e| {
-                panic!("{} link does not resolve: {e}", link.harness.as_str())
-            });
+            let content = std::fs::read_to_string(link.link.join("SKILL.md"))
+                .unwrap_or_else(|e| panic!("{} link does not resolve: {e}", link.harness.as_str()));
             assert!(
                 content.contains(SKILL_MARKER_PREFIX),
                 "{} link resolved to a non-tsift skill",
@@ -2075,7 +2088,10 @@ mod tests {
         .unwrap_err()
         .to_string();
 
-        assert!(err.contains("Refusing to replace the unmanaged claude skill"), "{err}");
+        assert!(
+            err.contains("Refusing to replace the unmanaged claude skill"),
+            "{err}"
+        );
         assert_eq!(
             std::fs::read_to_string(existing.join("SKILL.md")).unwrap(),
             "# hand-written tsift skill\n"
@@ -2106,8 +2122,7 @@ mod tests {
         std::fs::remove_file(&link).unwrap();
         create_dir_symlink(Path::new("../../.agents/skills/tsift/references"), &link).unwrap();
         std::fs::write(
-            dir.path()
-                .join(".agents/skills/tsift/references/SKILL.md"),
+            dir.path().join(".agents/skills/tsift/references/SKILL.md"),
             format!("{SKILL_MARKER_PREFIX}v=0.0.1 -->\nold\n{SKILL_END_MARKER}\n"),
         )
         .unwrap();
@@ -2463,6 +2478,11 @@ mod tests {
             ),
         )
         .unwrap();
+        #[cfg(unix)]
+        let original_inode = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&runbook).unwrap().ino()
+        };
 
         let result = init(dir.path(), false, false).unwrap();
         assert_eq!(
@@ -2474,6 +2494,15 @@ mod tests {
         assert!(content.contains("Local trailer."));
         assert!(!content.contains("Old."));
         assert!(content.contains(&format!("{}v={} -->", RUNBOOK_MARKER_PREFIX, TSIFT_VERSION)));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_ne!(
+                original_inode,
+                std::fs::metadata(&runbook).unwrap().ino(),
+                "managed runbook updates must replace the inode so concurrent readers cannot observe a torn write"
+            );
+        }
 
         let again = init(dir.path(), false, false).unwrap();
         assert_eq!(

@@ -8,7 +8,13 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.101
+
 - **`tsift init --harness <claude|codex|opencode|grok|all>` makes the skill loadable without an `AGENTS.md` router (`#harnessskilllink`).** The canonical skill lives under `.agents/skills/tsift/` (shared) or `~/.agents/skills/tsift/` (personal), and no harness scans that path — Claude Code reads `.claude/skills/`, Codex `.codex/skills/`, OpenCode `.opencode/skills/`, Grok `.grok/skills/`. Only the router `shared` mode writes into `AGENTS.md` made the skill reachable, so `personal` mode installed a skill nothing loaded. `--harness` symlinks the canonical skill into each requested harness directory — project-relative in `shared`, home-rooted and absolute in `personal`, so `personal` still writes nothing tracked. A symlink, never a copy: a copy drifts silently, with the harness loading a release-old file while `tsift status` reports the canonical surface as current, because status only ever reads the canonical path. An existing path that is not a tsift-owned link fails closed and names the harness; a link tsift owns that points elsewhere is repointed. `--instructions off --harness ...` removes the tsift-owned links from both roots so deleting the canonical skill cannot leave a dangling skill directory. Unlike `--codex`/`--opencode`, `--harness` does not require `shared`.
+
+- **Keep generated skills complete and make version drift actionable (`#skillversioneval`).** `tsift init` now derives its generated skill from the maintained navigation contract instead of a smaller parallel template, stamps both the skill and runbook with the binary version, and `tsift audit` reports stale tsift-owned skill declarations while leaving unrelated skills alone. The search lock-hook regression harness also models setup latency inside the readiness window, preserving deterministic coverage of the 30-second WAL fallback bound under slower CI runners.
+
+- **Publish managed skill and runbook updates atomically.** Concurrent `status --fix` / `init` processes can no longer expose a truncated marker block to another reader while refreshing a stale personal or repository instruction surface. Existing file permissions are retained, and the regression asserts that an update replaces the file inode instead of truncating it in place.
 
 ## 0.1.100
 
