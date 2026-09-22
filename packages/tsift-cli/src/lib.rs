@@ -28937,7 +28937,10 @@ tier = "private"
             false,
         );
 
-        assert!(result.is_ok());
+        // `#ciwalflake`: a bare `is_ok()` reported only "assertion failed"
+        // in CI, so a red run said nothing about why the rollback-journal
+        // fallback refused. Carry the error into the failure message.
+        assert!(result.is_ok(), "rollback-journal snapshot fallback failed: {:?}", result.err());
     }
 
     #[test]
@@ -28964,7 +28967,10 @@ tier = "private"
             false,
         );
 
-        assert!(result.is_ok());
+        // `#ciwalflake`: a bare `is_ok()` reported only "assertion failed"
+        // in CI, so a red run said nothing about why the WAL
+        // fallback refused. Carry the error into the failure message.
+        assert!(result.is_ok(), "WAL snapshot fallback failed: {:?}", result.err());
     }
 
     #[test]
@@ -36477,6 +36483,10 @@ pub(crate) fn maybe_apply_search_worker_test_hooks() -> Result<()> {
 #[cfg(test)]
 thread_local! {
     static SEARCH_POST_PRECHECK_LOCK_HOOK: RefCell<Option<SearchPostPrecheckLockHook>> = const { RefCell::new(None) };
+    /// Release handle for the thread holding the hook's lock (`#ciwalflake`).
+    /// Dropping it disconnects the channel, which is how the guard tells the
+    /// holder the test is done instead of the holder guessing with a sleep.
+    static SEARCH_POST_PRECHECK_LOCK_RELEASE: RefCell<Option<std::sync::mpsc::SyncSender<()>>> = const { RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -36499,6 +36509,11 @@ impl Drop for SearchPostPrecheckLockGuard {
     fn drop(&mut self) {
         SEARCH_POST_PRECHECK_LOCK_HOOK.with(|hook| {
             hook.borrow_mut().take();
+        });
+        // Releases the holder thread immediately rather than leaving it parked
+        // on its deadlock bound (`#ciwalflake`).
+        SEARCH_POST_PRECHECK_LOCK_RELEASE.with(|slot| {
+            slot.borrow_mut().take();
         });
     }
 }
@@ -36528,12 +36543,28 @@ fn install_search_post_precheck_lock_hook(
     SearchPostPrecheckLockGuard
 }
 
+/// Upper bound on the holder thread's setup and on how long it keeps the lock
+/// (`#ciwalflake`). Both are deadlock-breakers, not timing windows: the holder
+/// releases as soon as the test's guard drops, and a healthy run never comes
+/// near this. It was previously a 1s readiness cap plus a fixed 200ms hold,
+/// which made the test a latency assertion about a contended CI runner — the
+/// WAL hook does more setup than its rollback-journal sibling (journal-mode
+/// switch, table create, insert, exclusive locking mode, sidecar check), so it
+/// was the one that blew the 1s budget and reddened CI on an unrelated commit.
+#[cfg(test)]
+const SEARCH_POST_PRECHECK_LOCK_BOUND: Duration = Duration::from_secs(30);
+
 #[cfg(test)]
 pub(crate) fn maybe_apply_search_post_precheck_test_hooks() -> Result<()> {
     let Some(hook) = SEARCH_POST_PRECHECK_LOCK_HOOK.with(|hook| hook.borrow_mut().take()) else {
         return Ok(());
     };
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    // Dropping this sender (when the test's guard drops) disconnects the
+    // channel and releases the lock. A fixed sleep instead let a slow runner
+    // release it *before* the search reached the contended read, which passes
+    // the assertion while exercising none of the fallback it claims to test.
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
     std::thread::spawn(move || {
         let conn = Connection::open(&hook.db_path).expect("opening db for search lock hook");
         match hook.mode {
@@ -36557,12 +36588,17 @@ pub(crate) fn maybe_apply_search_post_precheck_test_hooks() -> Result<()> {
             }
         }
         ready_tx.send(()).expect("signaling search lock hook");
-        std::thread::sleep(Duration::from_millis(200));
+        // Hold until the test releases us, with a bound so a search that blocks
+        // on the lock cannot deadlock the suite.
+        let _ = release_rx.recv_timeout(SEARCH_POST_PRECHECK_LOCK_BOUND);
         drop(conn);
         let _ = fs::remove_file(substrate::rollback_journal_path(&hook.db_path));
     });
+    SEARCH_POST_PRECHECK_LOCK_RELEASE.with(|slot| {
+        *slot.borrow_mut() = Some(release_tx);
+    });
     ready_rx
-        .recv_timeout(Duration::from_secs(1))
+        .recv_timeout(SEARCH_POST_PRECHECK_LOCK_BOUND)
         .context("waiting for search post-precheck lock hook")?;
     Ok(())
 }
