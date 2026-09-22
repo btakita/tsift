@@ -277,6 +277,10 @@ tsift init --instructions shared --codex             # also inject auto-reindex 
 tsift init --instructions shared --codex --workspace # workspace hook + shared scope skills
 tsift init --instructions shared --opencode          # install OpenCode shortcuts
 opencode plugin opencode-tsift          # install the same shortcuts after the npm package is published
+tsift init --instructions personal --harness claude   # link ~/.claude/skills/tsift -> the user skill
+tsift init --harness claude --harness codex           # repeatable
+tsift init --harness all                              # every supported harness
+tsift init --instructions off --harness all           # remove the tsift-owned links too
 ```
 
 ### Path Resolution
@@ -308,6 +312,21 @@ promoting the target to the outer superproject.
 11. Verification guidance is capability-based. It names only repository and host commands that can be proven available.
 12. `SKILL.md` is a hot-path router and defers detailed workflows to `references/code-navigation.md`.
 13. With `--workspace`, shared skill surfaces are refreshed in every enabled workspace scope. Personal/off modes do not fan out tracked instruction changes.
+14. `--harness <claude|codex|opencode|grok|all>` links the canonical skill into that harness's own skill directory (`#harnessskilllink`). It is repeatable, and `all` expands to every supported harness.
+
+### Harness Skill Links (`--harness`)
+
+The canonical skill lives under `.agents/skills/tsift/` (shared) or `~/.agents/skills/tsift/` (personal). No harness scans that path: Claude Code reads `.claude/skills/` and `~/.claude/skills/`, Codex reads `.codex/skills/` and `$CODEX_HOME/skills/`, OpenCode `.opencode/skills/`, Grok `.grok/skills/`. Without `--harness`, the only thing making the skill reachable is the `AGENTS.md` router that `shared` mode writes — so `personal` mode installs a skill no harness loads, and the router is not actually optional.
+
+`--harness` closes that gap:
+
+1. Each requested harness gets `<root>/<harness skills dir>/tsift` pointing at the canonical skill directory. `root` is the project root in `shared` mode and the user's home directory in `personal` mode, so `personal` still writes nothing tracked.
+2. The link is a **symlink, never a copy**. A copy drifts silently: the harness keeps loading a release-old file while `tsift status` reports the canonical surface as current, because status only ever reads the canonical path. A symlink means one `tsift init` refresh updates every harness at once.
+3. A project-scoped link uses a relative target (`../../.agents/skills/tsift`) so the checkout stays relocatable; a user-scoped link is absolute because its target is outside any project. The `..` climb is derived from the harness directory's own depth, so a harness added at a different depth cannot produce a dangling link.
+4. An existing path that is not a tsift-owned symlink fails closed and names the harness and path — a hand-maintained `~/.claude/skills/tsift/` is never overwritten. A symlink tsift does own but that points elsewhere is repointed, which is how an older layout migrates.
+5. `--instructions off --harness ...` removes the tsift-owned links instead of creating them, in both the project and the user root, so deleting the canonical skill cannot leave a dangling skill directory behind. Removal skips any path tsift does not own.
+6. Links are idempotent: a second run reports `already present`.
+7. Unlike `--codex`/`--opencode`, `--harness` does not require `shared` — making the skill loadable without tracked instruction files is the whole point of `personal` mode.
 
 The OpenCode command shortcut set is intentionally prompt-template based rather than a background hook: OpenCode already reads project `AGENTS.md`, and the managed commands give operators explicit `/tsift-status`, `/tsift-session-review`, `/tsift-context-pack`, `/tsift-diff-digest`, `/tsift-test-digest`, `/tsift-log-digest`, `/tsift-rewrite-run`, `/tsift-explain`, `/tsift-symbol-read`, and `/tsift-graph` entrypoints that route common workflows through bounded tsift evidence without depending on raw terminal replay.
 

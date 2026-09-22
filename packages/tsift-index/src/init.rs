@@ -267,6 +267,68 @@ impl InstructionMode {
     }
 }
 
+/// Harnesses that discover skills by scanning their own skill directory rather
+/// than by following a router line in `AGENTS.md`. `tsift init --harness <name>`
+/// links the canonical tsift skill into each one, so the skill is loaded without
+/// any tracked instruction prose (`#harnessskilllink`).
+///
+/// The link is a symlink, never a copy: a copied skill drifts silently from the
+/// installed binary — the harness keeps loading a release-old file while
+/// `tsift status` reports the canonical surface as current, because status only
+/// ever reads the canonical path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum HarnessSkillTarget {
+    Claude,
+    Codex,
+    OpenCode,
+    Grok,
+}
+
+impl HarnessSkillTarget {
+    pub const ALL: &'static [Self] = &[Self::Claude, Self::Codex, Self::OpenCode, Self::Grok];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::OpenCode => "opencode",
+            Self::Grok => "grok",
+        }
+    }
+
+    /// Directory this harness scans for skills, relative to a project root
+    /// (shared mode) or to the user's home directory (personal mode).
+    fn skills_dir(self) -> &'static str {
+        match self {
+            Self::Claude => ".claude/skills",
+            Self::Codex => ".codex/skills",
+            Self::OpenCode => ".opencode/skills",
+            Self::Grok => ".grok/skills",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "claude" => Some(Self::Claude),
+            "codex" => Some(Self::Codex),
+            "opencode" => Some(Self::OpenCode),
+            "grok" => Some(Self::Grok),
+            _ => None,
+        }
+    }
+}
+
+/// One harness skill link this run created, refreshed, or removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessSkillLink {
+    pub harness: HarnessSkillTarget,
+    pub link: PathBuf,
+    /// The symlink target as written — relative for a project-scoped link so the
+    /// checkout stays relocatable, absolute for a user-scoped one.
+    pub target: PathBuf,
+    pub action: InitAction,
+}
+
 const GITIGNORE_ENTRY: &str = ".tsift/";
 const GITIGNORE_PROBE: &str = ".tsift/.tsift-ignore-probe";
 const CODEX_HOOK_STATUS: &str = "tsift auto-reindex";
@@ -274,6 +336,7 @@ const CODEX_AUTOINDEX_HELPER: &str = "tsift-autoindex.sh";
 const CODEX_AUTOINDEX_HELPER_VERSION: u32 = 3;
 const OPENCODE_COMMAND_MARKER_PREFIX: &str = "<!-- tsift:opencode-command";
 
+#[derive(Debug)]
 pub struct InitResult {
     pub instruction_mode: InstructionMode,
     pub updates: Vec<InstructionUpdate>,
@@ -286,6 +349,9 @@ pub struct InitResult {
     pub gitignore_ignore_source: Option<String>,
     pub codex_hooks: Option<CodexHooksResult>,
     pub opencode_commands: Option<Vec<OpenCodeCommandUpdate>>,
+    /// Harness skill links this run touched (`--harness`). Empty when no
+    /// harness was requested.
+    pub harness_links: Vec<HarnessSkillLink>,
 }
 
 /// A one-time relocation of the managed code-navigation runbook. Both paths are
@@ -328,6 +394,7 @@ pub struct OpenCodeCommandUpdate {
     pub action: InitAction,
 }
 
+#[derive(Debug)]
 pub struct InstructionUpdate {
     pub file: PathBuf,
     pub action: InitAction,
@@ -502,6 +569,178 @@ fn resolve_user_skills_dir(override_dir: Option<&Path>) -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".agents/skills"))
 }
 
+/// Root the harness skill directories hang off in personal mode.
+///
+/// `resolve_user_skills_dir` returns `<root>/.agents/skills`, so the harness
+/// root is that path's grandparent. An override that does not use the canonical
+/// layout links beside itself rather than guessing at a home directory.
+fn resolve_user_harness_root(user_skills_dir: Option<&Path>) -> Result<PathBuf> {
+    let skills = resolve_user_skills_dir(user_skills_dir)?;
+    if skills.ends_with(".agents/skills")
+        && let Some(root) = skills.parent().and_then(Path::parent)
+    {
+        return Ok(root.to_path_buf());
+    }
+    Ok(skills)
+}
+
+#[cfg(unix)]
+fn create_dir_symlink(target: &Path, link: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, link).map_err(Into::into)
+}
+
+#[cfg(windows)]
+fn create_dir_symlink(target: &Path, link: &Path) -> Result<()> {
+    std::os::windows::fs::symlink_dir(target, link).map_err(|err| {
+        anyhow::anyhow!(
+            "cannot create the harness skill link {}: {err} — Windows requires Developer Mode or the symlink privilege",
+            link.display()
+        )
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_dir_symlink(_target: &Path, link: &Path) -> Result<()> {
+    bail!(
+        "harness skill links are unsupported on this platform ({})",
+        link.display()
+    )
+}
+
+/// True when `link` is a symlink tsift owns — it resolves to a directory whose
+/// `SKILL.md` carries the tsift ownership marker. Anything else is a
+/// hand-maintained skill this command must never overwrite.
+fn is_tsift_owned_skill_link(link: &Path) -> bool {
+    let Ok(metadata) = link.symlink_metadata() else {
+        return false;
+    };
+    if !metadata.file_type().is_symlink() {
+        return false;
+    }
+    std::fs::read_to_string(link.join("SKILL.md"))
+        .is_ok_and(|content| content.contains(SKILL_MARKER_PREFIX))
+}
+
+/// Link the canonical tsift skill into each requested harness skill directory
+/// (`#harnessskilllink`). `canonical` is the directory holding the generated
+/// `SKILL.md`; `root` is the project root (shared) or home directory (personal).
+fn link_harness_skills(
+    root: &Path,
+    canonical: &Path,
+    harnesses: &[HarnessSkillTarget],
+    relative: bool,
+) -> Result<Vec<HarnessSkillLink>> {
+    if harnesses.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !canonical.join("SKILL.md").exists() {
+        bail!(
+            "cannot link harness skills: no tsift skill at {} — run `tsift init` with an instruction mode that installs one",
+            canonical.display()
+        );
+    }
+    let mut links = Vec::new();
+    for harness in dedup_harnesses(harnesses) {
+        let link = root.join(harness.skills_dir()).join("tsift");
+        let target = if relative {
+            // Every supported harness skills dir is `<root>/<a>/<b>`, but derive
+            // the climb from the path so a future harness with a different depth
+            // cannot silently produce a dangling link.
+            let mut up = PathBuf::new();
+            for _ in Path::new(harness.skills_dir()).components() {
+                up.push("..");
+            }
+            up.join(canonical.strip_prefix(root).unwrap_or(canonical))
+        } else {
+            canonical.to_path_buf()
+        };
+
+        if link.symlink_metadata().is_ok() {
+            if !is_tsift_owned_skill_link(&link) {
+                bail!(
+                    "Refusing to replace the unmanaged {} skill at {} — move it aside, then re-run with --harness {}",
+                    harness.as_str(),
+                    link.display(),
+                    harness.as_str()
+                );
+            }
+            if std::fs::read_link(&link).ok().as_deref() == Some(target.as_path()) {
+                links.push(HarnessSkillLink {
+                    harness,
+                    link,
+                    target,
+                    action: InitAction::AlreadyPresent,
+                });
+                continue;
+            }
+            std::fs::remove_file(&link)?;
+            if let Some(parent) = link.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            create_dir_symlink(&target, &link)?;
+            links.push(HarnessSkillLink {
+                harness,
+                link,
+                target,
+                action: InitAction::Updated,
+            });
+            continue;
+        }
+
+        if let Some(parent) = link.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        create_dir_symlink(&target, &link)?;
+        links.push(HarnessSkillLink {
+            harness,
+            link,
+            target,
+            action: InitAction::Created,
+        });
+    }
+    Ok(links)
+}
+
+/// Remove tsift-owned harness skill links. Used by `off` mode, which must not
+/// leave a dangling link behind after it deletes the canonical skill, and must
+/// not touch a hand-maintained skill that happens to share the path.
+fn unlink_harness_skills(
+    root: &Path,
+    harnesses: &[HarnessSkillTarget],
+) -> Result<Vec<HarnessSkillLink>> {
+    let mut links = Vec::new();
+    for harness in dedup_harnesses(harnesses) {
+        let link = root.join(harness.skills_dir()).join("tsift");
+        let Ok(metadata) = link.symlink_metadata() else {
+            continue;
+        };
+        if !metadata.file_type().is_symlink() {
+            continue;
+        }
+        let target = std::fs::read_link(&link).unwrap_or_default();
+        // The canonical skill may already be gone, so a broken link whose target
+        // still names the tsift skill path counts as ours.
+        if !is_tsift_owned_skill_link(&link) && !target.ends_with("skills/tsift") {
+            continue;
+        }
+        std::fs::remove_file(&link)?;
+        links.push(HarnessSkillLink {
+            harness,
+            link,
+            target,
+            action: InitAction::Removed,
+        });
+    }
+    Ok(links)
+}
+
+fn dedup_harnesses(harnesses: &[HarnessSkillTarget]) -> Vec<HarnessSkillTarget> {
+    let mut sorted: Vec<_> = harnesses.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    sorted
+}
+
 pub fn resolve_project_dir(path: &Path) -> Result<PathBuf> {
     let dir = input_dir(path)?;
 
@@ -560,6 +799,28 @@ pub fn init_with_mode(
     opencode: bool,
     requested_mode: InstructionMode,
     user_skills_dir: Option<&Path>,
+) -> Result<InitResult> {
+    init_with_harnesses(
+        dir,
+        codex,
+        codex_workspace,
+        opencode,
+        requested_mode,
+        user_skills_dir,
+        &[],
+    )
+}
+
+/// `init_with_mode` plus harness skill links (`--harness`, `#harnessskilllink`).
+#[allow(clippy::too_many_arguments)]
+pub fn init_with_harnesses(
+    dir: &Path,
+    codex: bool,
+    codex_workspace: bool,
+    opencode: bool,
+    requested_mode: InstructionMode,
+    user_skills_dir: Option<&Path>,
+    harnesses: &[HarnessSkillTarget],
 ) -> Result<InitResult> {
     let mut instruction_mode = resolve_instruction_mode(dir, requested_mode)?;
     if requested_mode == InstructionMode::Auto
@@ -641,6 +902,33 @@ pub fn init_with_mode(
     };
     persist_instruction_mode(dir, instruction_mode)?;
 
+    // `#harnessskilllink`: the canonical skill lives under `.agents/skills/`,
+    // which no harness scans — only the `AGENTS.md` router pointed at it. Link
+    // it into each requested harness skill directory so the skill is discovered
+    // on its own and the router becomes optional.
+    let harness_links = match instruction_mode {
+        InstructionMode::Shared => link_harness_skills(
+            dir,
+            &dir.join(".agents/skills/tsift"),
+            harnesses,
+            /* relative */ true,
+        )?,
+        InstructionMode::Personal => {
+            let root = resolve_user_harness_root(user_skills_dir)?;
+            let canonical = resolve_user_skills_dir(user_skills_dir)?.join("tsift");
+            link_harness_skills(&root, &canonical, harnesses, /* relative */ false)?
+        }
+        InstructionMode::Off => {
+            let mut removed = unlink_harness_skills(dir, harnesses)?;
+            removed.extend(unlink_harness_skills(
+                &resolve_user_harness_root(user_skills_dir)?,
+                harnesses,
+            )?);
+            removed
+        }
+        InstructionMode::Auto => Vec::new(),
+    };
+
     let codex_hooks = if codex {
         let scope = if codex_workspace {
             if !has_submodules(dir)? {
@@ -670,6 +958,7 @@ pub fn init_with_mode(
         gitignore_ignore_source,
         codex_hooks,
         opencode_commands,
+        harness_links,
     })
 }
 
@@ -1577,6 +1866,240 @@ mod tests {
             std::fs::read_to_string(dir.path().join(INSTRUCTION_MODE_RELATIVE_PATH)).unwrap(),
             "personal\n"
         );
+    }
+
+    /// `#harnessskilllink`: the canonical skill lives under `.agents/skills/`,
+    /// which no harness scans — before this, only the `AGENTS.md` router made it
+    /// reachable. The link has to resolve to the *generated* skill, so the test
+    /// reads through it rather than asserting the link exists.
+    #[test]
+    fn shared_harness_link_makes_the_skill_loadable_without_the_agents_router() {
+        let dir = TempDir::new().unwrap();
+        let result = init_with_harnesses(
+            dir.path(),
+            false,
+            false,
+            false,
+            InstructionMode::Shared,
+            None,
+            &[HarnessSkillTarget::Claude],
+        )
+        .unwrap();
+
+        let link = dir.path().join(".claude/skills/tsift");
+        assert_eq!(
+            result.harness_links,
+            vec![HarnessSkillLink {
+                harness: HarnessSkillTarget::Claude,
+                link: link.clone(),
+                target: PathBuf::from("../../.agents/skills/tsift"),
+                action: InitAction::Created,
+            }]
+        );
+        assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+        let through_link = std::fs::read_to_string(link.join("SKILL.md")).unwrap();
+        assert!(through_link.contains(SKILL_MARKER_PREFIX));
+        assert_eq!(
+            through_link,
+            std::fs::read_to_string(dir.path().join(SKILL_RELATIVE_PATH)).unwrap(),
+            "the harness must load the same bytes as the canonical skill"
+        );
+        // A relative target keeps the link working after the checkout moves.
+        assert!(
+            std::fs::read_link(&link).unwrap().is_relative(),
+            "a project-scoped link must not hard-code an absolute path"
+        );
+        assert!(link.join("references/code-navigation.md").exists());
+    }
+
+    #[test]
+    fn every_supported_harness_link_resolves_to_the_generated_skill() {
+        let dir = TempDir::new().unwrap();
+        let result = init_with_harnesses(
+            dir.path(),
+            false,
+            false,
+            false,
+            InstructionMode::Shared,
+            None,
+            HarnessSkillTarget::ALL,
+        )
+        .unwrap();
+
+        assert_eq!(result.harness_links.len(), HarnessSkillTarget::ALL.len());
+        for link in &result.harness_links {
+            let content = std::fs::read_to_string(link.link.join("SKILL.md")).unwrap_or_else(|e| {
+                panic!("{} link does not resolve: {e}", link.harness.as_str())
+            });
+            assert!(
+                content.contains(SKILL_MARKER_PREFIX),
+                "{} link resolved to a non-tsift skill",
+                link.harness.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn personal_harness_link_points_at_the_user_scoped_skill() {
+        let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let user_skills = home.path().join(".agents/skills");
+        let result = init_with_harnesses(
+            dir.path(),
+            false,
+            false,
+            false,
+            InstructionMode::Personal,
+            Some(&user_skills),
+            &[HarnessSkillTarget::Claude],
+        )
+        .unwrap();
+
+        // Personal mode leaves the repository untouched, so the link must land
+        // beside the user skill, never in the project.
+        assert!(!dir.path().join(".claude").exists());
+        let link = home.path().join(".claude/skills/tsift");
+        assert_eq!(result.harness_links[0].link, link);
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            user_skills.join("tsift"),
+            "a user-scoped link is absolute because its target is outside any project"
+        );
+        assert!(
+            std::fs::read_to_string(link.join("SKILL.md"))
+                .unwrap()
+                .contains(SKILL_MARKER_PREFIX)
+        );
+    }
+
+    #[test]
+    fn harness_link_refuses_to_replace_an_unmanaged_skill() {
+        let dir = TempDir::new().unwrap();
+        let existing = dir.path().join(".claude/skills/tsift");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::write(existing.join("SKILL.md"), "# hand-written tsift skill\n").unwrap();
+
+        let err = init_with_harnesses(
+            dir.path(),
+            false,
+            false,
+            false,
+            InstructionMode::Shared,
+            None,
+            &[HarnessSkillTarget::Claude],
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("Refusing to replace the unmanaged claude skill"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(existing.join("SKILL.md")).unwrap(),
+            "# hand-written tsift skill\n"
+        );
+    }
+
+    #[test]
+    fn harness_link_is_idempotent_and_repoints_a_stale_tsift_link() {
+        let dir = TempDir::new().unwrap();
+        let args = || {
+            init_with_harnesses(
+                dir.path(),
+                false,
+                false,
+                false,
+                InstructionMode::Shared,
+                None,
+                &[HarnessSkillTarget::Claude],
+            )
+            .unwrap()
+        };
+        assert_eq!(args().harness_links[0].action, InitAction::Created);
+        assert_eq!(args().harness_links[0].action, InitAction::AlreadyPresent);
+
+        // A link tsift owns but that points somewhere else is repointed, not
+        // refused: this is how an older layout migrates.
+        let link = dir.path().join(".claude/skills/tsift");
+        std::fs::remove_file(&link).unwrap();
+        create_dir_symlink(Path::new("../../.agents/skills/tsift/references"), &link).unwrap();
+        std::fs::write(
+            dir.path()
+                .join(".agents/skills/tsift/references/SKILL.md"),
+            format!("{SKILL_MARKER_PREFIX}v=0.0.1 -->\nold\n{SKILL_END_MARKER}\n"),
+        )
+        .unwrap();
+        assert_eq!(args().harness_links[0].action, InitAction::Updated);
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            PathBuf::from("../../.agents/skills/tsift")
+        );
+    }
+
+    /// `off` deletes the canonical skill, so leaving the harness link behind
+    /// would hand every harness a dangling directory.
+    #[test]
+    fn off_mode_removes_the_harness_link_but_not_an_unmanaged_one() {
+        let dir = TempDir::new().unwrap();
+        init_with_harnesses(
+            dir.path(),
+            false,
+            false,
+            false,
+            InstructionMode::Shared,
+            None,
+            &[HarnessSkillTarget::Claude, HarnessSkillTarget::Codex],
+        )
+        .unwrap();
+        // A hand-maintained skill sharing the codex path must survive.
+        let codex = dir.path().join(".codex/skills/tsift");
+        std::fs::remove_file(&codex).unwrap();
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::write(codex.join("SKILL.md"), "# team codex skill\n").unwrap();
+
+        let result = init_with_harnesses(
+            dir.path(),
+            false,
+            false,
+            false,
+            InstructionMode::Off,
+            None,
+            HarnessSkillTarget::ALL,
+        )
+        .unwrap();
+
+        assert!(!dir.path().join(".claude/skills/tsift").exists());
+        assert!(
+            dir.path()
+                .join(".claude/skills/tsift")
+                .symlink_metadata()
+                .is_err(),
+            "off must not leave a dangling link"
+        );
+        assert_eq!(
+            std::fs::read_to_string(codex.join("SKILL.md")).unwrap(),
+            "# team codex skill\n"
+        );
+        assert_eq!(
+            result
+                .harness_links
+                .iter()
+                .map(|l| l.harness)
+                .collect::<Vec<_>>(),
+            vec![HarnessSkillTarget::Claude]
+        );
+    }
+
+    #[test]
+    fn no_harness_flag_writes_no_harness_directories() {
+        let dir = TempDir::new().unwrap();
+        let result = init(dir.path(), false, false).unwrap();
+        assert!(result.harness_links.is_empty());
+        for harness in HarnessSkillTarget::ALL {
+            assert!(
+                !dir.path().join(harness.skills_dir()).exists(),
+                "{} directory created without --harness",
+                harness.as_str()
+            );
+        }
     }
 
     #[test]
@@ -2587,8 +3110,7 @@ mod tests {
         .unwrap();
 
         let error = init(dir.path(), true, false)
-            .err()
-            .expect("unsafe affinity should fail")
+            .expect_err("unsafe affinity should fail")
             .to_string();
         assert!(error.contains("invalid autoindex.cpu_affinity"));
     }

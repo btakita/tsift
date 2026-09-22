@@ -1200,7 +1200,8 @@ pub fn run() -> Result<()> {
             opencode,
             workspace,
             instructions,
-        }) => cmd_init(&path, codex, opencode, workspace, instructions),
+            harness,
+        }) => cmd_init(&path, codex, opencode, workspace, instructions, &harness),
         Some(Commands::Lint {
             file,
             index,

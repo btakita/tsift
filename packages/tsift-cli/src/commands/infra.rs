@@ -17,7 +17,7 @@ use tsift_quality::lint;
 use tsift_sqlite as substrate;
 use tsift_status::status;
 
-use crate::cli::{GraphDbBackend, GraphDbQuery, InstructionModeArg};
+use crate::cli::{GraphDbBackend, GraphDbQuery, HarnessSkillArg, InstructionModeArg};
 use crate::output::{OutputFormat, ToolEnvelopeSummary};
 use crate::{
     ConvexHttpTransport, ConvexSyncOptions, EditBatch, EditResult, EditStatus,
@@ -2837,6 +2837,7 @@ pub(crate) fn cmd_init(
     opencode: bool,
     workspace: bool,
     instructions: InstructionModeArg,
+    harness: &[HarnessSkillArg],
 ) -> Result<()> {
     let resolved = if workspace {
         init::resolve_workspace_dir(path)?
@@ -2853,13 +2854,15 @@ pub(crate) fn cmd_init(
         InstructionModeArg::Shared => init::InstructionMode::Shared,
         InstructionModeArg::Off => init::InstructionMode::Off,
     };
-    let result = init::init_with_mode(
+    let harnesses = resolve_harness_skill_targets(harness);
+    let result = init::init_with_harnesses(
         &resolved,
         codex,
         codex_workspace,
         opencode,
         instruction_mode,
         None,
+        &harnesses,
     )?;
     println!("instructions: {}", result.instruction_mode.as_str());
     print_init_updates(&result);
@@ -2917,6 +2920,23 @@ pub(crate) fn cmd_init(
     Ok(())
 }
 
+/// Expand `--harness` values, with `all` meaning every supported harness.
+fn resolve_harness_skill_targets(harness: &[HarnessSkillArg]) -> Vec<init::HarnessSkillTarget> {
+    if harness.contains(&HarnessSkillArg::All) {
+        return init::HarnessSkillTarget::ALL.to_vec();
+    }
+    harness
+        .iter()
+        .filter_map(|arg| match arg {
+            HarnessSkillArg::Claude => Some(init::HarnessSkillTarget::Claude),
+            HarnessSkillArg::Codex => Some(init::HarnessSkillTarget::Codex),
+            HarnessSkillArg::Opencode => Some(init::HarnessSkillTarget::OpenCode),
+            HarnessSkillArg::Grok => Some(init::HarnessSkillTarget::Grok),
+            HarnessSkillArg::All => None,
+        })
+        .collect()
+}
+
 fn print_init_updates(result: &init::InitResult) {
     if let Some(migration) = &result.migrated_runbook {
         println!("{}: moved -> {}", migration.from, migration.to);
@@ -2933,6 +2953,15 @@ fn print_init_updates(result: &init::InitResult) {
                 init::InitAction::Removed => "legacy tsift Code Navigation section removed",
                 init::InitAction::Deferred => "no managed tsift content found",
             }
+        );
+    }
+    for link in &result.harness_links {
+        println!(
+            "{}: {} ({} skill link -> {})",
+            link.link.display(),
+            link.action,
+            link.harness.as_str(),
+            link.target.display()
         );
     }
     if result.gitignore_added {

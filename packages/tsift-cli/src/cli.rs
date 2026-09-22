@@ -13,6 +13,18 @@ pub enum InstructionModeArg {
     Off,
 }
 
+/// Harness whose own skill directory should get a link to the tsift skill, so
+/// the skill loads without an `AGENTS.md` router (`#harnessskilllink`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum HarnessSkillArg {
+    Claude,
+    Codex,
+    Opencode,
+    Grok,
+    /// Link every supported harness.
+    All,
+}
+
 #[derive(Parser)]
 #[command(
     name = "tsift",
@@ -690,6 +702,12 @@ pub enum Commands {
         /// shared installs and otherwise selects personal.
         #[arg(long, value_enum, default_value = "auto")]
         instructions: InstructionModeArg,
+        /// Also link the tsift skill into a harness-native skill directory so
+        /// the harness discovers it without an AGENTS.md router. Repeatable;
+        /// `all` links every supported harness. With `--instructions off` the
+        /// tsift-owned links are removed instead.
+        #[arg(long, value_enum, action = clap::ArgAction::Append)]
+        harness: Vec<HarnessSkillArg>,
     },
     /// Cached LLM analysis — pre-computed summaries, entities, relationships
     Summarize {
