@@ -32,6 +32,14 @@ tsift audit --json                       # structured output
 - Directory exists and is readable
 - `SKILL.md` present, non-empty, has `description` in frontmatter
 - Symlink target resolves (detects broken symlinks)
+- Declared tsift version matches the running binary (`#skillversioneval`)
+
+**Version drift check (`#skillversioneval`).** A tsift skill pinned to an older release passes every other check — it has a `SKILL.md`, it has a `description` — while the agent loads command text for a surface that has since moved. Nothing about the file's appearance reveals it, so the audit compares the version the skill *declares*:
+
+1. `<!-- tsift:skill v=<version> -->`, the ownership marker on a generated skill.
+2. `tsift-version:` in frontmatter, which both the generated skill and a hand-maintained tsift skill use to pin the surface they were written against.
+
+The marker wins when both are present. A skill declaring neither is not tsift's and is never flagged — inventing a version for an unrelated skill would manufacture drift. A mismatch adds the issue `tsift version drift: SKILL.md declares <found> but the installed tsift is <expected> — run `tsift init` to refresh it`, which moves the skill from `healthy` to `broken`. The declared value is reported as `declared_tsift_version` in JSON, present only when the skill declares one. The expected version is the running binary's own `CARGO_PKG_VERSION`, never a separately maintained constant.
 
 **Manifest comparison** (`--manifest`): cross-references installed skills against an expected list (one name per line, `#` comments allowed). Reports:
 - `missing` — listed in manifest but not installed

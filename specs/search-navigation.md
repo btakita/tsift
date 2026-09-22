@@ -341,16 +341,31 @@ On plugin load and on the `installation.updated` lifecycle hook, the plugin runs
 ```markdown
 ---
 name: tsift
-description: Use tsift for token-efficient repository navigation, code search and reading, call graphs, diffs, logs, tests, session context, and workspace memory. Use when exploring or changing a codebase with tsift installed.
+description: "Use tsift for token-efficient repository navigation... TRIGGER: ... SKIP: ... VERSION CHECK: ..."
+user-invocable: true
+argument-hint: "[query or symbol]"
+tsift-version: "0.1.100"
 ---
 <!-- tsift:skill v=0.1.100 -->
 # tsift
 
-Run `tsift status` at session start from the owning repo root.
+**Check the version first.** (compare `tsift --version` against `tsift-version`)
+
+## Command surface
+## Session start
+## (envelope preference list)
 
 Command detail lives in [`references/code-navigation.md`](references/code-navigation.md).
 <!-- /tsift:skill -->
 ```
+
+The frontmatter carries more than the minimum a skill needs (`#claudeskillmerge`):
+
+- `user-invocable: true` plus `argument-hint` make the skill reachable as `/tsift` in harnesses that support slash invocation. Harnesses that do not simply ignore the keys.
+- `TRIGGER:` / `SKIP:` in the description improve skill selection, and `VERSION CHECK:` tells a reading agent to compare before trusting copied text.
+- `tsift-version` duplicates the ownership marker's version in a field the agent actually reads, and is the field `tsift audit` compares for drift (`#skillversioneval`).
+
+The body keeps a compact command surface so a turn can see what exists without expanding the reference, but names topics rather than restating the reference's commands: the skill must stay the smaller of the two, and a template gate enforces both that ordering and the absence of any deprecated flag.
 
 ### Generated Reference
 
@@ -363,6 +378,8 @@ Command detail lives in [`references/code-navigation.md`](references/code-naviga
 Managed by `tsift init` (versioned markers) — do not hand-edit between the markers; re-run `tsift init` to refresh. Text outside the markers is preserved.
 
 ## Session start
+## Version drift
+## Command surface
 ## Search, read, and graph
 ## Bounded digests instead of raw output
 ## Harnesses without `PreToolUse` hooks

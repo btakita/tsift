@@ -32,10 +32,21 @@ fn versioned_skill_with_verification(verification: String) -> String {
     format!(
         r#"---
 name: tsift
-description: Use tsift for token-efficient repository navigation, code search and reading, call graphs, diffs, logs, tests, session context, and workspace memory. Use when exploring or changing a codebase with tsift installed.
+description: "Use tsift for token-efficient repository navigation, code search and reading, call graphs, diffs, logs, tests, session context, and workspace memory. TRIGGER: exploring or changing a codebase with tsift installed, or working on the tsift repo. SKIP: plain file-level glob, non-code web search. VERSION CHECK: compare `tsift --version` against tsift-version below before trusting any command text copied from this file."
+user-invocable: true
+argument-hint: "[query or symbol]"
+tsift-version: "{version}"
 ---
 <!-- tsift:skill v={version} -->
 # tsift
+
+**Check the version first.** Run `tsift --version` and compare it to `tsift-version` in the frontmatter above. If the binary is newer, this file is stale: treat its command text as a hint, not a contract, and read the live surface from `tsift --help` / `<subcommand> --help`. `tsift init` refreshes this file and stamps both values from the installed binary, so a mismatch means the skill was never refreshed after an upgrade. `tsift audit` reports the same drift as an issue.
+
+## Command surface
+
+`search`, `symbol-read`, `source-read`, `explain`, `graph`, `communities`, `path`, `index`, `status`, `locks` — search and navigation. `traverse`, `graph-db`, `convex-sync`, `conflict-matrix`, `dispatch-trace`, `dependency-dag` — graph substrate. `edit`, `edit-intents`, `ast-grep` — batch and semantic editing. `diff-digest`, `test-digest`, `log-digest`, `metric-digest`, `session-digest`, `session-cost`, `session-review`, `context-pack`, `digest-runner` — bounded digests and session context. `summarize`, `semantic`, `lint`, `audit`, `audit-tagpath` — cached analysis and drift checks. `route`, `rewrite`, `sql`, `memory`, `init`, `workflow` — tooling. Global flags: `--envelope`, `--compact`, `--terse`, `--ultra-terse`, `--schema`, `--tabular`, `--absolute`, `--pretty`.
+
+## Session start
 
 Run `tsift status` at session start from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. `tsift status` repairs the `.tsift/` index state it owns and never rewrites tracked files (`--no-fix` skips even that). If status reports stale or missing instructions, run `tsift init` to refresh the repository-local tsift skill and its reference; it names every tracked file it rewrites or moves. When the harness cannot perform write commands, ask the user to run the printed `run:` command instead.
 
@@ -47,6 +58,8 @@ Prefer tsift envelopes over raw reads:
 - `tsift --envelope session-review <path>` / `tsift --envelope context-pack <path>` instead of replaying long session docs or transcripts
 - raw-read rewrites route recognized session docs/transcripts to `tsift session-digest --input <path>` and captured logs to `tsift log-digest --input <path>`
 - `tsift --envelope digest-runner --kind test|log --path . --shell-command '<command>'` instead of raw test/build output
+
+**No rewrite hook? Drive the list above yourself.** Only a `PreToolUse`-equipped harness redirects `cat`/`grep`/`git diff` for you. Everywhere else nothing intercepts them, so issue these commands directly instead of waiting for a rewrite; the reference below names the one-shot equivalent and the per-harness setup, `--harness` included.
 
 Command detail lives in [`references/code-navigation.md`](references/code-navigation.md) — budgets, `tsift workflow search`, `report.scale_guard` handling, the harness rewrite path for `PreToolUse`-less harnesses, and Codex/OpenCode integration. `tsift init` writes and versions that reference alongside this skill, so it is present in every initialized checkout; read it before broad exploration instead of expanding this file.
 
@@ -79,7 +92,22 @@ This reference is the detail behind the repository-local tsift skill. `SKILL.md`
 
 Run `tsift status` from the owning repo root. If the task or file lives under a git submodule (for example `src/tsift/...`), switch to that submodule root first so the harness loads the narrower local instructions and repo state instead of the superproject root. `tsift status` repairs the `.tsift/` index state it owns and never rewrites tracked files (`--no-fix` skips even that). If status reports stale or missing instructions, run `tsift init` to refresh the repository-local tsift skill and this reference; it names every tracked file it rewrites or moves. When the harness cannot perform write commands, ask the user to run the printed `run:` command instead.
 
-Codex projects can install a prompt-time auto-reindex hook with `tsift init --codex`; OpenCode projects can install per-project tsift command shortcuts with `tsift init --opencode`.
+Codex projects can install a prompt-time auto-reindex hook with `tsift init --codex`; OpenCode projects can install per-project tsift command shortcuts with `tsift init --opencode`. `tsift init --harness <claude|codex|opencode|grok|all>` links the skill into a harness's own skill directory, so it loads without an `AGENTS.md` router — no harness scans `.agents/skills/` on its own.
+
+## Version drift
+
+`SKILL.md` and this reference are stamped from the binary that wrote them, in both the ownership marker and the skill's `tsift-version` frontmatter. Compare `tsift --version` against that stamp before trusting copied command text: a stale surface still parses, still has a description, and still reads as a healthy skill, so nothing about its appearance reveals the drift. `tsift audit` compares the two and reports a mismatch as an issue; `tsift init` refreshes both surfaces and restamps them.
+
+## Command surface
+
+- **Search and navigation** — `search`, `symbol-read`, `source-read`, `markdown-ast`, `explain`, `graph`, `communities`, `path`, `analyze`, `index`, `status`, `locks`
+- **Graph substrate** — `traverse`, `graph-db`, `convex-sync`, `conflict-matrix`, `dispatch-trace`, `dependency-dag`, `semantic`, `finding`
+- **Editing** — `edit` (atomic JSON batch), `edit-intents` (semantic AST intents with `--verify`/`--apply`), `ast-grep` (structural search and rewrite)
+- **Digests and session context** — `diff-digest`, `test-digest`, `log-digest`, `metric-digest`, `digest-runner`, `session-digest`, `session-cost`, `session-review`, `context-pack`
+- **Cached analysis and drift checks** — `summarize`, `lint`, `audit`, `audit-tagpath`, `token-savings`, `token-gate`
+- **Tooling** — `route` (task to model tier), `rewrite`, `sql`, `memory`, `local-model`, `kg`, `init`, `workflow`
+
+Global flags: `--envelope`, `--compact`, `--terse`, `--ultra-terse`, `--schema`, `--tabular`, `--absolute`, `--pretty`. Subcommand flags move between releases faster than this file does, so read `tsift <subcommand> --help` for the live contract.
 
 ## Search, read, and graph
 
@@ -1866,6 +1894,62 @@ mod tests {
             std::fs::read_to_string(dir.path().join(INSTRUCTION_MODE_RELATIVE_PATH)).unwrap(),
             "personal\n"
         );
+    }
+
+    /// `#claudeskillmerge`: the generated skill has to carry what the
+    /// hand-maintained Claude skill carried, or linking it in is a downgrade and
+    /// operators keep a divergent copy — which is how a 0.1.62 skill ended up
+    /// shadowing a 0.1.100 binary in the first place.
+    #[test]
+    fn the_generated_skill_carries_the_hand_maintained_skills_value() {
+        let dir = TempDir::new().unwrap();
+        init(dir.path(), false, false).unwrap();
+        let content = std::fs::read_to_string(dir.path().join(SKILL_RELATIVE_PATH)).unwrap();
+
+        // The version must be declared where `tsift audit` and a reading agent
+        // can both find it, not only in the ownership marker.
+        assert!(
+            content.contains(&format!("tsift-version: \"{TSIFT_VERSION}\"")),
+            "generated skill must stamp its version in frontmatter"
+        );
+        assert!(content.contains(&format!("<!-- tsift:skill v={TSIFT_VERSION} -->")));
+        assert!(
+            content.contains("`tsift --version`"),
+            "the skill must tell the agent to check the binary against it"
+        );
+
+        // `/tsift` as a slash command, which the generated skill previously lost.
+        assert!(content.contains("user-invocable: true"));
+        assert!(content.contains("argument-hint:"));
+        assert!(content.contains("TRIGGER:"));
+
+        // A command surface, so the skill is usable without expanding the
+        // reference for every question.
+        for command in ["symbol-read", "graph-db", "edit-intents", "context-pack"] {
+            assert!(
+                content.contains(command),
+                "generated skill omits `{command}` from its command surface"
+            );
+        }
+        // Harnesses with no PreToolUse rewrite must be told to drive it
+        // manually — naming the topic, not restating the reference's commands
+        // (see `init_writes_the_code_navigation_runbook_with_the_detail_the_block_defers_to`).
+        assert!(content.contains("PreToolUse"));
+        assert!(content.contains("--harness"));
+    }
+
+    /// The stale hand-written skill taught `tsift status --fix`. The generated
+    /// one must never reintroduce a deprecated flag while absorbing its content.
+    #[test]
+    fn the_enriched_skill_still_passes_the_deprecated_flag_gate() {
+        let dir = TempDir::new().unwrap();
+        init(dir.path(), false, false).unwrap();
+        for surface in [SKILL_RELATIVE_PATH, RUNBOOK_RELATIVE_PATH] {
+            let content = std::fs::read_to_string(dir.path().join(surface)).unwrap();
+            for flag in DEPRECATED_FLAG_USAGES {
+                assert!(!content.contains(flag), "{surface} teaches `{flag}`");
+            }
+        }
     }
 
     /// `#harnessskilllink`: the canonical skill lives under `.agents/skills/`,

@@ -11,10 +11,18 @@ pub struct SkillEntry {
     pub has_skill_md: bool,
     pub is_symlink: bool,
     pub description: Option<String>,
+    /// tsift version this skill declares, when it declares one at all
+    /// (`#skillversioneval`). Absent for skills unrelated to tsift.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub declared_tsift_version: Option<String>,
     pub issues: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub invocation_count: Option<u32>,
 }
+
+/// The tsift version this binary is, which every tsift-owned instruction
+/// surface is stamped from.
+pub const TSIFT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SkillUsage {
@@ -69,7 +77,36 @@ pub enum DiffKind {
     Orphan,
 }
 
+/// The tsift version a skill declares, from either surface tsift stamps
+/// (`#skillversioneval`):
+///
+/// 1. the generated ownership marker, `<!-- tsift:skill v=0.1.100 -->`
+/// 2. a `tsift-version:` frontmatter field, which a hand-maintained tsift skill
+///    uses to pin the surface it was written against
+///
+/// Returns `None` for a skill that declares neither — most skills have nothing
+/// to do with tsift, and inventing a version for them would manufacture drift.
+pub fn declared_tsift_version(content: &str) -> Option<String> {
+    const MARKER: &str = "<!-- tsift:skill v=";
+    if let Some(start) = content.find(MARKER) {
+        let rest = &content[start + MARKER.len()..];
+        if let Some(end) = rest.find(" -->") {
+            let version = rest[..end].trim();
+            if !version.is_empty() {
+                return Some(version.to_string());
+            }
+        }
+    }
+    extract_frontmatter_field(content, "tsift-version")
+}
+
 pub fn scan_skills(skills_dir: &Path) -> Result<AuditResult> {
+    scan_skills_expecting(skills_dir, TSIFT_VERSION)
+}
+
+/// `scan_skills` with an explicit expected tsift version, so the version check
+/// can be exercised without rebuilding at a different crate version.
+pub fn scan_skills_expecting(skills_dir: &Path, expected_version: &str) -> Result<AuditResult> {
     if !skills_dir.exists() {
         return Ok(AuditResult {
             skills_dir: skills_dir.to_path_buf(),
@@ -114,6 +151,7 @@ pub fn scan_skills(skills_dir: &Path) -> Result<AuditResult> {
         let has_skill_md = skill_md.exists();
         let mut issues = Vec::new();
         let mut description = None;
+        let mut declared = None;
 
         if is_symlink && !resolved.exists() {
             issues.push("broken symlink".to_string());
@@ -129,6 +167,20 @@ pub fn scan_skills(skills_dir: &Path) -> Result<AuditResult> {
                         if description.is_none() {
                             issues.push("no description in SKILL.md frontmatter".to_string());
                         }
+                        // `#skillversioneval`: a tsift skill pinned to an older
+                        // release reads as healthy on every other check — it has
+                        // a SKILL.md and a description — while the agent loads
+                        // command text for a surface that has since moved. The
+                        // version it declares is the only evidence, so compare
+                        // it rather than trusting the file's presence.
+                        declared = declared_tsift_version(&content);
+                        if let Some(found) = &declared
+                            && found != expected_version
+                        {
+                            issues.push(format!(
+                                "tsift version drift: SKILL.md declares {found} but the installed tsift is {expected_version} — run `tsift init` to refresh it"
+                            ));
+                        }
                     }
                 }
                 Err(e) => {
@@ -143,6 +195,7 @@ pub fn scan_skills(skills_dir: &Path) -> Result<AuditResult> {
             has_skill_md,
             is_symlink,
             description,
+            declared_tsift_version: declared,
             issues,
             invocation_count: None,
         });
@@ -585,6 +638,124 @@ mod tests {
         assert_eq!(result.broken, 0);
     }
 
+    /// `#skillversioneval`: the real defect this check exists for. A tsift
+    /// skill pinned to an older release passes every other health check — it
+    /// has a SKILL.md, it has a description — so the audit called a
+    /// 38-versions-stale skill healthy while the agent loaded its command text.
+    #[test]
+    fn a_stale_tsift_skill_is_not_healthy_just_because_it_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join("tsift");
+        fs::create_dir(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\ndescription: Primary source for the tsift CLI\ntsift-version: \"0.1.62\"\n---\n# tsift\nRun `tsift status --fix`.\n",
+        )
+        .unwrap();
+
+        let result = scan_skills_expecting(dir.path(), "0.1.100").unwrap();
+
+        assert_eq!(result.broken, 1, "stale skill must not count as healthy");
+        assert_eq!(result.healthy, 0);
+        assert_eq!(
+            result.skills[0].declared_tsift_version.as_deref(),
+            Some("0.1.62")
+        );
+        let issue = result.skills[0].issues.join("; ");
+        assert!(issue.contains("tsift version drift"), "{issue}");
+        assert!(issue.contains("0.1.62"), "{issue}");
+        assert!(issue.contains("0.1.100"), "{issue}");
+    }
+
+    /// The generated skill declares its version in the ownership marker rather
+    /// than in frontmatter, so both surfaces have to be read.
+    #[test]
+    fn the_generated_skill_marker_is_a_version_declaration_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join("tsift");
+        fs::create_dir(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: tsift\ndescription: Use tsift\n---\n<!-- tsift:skill v=0.1.99 -->\n# tsift\n<!-- /tsift:skill -->\n",
+        )
+        .unwrap();
+
+        let result = scan_skills_expecting(dir.path(), "0.1.100").unwrap();
+        assert_eq!(
+            result.skills[0].declared_tsift_version.as_deref(),
+            Some("0.1.99")
+        );
+        assert_eq!(result.broken, 1);
+    }
+
+    #[test]
+    fn a_current_tsift_skill_reports_its_version_and_stays_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join("tsift");
+        fs::create_dir(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: tsift\ndescription: Use tsift\n---\n<!-- tsift:skill v=0.1.100 -->\n# tsift\n<!-- /tsift:skill -->\n",
+        )
+        .unwrap();
+
+        let result = scan_skills_expecting(dir.path(), "0.1.100").unwrap();
+        assert_eq!(result.healthy, 1);
+        assert_eq!(result.broken, 0);
+        assert_eq!(
+            result.skills[0].declared_tsift_version.as_deref(),
+            Some("0.1.100")
+        );
+    }
+
+    /// Most skills have nothing to do with tsift. Treating a missing
+    /// declaration as drift would flag every unrelated skill in the directory.
+    #[test]
+    fn a_skill_that_declares_no_tsift_version_is_never_flagged_for_drift() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["corky", "email"] {
+            let skill = dir.path().join(name);
+            fs::create_dir(&skill).unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\ndescription: The {name} skill\n---\n# {name}\n"),
+            )
+            .unwrap();
+        }
+
+        let result = scan_skills_expecting(dir.path(), "0.1.100").unwrap();
+        assert_eq!(result.healthy, 2);
+        assert_eq!(result.broken, 0);
+        for skill in &result.skills {
+            assert!(skill.declared_tsift_version.is_none(), "{}", skill.name);
+        }
+    }
+
+    /// The live audit has to use the binary's own version, not a constant that
+    /// drifts on its own — otherwise the check reports staleness that isn't
+    /// there, or misses staleness that is.
+    #[test]
+    fn scan_skills_compares_against_this_binarys_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join("tsift");
+        fs::create_dir(&skill).unwrap();
+        fs::write(
+            skill.join("SKILL.md"),
+            format!(
+                "---\nname: tsift\ndescription: Use tsift\n---\n<!-- tsift:skill v={TSIFT_VERSION} -->\n# tsift\n<!-- /tsift:skill -->\n"
+            ),
+        )
+        .unwrap();
+
+        let result = scan_skills(dir.path()).unwrap();
+        assert_eq!(
+            result.broken, 0,
+            "a skill stamped from this binary must not read as drifted: {:?}",
+            result.skills[0].issues
+        );
+        assert_eq!(TSIFT_VERSION, env!("CARGO_PKG_VERSION"));
+    }
+
     #[test]
     fn scan_nonexistent_dir() {
         let result = scan_skills(Path::new("/nonexistent/skills")).unwrap();
@@ -773,6 +944,7 @@ mod tests {
             has_skill_md: true,
             is_symlink: false,
             description: Some(description.to_string()),
+            declared_tsift_version: None,
             issues: Vec::new(),
             invocation_count: None,
         }
@@ -1051,6 +1223,7 @@ mod tests {
                     has_skill_md: true,
                     is_symlink: false,
                     description: None,
+                    declared_tsift_version: None,
                     issues: vec!["broken".to_string()],
                     invocation_count: None,
                 },
@@ -1060,6 +1233,7 @@ mod tests {
                     has_skill_md: true,
                     is_symlink: false,
                     description: None,
+                    declared_tsift_version: None,
                     issues: vec!["broken".to_string()],
                     invocation_count: None,
                 },
