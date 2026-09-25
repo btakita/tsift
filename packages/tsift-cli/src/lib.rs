@@ -3959,6 +3959,8 @@ struct TraversalGraphBuild {
 
 pub(crate) const GRAPH_PROJECTION_VERSION: &str =
     concat!("tsift-traversal-v2@", env!("CARGO_PKG_VERSION"));
+const FEDERATED_GRAPH_SCOPE_LIMIT: usize = 64;
+const FEDERATED_GRAPH_SYMBOL_LIMIT: usize = 250_000;
 const GRAPH_DB_EVIDENCE_CONTRACT_VERSION: &str = "graph-db-evidence-v1";
 const WORKER_PROMPT_PACKET_CONTRACT_VERSION: &str = "worker-prompt-packet-v1";
 const CONFLICT_MATRIX_CONTRACT_VERSION: &str = "conflict-matrix-v1";
@@ -14821,10 +14823,21 @@ fn build_traversal_graph_source_with_options(
     scope: Option<&str>,
     session_only: bool,
 ) -> Result<TraversalGraphBuild> {
+    if scope.is_none() && !session_only {
+        ensure_federated_graph_work_budget(
+            indexed_workspace_scope_count(root)?.saturating_add(1),
+            0,
+        )?;
+    }
     if scope.is_none() && !session_only && should_auto_federate(root, path_hint, scope, false)? {
         let config = config::Config::load(root)?;
         let workspace_scopes = config::Config::submodule_dirs(root)?;
         if !workspace_scopes.is_empty() {
+            let federated_scopes = workspace_scopes
+                .iter()
+                .filter(|workspace_scope| config.federation_for_scope(workspace_scope))
+                .collect::<Vec<_>>();
+            ensure_federated_graph_work_is_bounded(root, &config, &federated_scopes)?;
             let mut graph = build_traversal_graph_source_with_options(
                 root,
                 path_hint,
@@ -14832,10 +14845,7 @@ fn build_traversal_graph_source_with_options(
                 session_only,
             )?;
             graph.mark_code_scope(config::WORKSPACE_ROOT_SCOPE_ID);
-            for workspace_scope in workspace_scopes {
-                if !config.federation_for_scope(&workspace_scope) {
-                    continue;
-                }
+            for workspace_scope in federated_scopes {
                 let mut scoped_graph = build_traversal_graph_source_with_options(
                     root,
                     &workspace_scope.source_root,
@@ -15128,6 +15138,115 @@ fn build_traversal_graph_source_with_options(
     );
     load_agent_doc_traversal_nodes(root, path_hint, &mut graph, &code_lookup)?;
     Ok(graph)
+}
+
+fn ensure_federated_graph_work_is_bounded(
+    root: &Path,
+    config: &config::Config,
+    federated_scopes: &[&config::WorkspaceScope],
+) -> Result<()> {
+    let projected_scope_count = federated_scopes.len().saturating_add(1);
+    ensure_federated_graph_work_budget(projected_scope_count, 0)?;
+
+    let mut projected_symbol_count = indexed_symbol_count(&root.join(".tsift/index.db"))?;
+    for workspace_scope in federated_scopes {
+        projected_symbol_count = projected_symbol_count.saturating_add(indexed_symbol_count(
+            &config.db_path_for(root, &workspace_scope.id),
+        )?);
+        if projected_symbol_count > FEDERATED_GRAPH_SYMBOL_LIMIT {
+            break;
+        }
+    }
+
+    ensure_federated_graph_work_budget(projected_scope_count, projected_symbol_count)
+}
+
+pub(crate) fn ensure_graph_refresh_work_is_bounded(
+    root: &Path,
+    path_hint: &Path,
+    scope: Option<&str>,
+) -> Result<()> {
+    if scope.is_some() {
+        return Ok(());
+    }
+    let indexed_scope_count = indexed_workspace_scope_count(root)?;
+    ensure_federated_graph_work_budget(indexed_scope_count.saturating_add(1), 0)?;
+    if !should_auto_federate(root, path_hint, scope, false)? {
+        return Ok(());
+    }
+    let config = config::Config::load(root)?;
+    let workspace_scopes = config::Config::submodule_dirs(root)?;
+    let federated_scopes = workspace_scopes
+        .iter()
+        .filter(|workspace_scope| config.federation_for_scope(workspace_scope))
+        .collect::<Vec<_>>();
+    if federated_scopes.is_empty() {
+        return Ok(());
+    }
+    ensure_federated_graph_work_is_bounded(root, &config, &federated_scopes)
+}
+
+fn indexed_workspace_scope_count(root: &Path) -> Result<usize> {
+    let indexes_dir = root.join(".tsift/indexes");
+    if !indexes_dir.is_dir() {
+        return Ok(0);
+    }
+    let mut count = 0usize;
+    for entry in fs::read_dir(&indexes_dir)
+        .with_context(|| format!("reading workspace scope indexes: {}", indexes_dir.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("reading workspace scope entry: {}", indexes_dir.display()))?;
+        if entry.path().join("index.db").is_file() {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
+fn indexed_symbol_count(db_path: &Path) -> Result<usize> {
+    if !db_path.exists() {
+        return Ok(0);
+    }
+    index::IndexDb::open_read_only(db_path)
+        .with_context(|| {
+            format!(
+                "opening index for graph refresh estimate: {}",
+                db_path.display()
+            )
+        })?
+        .symbol_count()
+        .with_context(|| {
+            format!(
+                "counting indexed symbols for graph refresh: {}",
+                db_path.display()
+            )
+        })
+}
+
+fn ensure_federated_graph_work_budget(
+    projected_scope_count: usize,
+    projected_symbol_count: usize,
+) -> Result<()> {
+    if projected_scope_count > FEDERATED_GRAPH_SCOPE_LIMIT {
+        bail!(
+            "refusing unbounded federated graph refresh: {projected_scope_count} projected scopes \
+             exceed the safety limit of {FEDERATED_GRAPH_SCOPE_LIMIT}; root graph materialization \
+             retains every federated scope in memory and can thrash under swap pressure. Refresh \
+             one scope with `tsift graph-db --scope <scope> refresh --rebuild --json`, or disable \
+             federation for scopes that should not join the root graph"
+        );
+    }
+    if projected_symbol_count > FEDERATED_GRAPH_SYMBOL_LIMIT {
+        bail!(
+            "refusing unbounded federated graph refresh: {projected_symbol_count} indexed symbols \
+             exceed the safety limit of {FEDERATED_GRAPH_SYMBOL_LIMIT}; root graph materialization \
+             retains every federated scope in memory and can thrash under swap pressure. Refresh \
+             one scope with `tsift graph-db --scope <scope> refresh --rebuild --json`, or disable \
+             federation for scopes that should not join the root graph"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -27852,6 +27971,52 @@ fn main() { api::handler(); }
             Some("beta")
         );
         assert_eq!(file_scopes.len(), 3);
+    }
+
+    #[test]
+    fn federated_graph_refresh_refuses_runaway_work_before_materialization() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut gitmodules = String::new();
+        for index in 0..FEDERATED_GRAPH_SCOPE_LIMIT {
+            let path = format!("src/scope-{index}");
+            gitmodules.push_str(&format!(
+                "[submodule \"{path}\"]\n\tpath = {path}\n\turl = https://example.invalid/{index}\n"
+            ));
+            std::fs::create_dir_all(root.join(path)).unwrap();
+        }
+        std::fs::write(root.join(".gitmodules"), gitmodules).unwrap();
+
+        let err = build_traversal_graph_source_with_options(root, root, None, false).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("65 projected scopes"), "{message}");
+        assert!(message.contains("safety limit of 64"), "{message}");
+        assert!(message.contains("--scope <scope>"), "{message}");
+        assert!(!root.join(".tsift/graph.db").exists());
+
+        assert!(
+            ensure_federated_graph_work_budget(
+                FEDERATED_GRAPH_SCOPE_LIMIT,
+                FEDERATED_GRAPH_SYMBOL_LIMIT,
+            )
+            .is_ok()
+        );
+        let err = ensure_federated_graph_work_budget(
+            FEDERATED_GRAPH_SCOPE_LIMIT,
+            FEDERATED_GRAPH_SYMBOL_LIMIT + 1,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("250001 indexed symbols"));
+
+        let indexed = tempfile::tempdir().unwrap();
+        for index in 0..FEDERATED_GRAPH_SCOPE_LIMIT {
+            let scope_dir = indexed.path().join(format!(".tsift/indexes/scope-{index}"));
+            std::fs::create_dir_all(&scope_dir).unwrap();
+            std::fs::write(scope_dir.join("index.db"), []).unwrap();
+        }
+        let err =
+            ensure_graph_refresh_work_is_bounded(indexed.path(), indexed.path(), None).unwrap_err();
+        assert!(err.to_string().contains("65 projected scopes"));
     }
 
     #[test]

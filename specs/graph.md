@@ -34,6 +34,13 @@ An explicitly scoped projection also tags `route` and semantic entity nodes with
 that scope and admits cached semantic summaries only when they resolve to a source
 node in the scoped code graph; summaries from sibling scopes cannot leak in.
 
+Before a root refresh materializes that federated graph, tsift counts the participating
+scopes and indexed symbols. It fails before loading graph rows when the projection would
+exceed 64 scopes or 250,000 symbols, because the current builder retains the complete
+federated projection in memory and can otherwise enter sustained swap thrash. The error
+routes operators to `graph-db --scope <scope> refresh`; scoped refreshes are not subject
+to the aggregate root budget.
+
 Projection freshness includes a canonical hash of the index rows that feed graph
 materialization (`file_state`, zone maps, symbols, call edges, and routes), not only
 source mtimes. Removing or adding an extracted row therefore makes `graph-db status`,

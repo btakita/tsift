@@ -33,8 +33,9 @@ use crate::{
     append_tokensave_graph_doctor_checks, apply_edit_plan_atomically, apply_rewrite_output_format,
     apply_status_fixes, apply_status_instruction_fixes, autoindex_missing_workspace_scopes,
     build_convex_sync_report_with_snapshot, build_edit_plan, classify_task, convex_graph_freshness,
-    convex_rows_from_graph_store, dedupe_preserve_order, envelope_metric, execute_query,
-    execute_rewritten_command, graph_db_backend_eval_cached_refresh, graph_db_backend_eval_dataset,
+    convex_rows_from_graph_store, dedupe_preserve_order, ensure_graph_refresh_work_is_bounded,
+    envelope_metric, execute_query, execute_rewritten_command,
+    graph_db_backend_eval_cached_refresh, graph_db_backend_eval_dataset,
     graph_db_backend_eval_full_projection_with_profile, graph_db_backend_eval_graph_rows,
     graph_db_backend_eval_metric_digest_command, graph_db_backend_eval_metrics,
     graph_db_backend_eval_performance_gate, graph_db_backend_eval_phase_timing,
@@ -270,6 +271,7 @@ pub(crate) fn cmd_graph_db_refresh(
     rebuild: bool,
     format: OutputFormat,
 ) -> Result<()> {
+    ensure_graph_refresh_work_is_bounded(root, path, scope)?;
     let source_watermark = traversal_source_watermark(root, path, scope, false)?;
     let cached_refresh = if rebuild {
         None
