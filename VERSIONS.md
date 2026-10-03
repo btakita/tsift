@@ -8,7 +8,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
-- **Index API contracts in JSON and YAML (`#sdktsiftcontracts`).** `.json`, `.yaml`, and `.yml` are now indexed. Symbols come from a contract projection rather than a tag query: a document whose root has `openapi`/`swagger`, `asyncapi`, or a JSON Schema marker (`$schema`, `$defs`, `definitions`) yields schemas, `Owner.property` properties, paths, operations named by `operationId`, channels, messages, and components. Every `$ref` with a JSON-pointer fragment becomes a call edge from its enclosing schema or operation, so `graph <Schema> --callers` lists everything that references a schema. Any other JSON/YAML file yields no symbols but is full-text searchable, and package-manager lockfiles are excluded from the walk. On haiven-contracts this turns 166 skipped `.json` files into 2,882 symbols and 1,205 `$ref` edges.
+- **Index API contracts in JSON and YAML (`#sdktsiftcontracts`).** `.json`, `.yaml`, and `.yml` are now indexed. Symbols come from a contract projection rather than a tag query: a document whose root has `openapi`/`swagger`, `asyncapi`, or a JSON Schema marker (`$schema`, `$defs`, `definitions`) yields schemas, `Owner.property` properties, paths, operations named by `operationId`, channels, messages, and components. Every `$ref` with a JSON-pointer fragment becomes a call edge from its enclosing schema or operation, so `graph <Schema> --callers` lists everything that references a schema. Any other JSON/YAML file yields no symbols but is full-text searchable, and package-manager lockfiles are excluded from the walk. On haiven-contracts this turns 166 skipped `.json` files into 3,082 symbols and 1,205 `$ref` edges.
 
 ## 0.1.102
 
