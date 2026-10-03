@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+## 0.1.102
+
 - **Promote C++ to indexed navigation support (`#cppindex`).** `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, `.inl`, and `.h` files (`.h` is parsed as C++) now provide symbols and call edges to search and graph commands. Symbols are types, enumerators, namespaces, aliases, functions, methods, and fields, including header prototypes and member declarations. A symbol's extent climbs from its name through C++'s nested declarators to the owning declaration, so call edges resolve inside out-of-line and pointer-returning definitions. Before this, an Unreal plugin's 54 headers and 12 sources were skipped entirely and could not be searched or explained.
 
 ## 0.1.101
