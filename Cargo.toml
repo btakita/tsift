@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "packages/tsift-core", "packages/tsift-sqlite", "packages/tsift-libsql", "packages/tsift-tokensave", "packages/tsift-memory", "packages/tsift-local-model", "packages/tsift-kg", "packages/tsift-memgraphrag", "packages/tsift-md-ast", "packages/tsift-graph", "packages/tsift-algorithms", "packages/tsift-astgrep", "packages/tsift-resolution", "packages/tsift-cache", "packages/tsift-quality", "packages/tsift-index", "packages/tsift-agent-doc", "packages/tsift-session", "packages/tsift-summarize", "packages/tsift-digest", "packages/tsift-search", "packages/tsift-status", "packages/tsift-surrealdb", "packages/tsift-cli", "packages/tsift-sim-world"]
+members = [".", "packages/tsift-core", "packages/tsift-sqlite", "packages/tsift-libsql", "packages/tsift-tokensave", "packages/tsift-memory", "packages/tsift-local-model", "packages/tsift-kg", "packages/tsift-memgraphrag", "packages/tsift-md-ast", "packages/tsift-tree-sitter-jai", "packages/tsift-graph", "packages/tsift-algorithms", "packages/tsift-astgrep", "packages/tsift-resolution", "packages/tsift-cache", "packages/tsift-quality", "packages/tsift-index", "packages/tsift-agent-doc", "packages/tsift-session", "packages/tsift-summarize", "packages/tsift-digest", "packages/tsift-search", "packages/tsift-status", "packages/tsift-surrealdb", "packages/tsift-cli", "packages/tsift-sim-world"]
 resolver = "3"
 
 [package]
@@ -47,7 +47,7 @@ tsift-tokensave = { path = "packages/tsift-tokensave", version = "0.1.102" }
 tsift-libsql = { path = "packages/tsift-libsql", version = "0.1.102", optional = true }
 
 [features]
-default = ["cli", "lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-csharp", "lang-c", "lang-cpp", "lang-odin", "lang-jai", "lang-gdscript", "lang-markdown", "lang-json", "lang-yaml", "lang-xsd", "lang-wsdl"]
+default = ["cli", "lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-csharp", "lang-c", "lang-cpp", "lang-odin", "lang-gdscript", "lang-markdown", "lang-json", "lang-yaml", "lang-xsd", "lang-wsdl"]
 backend-libsql = ["dep:tsift-libsql"]
 backend-surrealdb = ["cli", "tsift-cli/backend-surrealdb"]
 cli = ["dep:tsift-cli"]
@@ -63,6 +63,8 @@ lang-csharp = ["tsift-astgrep/lang-csharp", "tsift-graph/lang-csharp", "tsift-se
 lang-c = ["tsift-astgrep/lang-c", "tsift-graph/lang-c", "tsift-search/lang-c"]
 lang-cpp = ["tsift-astgrep/lang-cpp", "tsift-graph/lang-cpp", "tsift-search/lang-cpp"]
 lang-odin = ["tsift-graph/lang-odin", "tsift-search/lang-odin"]
+# Opt-in: Jai's grammar (tsift-tree-sitter-jai) is a 29 MB generated parser.c,
+# so it is left out of `default`. `all-languages` and release binaries include it.
 lang-jai = ["tsift-graph/lang-jai", "tsift-search/lang-jai"]
 lang-gdscript = ["tsift-graph/lang-gdscript", "tsift-search/lang-gdscript"]
 lang-markdown = ["tsift-astgrep/lang-markdown", "tsift-graph/lang-markdown", "tsift-search/lang-markdown"]

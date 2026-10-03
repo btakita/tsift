@@ -1,17 +1,6 @@
 use anyhow::Result;
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
-// Jai has no grammar crate on crates.io: build.rs compiles the vendored
-// constantitus/tree-sitter-jai sources (MIT-0) under `vendor/tree-sitter-jai`.
-#[cfg(feature = "lang-jai")]
-unsafe extern "C" {
-    fn tree_sitter_jai() -> *const ();
-}
-
-#[cfg(feature = "lang-jai")]
-const JAI_LANGUAGE: tree_sitter_language::LanguageFn =
-    unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_jai) };
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Symbol {
     pub name: String,
@@ -182,7 +171,7 @@ impl Lang {
             #[cfg(feature = "lang-odin")]
             Self::Odin => tree_sitter_odin::LANGUAGE.into(),
             #[cfg(feature = "lang-jai")]
-            Self::Jai => JAI_LANGUAGE.into(),
+            Self::Jai => tree_sitter_jai::LANGUAGE.into(),
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => tree_sitter_gdscript::LANGUAGE.into(),
             #[cfg(feature = "lang-markdown")]
@@ -1153,7 +1142,6 @@ mod tests {
             ("h", "cpp"),
             ("hpp", "cpp"),
             ("odin", "odin"),
-            ("jai", "jai"),
             ("gd", "gdscript"),
             ("md", "markdown"),
             ("mdx", "markdown"),
@@ -1163,6 +1151,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("no language for extension: {ext}"));
             assert_eq!(lang.name(), expected_name, "wrong language for .{ext}");
         }
+        // Jai is opt-in (`lang-jai`), so `.jai` dispatches only when it is on.
+        #[cfg(feature = "lang-jai")]
+        assert_eq!(Lang::from_extension("jai").map(|l| l.name()), Some("jai"));
+        #[cfg(not(feature = "lang-jai"))]
+        assert!(Lang::from_extension("jai").is_none());
     }
 
     #[test]

@@ -1,0 +1,37 @@
+[package]
+name = "tsift-tree-sitter-jai"
+version = "0.1.102"
+edition = "2024"
+description = "Jai grammar for tree-sitter: tsift's packaging of constantitus/tree-sitter-jai (MIT-0), which has no crate on crates.io"
+license = "MIT-0"
+repository = "https://github.com/btakita/tsift"
+homepage = "https://github.com/btakita/tsift/tree/main/packages/tsift-tree-sitter-jai"
+authors = ["constantitus <constantitus@gmail.com>", "Brian Takita <brian.takita@gmail.com>"]
+readme = "README.md"
+keywords = ["incremental", "parsing", "tree-sitter", "jai"]
+categories = ["parsing", "text-editors"]
+publish = true
+build = "bindings/rust/build.rs"
+# Only what the C build and the Rust binding need. Upstream's grammar.js,
+# grammar.json, queries and editor bindings stay upstream.
+include = [
+    "bindings/rust/*",
+    "src/parser.c",
+    "src/scanner.c",
+    "src/node-types.json",
+    "src/tree_sitter/*.h",
+    "LICENSE",
+    "README.md",
+]
+
+[lib]
+path = "bindings/rust/lib.rs"
+
+[dependencies]
+tree-sitter-language = "0.1"
+
+[build-dependencies]
+cc = "1.1"
+
+[dev-dependencies]
+tree-sitter = "0.26"

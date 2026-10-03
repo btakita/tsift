@@ -66,6 +66,7 @@ jobs:
             tsift-core \
             tsift-md-ast \
             tsift-astgrep \
+            tsift-tree-sitter-jai \
             tsift-graph \
             tsift-sqlite \
             tsift-algorithms \
@@ -128,8 +129,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Prebuilt binaries carry every language, including opt-in ones such as
+      # `lang-jai` that a default `cargo install tsift` leaves out.
       - name: Build release binary
-        run: cargo build -p tsift --release --locked --target ${{ matrix.target }}
+        run: cargo build -p tsift --release --locked --features all-languages --target ${{ matrix.target }}
 
       - name: Package Unix archive
         if: runner.os != 'Windows'
@@ -290,6 +293,7 @@ jobs:
             tsift-core \
             tsift-md-ast \
             tsift-astgrep \
+            tsift-tree-sitter-jai \
             tsift-graph \
             tsift-sqlite \
             tsift-algorithms \

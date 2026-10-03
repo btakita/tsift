@@ -37,6 +37,7 @@ tsift (root crate — public package shim: lib.rs + graph/lang/resolution/substr
 │   ├── SurrealdbGraphStore (embedded SurrealKV file-backed or in-memory)
 │   ├── writes provider-neutral ConvexProjectionRows into SurrealDB records
 │   └── implements GraphStore trait from tsift-core behind `backend-surrealdb`
+├── tsift-tree-sitter-jai crate (packages/tsift-tree-sitter-jai — packaged constantitus/tree-sitter-jai grammar, MIT-0; behind opt-in `lang-jai`)
 ├── tsift-graph crate (packages/tsift-graph — language-aware graph extraction)
 │   ├── lang module — Lang enum, Symbol, tree-sitter symbol/call queries, extract_symbols
 │   ├── graph extraction — call sites, routes, edge resolution, community detection, shortest path
@@ -232,6 +233,7 @@ all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript
 | Bash | `tree-sitter-bash` | 0.25.1 | `LANGUAGE` | `.sh`, `.bash`, `.zsh` |
 | GDScript | `tree-sitter-gdscript` | 6.1.0 | `LANGUAGE` | `.gd` |
 | Markdown | `tree-sitter-md` | 0.5.3 | `LANGUAGE` + `LANGUAGE_INLINE` | `.md`, `.mdx` |
+| Jai (opt-in `lang-jai`) | `tsift-tree-sitter-jai` (renamed `tree-sitter-jai`) | workspace crate | `LANGUAGE` | `.jai` |
 
 Markdown parsing and heading/list/code-block extraction are owned by the dependency-light `tsift-md-ast` leaf crate. The crate exposes `parse()`, `reparse_incremental()` with serializable `MdTextEdit` source-range edits, `reparse_incremental_with_input_edit()` for callers that already have a tree-sitter edit, and `markdown_symbols_from_tree()` so `tsift-graph` and external live-document consumers share tree-sitter-md behavior without depending on the graph/index stack.
 

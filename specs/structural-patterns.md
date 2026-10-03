@@ -66,7 +66,7 @@ reaches is what it can actually do:
 | Fans out to | Meaning | Languages |
 |---|---|---|
 | `tsift-astgrep` + `tsift-graph` + `tsift-search` | Indexable **and** structural. Searchable, graphable, and eligible for the symbol-resolved edit kinds | rust, python, typescript, javascript, kotlin, bash, go, csharp, c, cpp, markdown, json, yaml |
-| `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig, odin, gdscript, jai, xsd, wsdl — `ast-grep-language` ships no Zig, Odin, GDScript, Jai, or XML grammar |
+| `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig, odin, gdscript, jai (opt-in), xsd, wsdl — `ast-grep-language` ships no Zig, Odin, GDScript, Jai, or XML grammar |
 | `tsift-astgrep` only | **Structural-only**: `ast-grep search`/`rewrite` and the `structural_rewrite` edit intent work; the language is not indexed, not searchable, and not graphable | css, dart, elixir, haskell, hcl, html, java, lua, nix, php, ruby, scala, solidity, swift |
 
 Structural-only is a deliberate tier, not an oversight. A tree-sitter grammar is
@@ -138,11 +138,21 @@ so one call pattern covers bare, package-qualified, and selector calls. Like
 C++, `rename_symbol` is not promoted: Odin has no semantic-edit contract.
 
 Jai followed under `#jaiindex`, as the first grammar tsift builds itself. Jai is
-in closed beta and has no grammar crate on crates.io, so `tsift-graph` vendors
-the generated `parser.c` and external `scanner.c` from
+in closed beta and has no grammar crate on crates.io, so the workspace crate
+`tsift-tree-sitter-jai` (`packages/tsift-tree-sitter-jai/`) packages the
+generated `parser.c`, external `scanner.c`, and `node-types.json` from
 [constantitus/tree-sitter-jai](https://github.com/constantitus/tree-sitter-jai)
-(MIT-0) under `packages/tsift-graph/vendor/tree-sitter-jai/` and compiles them
-in `build.rs` only when `lang-jai` is enabled. `.jai` files contribute
+(MIT-0, commit `96440b0`) and compiles them in its own `build.rs`. It exposes
+the standard grammar-crate API (`LANGUAGE`, `NODE_TYPES`), and `tsift-graph`
+depends on it renamed as `tree-sitter-jai`, so an upstream `tree-sitter-jai`
+crate would replace it with a one-line dependency change. Under `#jaicrate`,
+`lang-jai` became **opt-in**: the generated `parser.c` is 29 MB, so it is not in
+`default` and a plain `cargo install tsift` neither downloads nor compiles it.
+`all-languages` includes it, the release workflow builds the prebuilt binaries
+with `--features all-languages`, and `make check` runs the workspace tests a
+second time with `--features all-languages` so the Jai tests stay in CI. Build
+it locally with `cargo install tsift --features lang-jai` (or
+`all-languages`). With `lang-jai` on, `.jai` files contribute
 procedure (`function`), struct, union, enum and `enum_flags` (`enum`),
 enum-member, named-import (`mod`, for `Name :: #import "Name"`), `#type` alias
 (`type_alias`), constant, variable, and struct-field symbols. Constants and

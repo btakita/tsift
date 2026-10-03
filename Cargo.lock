@@ -5658,7 +5658,6 @@ version = "0.1.102"
 dependencies = [
  "anyhow",
  "blake3",
- "cc",
  "lazily",
  "serde",
  "serde_json",
@@ -5672,7 +5671,6 @@ dependencies = [
  "tree-sitter-javascript",
  "tree-sitter-json",
  "tree-sitter-kotlin-ng",
- "tree-sitter-language",
  "tree-sitter-odin",
  "tree-sitter-python",
  "tree-sitter-rust",
@@ -5682,6 +5680,7 @@ dependencies = [
  "tree-sitter-zig",
  "tsift-core",
  "tsift-md-ast",
+ "tsift-tree-sitter-jai",
 ]
 
 [[package]]
@@ -5909,6 +5908,15 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tsift-core",
+]
+
+[[package]]
+name = "tsift-tree-sitter-jai"
+version = "0.1.102"
+dependencies = [
+ "cc",
+ "tree-sitter",
+ "tree-sitter-language",
 ]
 
 [[package]]

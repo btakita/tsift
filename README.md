@@ -24,6 +24,11 @@ the downloaded archive with the release SHA-256 file before installing `tsift`
 into `$HOME/.local/bin` by default. macOS x86_64 users should install from
 crates.io with `cargo install tsift`.
 
+Release binaries are built with every language. `cargo install tsift` builds the
+default set, which leaves out opt-in languages such as Jai (its generated
+grammar is 29 MB of C); add `--features lang-jai`, or `--features all-languages`
+to match the release binaries.
+
 ## Quick Start
 
 ```sh
