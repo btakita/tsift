@@ -367,3 +367,115 @@ fn generic_edge_file_counts_unmatched_endpoints_as_external() {
     let stderr = tsift_fails(&["graph-db", "--path", &root, "import", &edges_arg, "--json"]);
     assert!(stderr.contains("empty `kind`"), "{stderr}");
 }
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?} failed: {output:?}");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn write_lock(root: &Path, commit: &str) {
+    fs::write(
+        root.join("codegen/contracts.lock"),
+        format!("{{\n\t\"repository\": \"haiven-dev/haiven-contracts\",\n\t\"commit\": \"{commit}\"\n}}\n"),
+    )
+    .unwrap();
+}
+
+fn import_warnings(root: &str) -> (Vec<String>, Value) {
+    let imported = tsift(&[
+        "graph-db",
+        "--path",
+        root,
+        "import",
+        "codegen/trace.json",
+        "--json",
+    ]);
+    let warnings = report(&imported)["warnings"]
+        .as_array()
+        .map(|warnings| {
+            warnings
+                .iter()
+                .filter_map(|warning| warning.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    (warnings, imported)
+}
+
+#[test]
+fn haiven_trace_contracts_lock_mismatch_warns_and_match_is_silent() {
+    let project = sdk_project();
+    let root = project.path().to_string_lossy().to_string();
+    // haiven-sdk's layout: the contracts submodule beside `codegen/`.
+    let contracts = project.path().join("haiven-contracts");
+    fs::create_dir_all(&contracts).unwrap();
+    git(&contracts, &["init", "-q"]);
+    fs::write(contracts.join("README.md"), "contracts\n").unwrap();
+    git(&contracts, &["add", "."]);
+    git(&contracts, &["commit", "-q", "-m", "first"]);
+    let first = git(&contracts, &["rev-parse", "HEAD"]);
+    fs::write(contracts.join("README.md"), "contracts v2\n").unwrap();
+    git(&contracts, &["commit", "-q", "-am", "second"]);
+    let second = git(&contracts, &["rev-parse", "HEAD"]);
+
+    // The lock pins `first` but the checkout is at `second`.
+    write_lock(project.path(), &first);
+    let (warnings, imported) = import_warnings(&root);
+    let expected = format!(
+        "codegen/contracts.lock pins haiven-contracts {} but the indexed contracts checkout haiven-contracts is at {}; contract joins may land on declarations the trace was not generated from — check out {} there (or move the lock) and re-import",
+        &first[..7],
+        &second[..7],
+        &first[..7]
+    );
+    assert!(warnings.contains(&expected), "{imported}");
+    // The pin is recorded on the source's summary node.
+    assert_eq!(
+        report(&imported)["imports"][0]["projected"]["contracts_commit"],
+        first.as_str(),
+        "{imported}"
+    );
+
+    // A lock that matches the checkout imports without a contracts warning.
+    write_lock(project.path(), &second);
+    let (warnings, imported) = import_warnings(&root);
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning.contains("contracts.lock")
+                || warning.contains("haiven-contracts")),
+        "{imported}"
+    );
+    assert_eq!(
+        report(&imported)["imports"][0]["projected"]["contracts_commit"],
+        second.as_str(),
+        "{imported}"
+    );
+}
+
+#[test]
+fn haiven_trace_without_contracts_lock_still_imports() {
+    let project = sdk_project();
+    let root = project.path().to_string_lossy().to_string();
+    let (warnings, imported) = import_warnings(&root);
+    assert_eq!(report(&imported)["imports"].as_array().unwrap().len(), 1);
+    assert!(
+        warnings
+            .iter()
+            .any(|warning| warning.starts_with("no contracts.lock beside codegen/trace.json")),
+        "{imported}"
+    );
+}

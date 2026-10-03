@@ -56,6 +56,10 @@ pub(crate) struct EdgeFile {
     /// Which adapter produced the rows (`edges` for a native file).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<String>,
+    /// Source-level facts copied onto the source's `graph_import` summary node
+    /// (the haiven-trace adapter records its `contracts.lock` pin here).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, Value>,
     #[serde(default)]
     pub nodes: Vec<EdgeFileNode>,
     pub edges: Vec<EdgeFileEdge>,
@@ -245,7 +249,18 @@ pub(crate) fn parse_edge_file(
                 .filter(|path| path.is_file())
                 .and_then(|path| fs::read_to_string(path).ok())
                 .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-            lower_haiven_trace(&value, model.as_ref())?
+            let mut lowered = lower_haiven_trace(&value, model.as_ref())?;
+            if let Some(lock) = file.parent().and_then(read_contracts_lock) {
+                lowered
+                    .properties
+                    .insert("contracts_commit".to_string(), Value::from(lock.commit));
+                if let Some(repository) = lock.repository {
+                    lowered
+                        .properties
+                        .insert("contracts_repository".to_string(), Value::from(repository));
+                }
+            }
+            lowered
         }
         _ => {
             let mut parsed: EdgeFile = serde_json::from_value(value).with_context(|| {
@@ -626,6 +641,9 @@ pub(crate) fn append_edge_file_rows(
         if let Some(from) = &file.imported_from {
             summary = summary.with_property("imported_from", from.as_str());
         }
+        for (key, value) in &file.properties {
+            summary = summary.with_property(key.clone(), property_string(value));
+        }
         nodes.push(summary);
     }
     stats
@@ -803,6 +821,9 @@ pub(crate) fn cmd_graph_db_import(
     let scope_arg = crate::graph_db_scope_arg(scope);
     let root_arg = crate::shell_quote(root.to_string_lossy().as_ref());
     let mut warnings = Vec::new();
+    // A haiven-trace import's file, checked against its contracts pin once the
+    // refresh has run.
+    let mut trace_lock_check: Option<PathBuf> = None;
 
     let (operation, changed) = if options.list {
         ("list", false)
@@ -849,6 +870,9 @@ pub(crate) fn cmd_graph_db_import(
         let source = edge_file.source.clone().unwrap_or_default();
         let stored = imports_dir.join(graph_import_file_name(&source));
         write_stored_atomically(&stored, &edge_file)?;
+        if edge_file.adapter.as_deref() == Some("haiven-trace") {
+            trace_lock_check = Some(file.to_path_buf());
+        }
         ("import", true)
     };
 
@@ -867,6 +891,10 @@ pub(crate) fn cmd_graph_db_import(
     } else {
         None
     };
+
+    if let Some(trace) = &trace_lock_check {
+        warnings.extend(contracts_lock_warning(root, trace));
+    }
 
     let imports: Vec<GraphDbImportEntry> = stored_graph_import_files(&imports_dir)
         .into_iter()
@@ -984,6 +1012,165 @@ pub(crate) fn cmd_graph_db_import(
         }
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// haiven-sdk `codegen/contracts.lock` pin check
+// ---------------------------------------------------------------------------
+
+/// Repository name a contracts checkout is found by when the lock names none.
+const DEFAULT_CONTRACTS_REPOSITORY_NAME: &str = "haiven-contracts";
+
+/// haiven-sdk's `codegen/contracts.lock`: the haiven-contracts commit the
+/// trace beside it was generated from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ContractsLock {
+    pub path: PathBuf,
+    pub commit: String,
+    /// `owner/name` of the contracts repository, when the lock records one.
+    pub repository: Option<String>,
+}
+
+impl ContractsLock {
+    /// Last path segment of `repository` (`haiven-contracts`).
+    fn repository_name(&self) -> String {
+        self.repository
+            .as_deref()
+            .and_then(|repository| repository.trim_end_matches('/').rsplit('/').next())
+            .map(|name| name.trim_end_matches(".git").to_string())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| DEFAULT_CONTRACTS_REPOSITORY_NAME.to_string())
+    }
+}
+
+/// Read the `contracts.lock` in `dir` (the trace's own directory).
+pub(crate) fn read_contracts_lock(dir: &Path) -> Option<ContractsLock> {
+    let path = dir.join("contracts.lock");
+    let value: Value = serde_json::from_str(&fs::read_to_string(&path).ok()?).ok()?;
+    let commit = value.get("commit")?.as_str()?.trim().to_string();
+    if commit.is_empty() {
+        return None;
+    }
+    Some(ContractsLock {
+        path,
+        commit,
+        repository: value
+            .get("repository")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+fn git_output(dir: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// `dir` is the top of its own git work tree (not a plain directory, or an
+/// uninitialized submodule, inside some enclosing repository).
+fn is_git_toplevel(dir: &Path) -> bool {
+    let (Some(top), Ok(dir)) = (
+        git_output(dir, &["rev-parse", "--show-toplevel"]),
+        fs::canonicalize(dir),
+    ) else {
+        return false;
+    };
+    fs::canonicalize(top).is_ok_and(|top| top == dir)
+}
+
+/// Any remote URL of the repository at `dir` names `repository_name`.
+fn has_remote_named(dir: &Path, repository_name: &str) -> bool {
+    git_output(dir, &["remote", "-v"]).is_some_and(|remotes| {
+        remotes.lines().any(|line| {
+            line.split_whitespace().nth(1).is_some_and(|url| {
+                let url = url.trim_end_matches('/').trim_end_matches(".git");
+                url.rsplit(['/', ':']).next() == Some(repository_name)
+            })
+        })
+    })
+}
+
+/// The indexed contracts checkout a trace's joins land on: the trace
+/// directory's `../<repository>` sibling (haiven-sdk's submodule), otherwise
+/// an indexed repository (the root or a workspace scope) whose git remote
+/// names the contracts repository.
+pub(crate) fn find_contracts_checkout(
+    root: &Path,
+    trace_dir: &Path,
+    repository_name: &str,
+) -> Option<PathBuf> {
+    let sibling = trace_dir.join("..").join(repository_name);
+    if sibling.is_dir() && is_git_toplevel(&sibling) {
+        return Some(fs::canonicalize(&sibling).unwrap_or(sibling));
+    }
+    let mut candidates = vec![root.to_path_buf()];
+    if let Ok(scopes) = crate::config::Config::submodule_dirs(root) {
+        candidates.extend(scopes.into_iter().map(|scope| scope.source_root));
+    }
+    candidates
+        .into_iter()
+        .find(|dir| dir.is_dir() && is_git_toplevel(dir) && has_remote_named(dir, repository_name))
+}
+
+fn short_commit(commit: &str) -> &str {
+    commit.get(..7).unwrap_or(commit)
+}
+
+fn display_under_root(root: &Path, path: &Path) -> String {
+    let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    path.strip_prefix(&root)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map(|relative| relative.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string_lossy().to_string())
+}
+
+/// Compare a haiven trace's `contracts.lock` pin with the indexed contracts
+/// checkout. A mismatch means the contract joins may land on declarations the
+/// trace was not generated from; a missing lock or checkout is noted quietly.
+/// Never an error: the import has already succeeded.
+pub(crate) fn contracts_lock_warning(root: &Path, trace: &Path) -> Option<String> {
+    let trace_dir = trace.parent().filter(|dir| !dir.as_os_str().is_empty());
+    let trace_dir = trace_dir.unwrap_or(Path::new("."));
+    let Some(lock) = read_contracts_lock(trace_dir) else {
+        return Some(format!(
+            "no contracts.lock beside {}; contract joins were not checked against a contracts pin",
+            display_under_root(root, trace)
+        ));
+    };
+    let lock_display = display_under_root(root, &lock.path);
+    let lock7 = short_commit(&lock.commit);
+    let repository_name = lock.repository_name();
+    let Some(checkout) = find_contracts_checkout(root, trace_dir, &repository_name) else {
+        return Some(format!(
+            "{lock_display} pins {repository_name} {lock7} but no indexed {repository_name} checkout was found; contract joins were not checked against the pin"
+        ));
+    };
+    let checkout_display = display_under_root(root, &checkout);
+    let Some(head) = git_output(&checkout, &["rev-parse", "HEAD"]) else {
+        return Some(format!(
+            "{lock_display} pins {repository_name} {lock7} but the HEAD of {checkout_display} could not be read; contract joins were not checked against the pin"
+        ));
+    };
+    let lock_commit = lock.commit.to_ascii_lowercase();
+    if head.to_ascii_lowercase().starts_with(&lock_commit) {
+        return None;
+    }
+    Some(format!(
+        "{lock_display} pins {repository_name} {lock7} but the indexed contracts checkout {checkout_display} is at {}; contract joins may land on declarations the trace was not generated from — check out {lock7} there (or move the lock) and re-import",
+        short_commit(&head)
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,9 +1322,10 @@ fn contract_join(name: &str) -> Option<JoinSpec> {
 /// | trace section | node kind | joins to (indexed contracts) | edges |
 /// |---|---|---|---|
 /// | `contracts.<Stem>` | `contract` | JSON Schema titled `<Stem>` | `declared_in` → `sdk_declaration`, `declares_record` → `contract_record` |
-/// | `vocabularies.<Name>` | `vocabulary` | symbol `<Name>` | `declared_in` |
+/// | `vocabularies.<Name>` | `vocabulary` | JSON Schema titled `title`, else symbol `<Name>` | `declared_in` |
 /// | `rest."<METHOD> <path>"` | `rest_operation` | OpenAPI operation `<METHOD> <path>`, else `operationId` (from `model.json`) | `declared_in`, `exercised_by` |
-/// | `ws.requests.<op>` / `ws.events.<type>` | `ws_request` / `ws_event` | AsyncAPI operation `<op>` | `declared_in`, `exercised_by` |
+/// | `ws.requests.<op>` | `ws_request` | AsyncAPI operation `<op>` | `declared_in`, `exercised_by` |
+/// | `ws.events.<type>` | `ws_event` | AsyncAPI `operation`, else `message` key, else `<type>` | `declared_in`, `exercised_by` |
 /// | scenario `suite#id` | `conformance_scenario` | — | `in_suite` → `conformance_suite` |
 ///
 /// Each `sdk_declaration` joins to the indexed symbol at its `path:line`. When
@@ -1160,12 +1348,22 @@ pub(crate) fn lower_haiven_trace(trace: &Value, model: Option<&Value>) -> Result
         .into_iter()
         .flatten()
     {
+        // The contract a vocabulary is published as is titled differently
+        // from the emitted type (`ErrorCode` is `RestErrorCodeV0`); traces
+        // that predate `title` join by the name.
+        let title = entry.get("title").and_then(Value::as_str);
+        let mut properties = BTreeMap::new();
+        for key in ["title", "id"] {
+            if let Some(value) = entry.get(key).and_then(Value::as_str) {
+                properties.insert(key.to_string(), Value::from(value));
+            }
+        }
         let id = lowering.node(
             format!("vocabulary:{name}"),
             "vocabulary",
             name,
-            contract_join(name),
-            BTreeMap::new(),
+            contract_join(title.unwrap_or(name)),
+            properties,
         );
         lowering.declarations(&id, "vocabulary", name, entry.get("declared"));
     }
@@ -1257,13 +1455,34 @@ pub(crate) fn lower_haiven_trace(trace: &Value, model: Option<&Value>) -> Result
             .into_iter()
             .flatten()
         {
-            let id = lowering.node(
-                format!("{kind}:{name}"),
-                kind,
-                name,
-                contract_join(name),
-                BTreeMap::new(),
-            );
+            // An event names its AsyncAPI `send` operation when one sends it,
+            // else only its channel `message` key: joining such an event by its
+            // own name could land on a same-named client operation (event
+            // `chat.typing` vs request `chat.typing`). Traces that predate
+            // these fields join by the name.
+            let mut properties = BTreeMap::new();
+            for key in ["message", "operation"] {
+                if let Some(value) = entry.get(key).and_then(Value::as_str) {
+                    properties.insert(key.to_string(), Value::from(value));
+                }
+            }
+            let message = entry.get("message").and_then(Value::as_str);
+            let join_name = entry
+                .get("operation")
+                .and_then(Value::as_str)
+                .or(message)
+                .unwrap_or(name);
+            let join = Some(JoinSpec::Spec(JoinFields {
+                name: Some(join_name.to_string()),
+                languages: contract_languages(),
+                aliases: message
+                    .filter(|message| *message != join_name)
+                    .map(str::to_string)
+                    .into_iter()
+                    .collect(),
+                ..JoinFields::default()
+            }));
+            let id = lowering.node(format!("{kind}:{name}"), kind, name, join, properties);
             lowering.declarations(&id, "ws", name, entry.get("declared"));
             lowering.scenarios(&id, entry.get("conformance"));
         }
@@ -1282,21 +1501,21 @@ pub(crate) fn lower_haiven_trace(trace: &Value, model: Option<&Value>) -> Result
             payloads.push((contract.to_string(), format!("ws_event:{event}")));
         }
     }
-    // `ws.requests` is an object keyed by operation in model.json; an array of
-    // requests (each naming its `operation`) is accepted too.
+    // model.json keys `ws.requests` by wire `type`, which is not always the
+    // operation (`transport.ping` is keyed `ping`), so a request's own
+    // `operation` names its trace node; the key is only a fallback for a
+    // request that names none. An array of requests (each naming its
+    // `operation`) is accepted too.
     let requests: Vec<(Option<&str>, &Value)> = match model_ws.and_then(|ws| ws.get("requests")) {
         Some(Value::Object(requests)) => requests
             .iter()
-            .map(|(operation, request)| (Some(operation.as_str()), request))
+            .map(|(wire_type, request)| (Some(wire_type.as_str()), request))
             .collect(),
         Some(Value::Array(requests)) => requests.iter().map(|request| (None, request)).collect(),
         _ => Vec::new(),
     };
     for (key, request) in requests {
-        let operation = request
-            .get("operation")
-            .and_then(Value::as_str)
-            .or(key);
+        let operation = request.get("operation").and_then(Value::as_str).or(key);
         if let (Some(operation), Some(contract)) =
             (operation, request.get("payload").and_then(Value::as_str))
         {
@@ -1328,6 +1547,7 @@ pub(crate) fn lower_haiven_trace(trace: &Value, model: Option<&Value>) -> Result
         source: None,
         imported_from: None,
         adapter: Some("haiven-trace".to_string()),
+        properties: BTreeMap::new(),
         nodes: lowering.nodes.into_values().collect(),
         edges: lowering.edges,
     })
@@ -1464,14 +1684,16 @@ mod tests {
     }
 
     #[test]
-    fn model_ws_requests_keyed_by_operation_add_carried_by() {
-        // model.json keys `ws.requests` by operation; both that and an array of
-        // requests link the payload contract to the request frame (#sdktraceroot).
+    fn model_ws_requests_keyed_by_wire_type_add_carried_by() {
+        // model.json keys `ws.requests` by wire type, which is not always the
+        // operation (`transport.ping` is keyed `ping`); the request's own
+        // `operation` names the frame. Both that and an array of requests link
+        // the payload contract to the request frame (#sdktraceroot).
         let trace = serde_json::json!({
             "vocabularies": {},
-            "contracts": {"ChatSendV0": {"declared": {}}, "ChatEditV0": {"declared": {}}},
+            "contracts": {"ChatSendV0": {"declared": {}}, "ChatEditV0": {"declared": {}}, "PingV0": {"declared": {}}},
             "rest": {},
-            "ws": {"requests": {"chat.send": {"declared": {}}, "chat.edit": {"declared": {}}}, "events": {}},
+            "ws": {"requests": {"chat.send": {"declared": {}}, "chat.edit": {"declared": {}}, "transport.ping": {"declared": {}}}, "events": {}},
             "conformance": {"suites": [], "operations": 0, "exercised": 0}
         });
         let carried = |model: serde_json::Value| -> BTreeSet<(String, String)> {
@@ -1486,20 +1708,260 @@ mod tests {
         let expected: BTreeSet<(String, String)> = [
             ("contract:ChatEditV0", "ws_request:chat.edit"),
             ("contract:ChatSendV0", "ws_request:chat.send"),
+            ("contract:PingV0", "ws_request:transport.ping"),
         ]
         .into_iter()
         .map(|(from, to)| (from.to_string(), to.to_string()))
         .collect();
         let keyed = serde_json::json!({"ws": {"requests": {
             "chat.send": {"operation": "chat.send", "payload": "ChatSendV0"},
-            "chat.edit": {"payload": "ChatEditV0"}
+            "chat.edit": {"payload": "ChatEditV0"},
+            "ping": {"operation": "transport.ping", "payload": "PingV0"}
         }, "events": {}}});
         assert_eq!(carried(keyed), expected);
         let listed = serde_json::json!({"ws": {"requests": [
             {"operation": "chat.send", "payload": "ChatSendV0"},
-            {"operation": "chat.edit", "payload": "ChatEditV0"}
+            {"operation": "chat.edit", "payload": "ChatEditV0"},
+            {"operation": "transport.ping", "payload": "PingV0"}
         ], "events": {}}});
         assert_eq!(carried(listed), expected);
+    }
+
+    fn json_symbol(id: &str, name: &str, path: &str, line: i64) -> GraphNode {
+        symbol(id, name, "json", path, line)
+    }
+
+    fn joined_ids(file: &EdgeFile, nodes: &[GraphNode], local: &str) -> Vec<String> {
+        let node = file
+            .nodes
+            .iter()
+            .find(|node| node.id == local)
+            .unwrap_or_else(|| panic!("lowered node {local} missing"));
+        let fields = node.join.as_ref().expect("join").fields();
+        JoinIndex::build(nodes).resolve(nodes, &fields)
+    }
+
+    fn naming_trace() -> Value {
+        serde_json::json!({
+            "vocabularies": {
+                "ErrorCode": {
+                    "title": "RestErrorCodeV0",
+                    "id": "https://schemas.haiven.gg/rest-error-code/v0.json",
+                    "declared": {}
+                },
+                "Legacy": {"declared": {}}
+            },
+            "contracts": {},
+            "rest": {},
+            "ws": {
+                "requests": {"chat.typing": {"declared": {}}},
+                "events": {
+                    "chat.typing": {"message": "chat.typing.event", "declared": {}},
+                    "motd": {"message": "motd.event", "operation": "motd", "declared": {}},
+                    "old.event": {"declared": {}}
+                }
+            },
+            "conformance": {"suites": [], "operations": 0, "exercised": 0}
+        })
+    }
+
+    #[test]
+    fn vocabulary_joins_by_contract_title() {
+        let file = lower_haiven_trace(&naming_trace(), None).unwrap();
+        let nodes = vec![
+            json_symbol("gsym-title", "RestErrorCodeV0", "rest-error-code.json", 2),
+            json_symbol("gsym-legacy", "Legacy", "legacy.json", 2),
+        ];
+        assert_eq!(
+            joined_ids(&file, &nodes, "vocabulary:ErrorCode"),
+            vec!["gsym-title"]
+        );
+        let vocabulary = file
+            .nodes
+            .iter()
+            .find(|node| node.id == "vocabulary:ErrorCode")
+            .unwrap();
+        assert_eq!(vocabulary.properties["title"], "RestErrorCodeV0");
+        assert_eq!(
+            vocabulary.properties["id"],
+            "https://schemas.haiven.gg/rest-error-code/v0.json"
+        );
+        // A vocabulary without `title` (an older trace) still joins by name.
+        assert_eq!(
+            joined_ids(&file, &nodes, "vocabulary:Legacy"),
+            vec!["gsym-legacy"]
+        );
+    }
+
+    #[test]
+    fn event_without_operation_joins_by_message_key_not_client_operation() {
+        let file = lower_haiven_trace(&naming_trace(), None).unwrap();
+        let nodes = vec![
+            // The client's `chat.typing` request operation shares the event's name.
+            json_symbol("gsym-op-typing", "chat.typing", "asyncapi.json", 10),
+            json_symbol("gsym-msg-typing", "chat.typing.event", "asyncapi.json", 20),
+            json_symbol("gsym-op-motd", "motd", "asyncapi.json", 30),
+            json_symbol("gsym-msg-motd", "motd.event", "asyncapi.json", 40),
+            json_symbol("gsym-old", "old.event", "asyncapi.json", 50),
+        ];
+        assert_eq!(
+            joined_ids(&file, &nodes, "ws_event:chat.typing"),
+            vec!["gsym-msg-typing"],
+            "an event no operation sends joins its message key, never the client operation"
+        );
+        assert_eq!(
+            joined_ids(&file, &nodes, "ws_request:chat.typing"),
+            vec!["gsym-op-typing"]
+        );
+        assert_eq!(
+            joined_ids(&file, &nodes, "ws_event:motd"),
+            vec!["gsym-op-motd"],
+            "an event with a send operation joins the operation"
+        );
+        let typing = file
+            .nodes
+            .iter()
+            .find(|node| node.id == "ws_event:chat.typing")
+            .unwrap();
+        assert_eq!(typing.properties["message"], "chat.typing.event");
+        assert!(!typing.properties.contains_key("operation"));
+        let motd = file
+            .nodes
+            .iter()
+            .find(|node| node.id == "ws_event:motd")
+            .unwrap();
+        assert_eq!(motd.properties["message"], "motd.event");
+        assert_eq!(motd.properties["operation"], "motd");
+        // An event without `message`/`operation` (an older trace) joins by name.
+        assert_eq!(
+            joined_ids(&file, &nodes, "ws_event:old.event"),
+            vec!["gsym-old"]
+        );
+    }
+
+    #[test]
+    fn contracts_lock_commit_lands_on_the_source_summary_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let trace = dir.path().join("trace.json");
+        fs::write(&trace, naming_trace().to_string()).unwrap();
+        fs::write(
+            dir.path().join("contracts.lock"),
+            r#"{"repository": "haiven-dev/haiven-contracts", "commit": "1ce0581b18005a3c321f723fb7d828acf43f4b7a"}"#,
+        )
+        .unwrap();
+        let file = parse_edge_file(&trace, ImportFormat::Auto, Some("t"), "t").unwrap();
+        assert_eq!(
+            file.properties["contracts_commit"],
+            "1ce0581b18005a3c321f723fb7d828acf43f4b7a"
+        );
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        append_edge_file_rows(&file, &mut nodes, &mut edges);
+        let summary = nodes
+            .iter()
+            .find(|node| node.id == graph_import_source_node_id("t"))
+            .unwrap();
+        assert_eq!(
+            summary.properties["contracts_commit"],
+            "1ce0581b18005a3c321f723fb7d828acf43f4b7a"
+        );
+        assert_eq!(
+            summary.properties["contracts_repository"],
+            "haiven-dev/haiven-contracts"
+        );
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args([
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed: {output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn contracts_repo(dir: &Path) -> String {
+        fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q"]);
+        fs::write(dir.join("schema.json"), "{}\n").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-q", "-m", "init"]);
+        git(dir, &["rev-parse", "HEAD"])
+    }
+
+    #[test]
+    fn contracts_checkout_is_found_by_remote_when_not_a_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let head = contracts_repo(root);
+        git(
+            root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:haiven-dev/haiven-contracts.git",
+            ],
+        );
+        let codegen = root.join("vendor/sdk/codegen");
+        fs::create_dir_all(&codegen).unwrap();
+        let found = find_contracts_checkout(root, &codegen, "haiven-contracts").unwrap();
+        assert_eq!(found, fs::canonicalize(root).unwrap());
+        fs::write(
+            codegen.join("contracts.lock"),
+            format!(r#"{{"repository": "haiven-dev/haiven-contracts", "commit": "{head}"}}"#),
+        )
+        .unwrap();
+        assert_eq!(
+            contracts_lock_warning(root, &codegen.join("trace.json")),
+            None
+        );
+        // A repository whose remote names something else is not a checkout.
+        let other = tempfile::tempdir().unwrap();
+        contracts_repo(other.path());
+        git(
+            other.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.com/x/not-contracts",
+            ],
+        );
+        assert!(find_contracts_checkout(other.path(), other.path(), "haiven-contracts").is_none());
+    }
+
+    #[test]
+    fn contracts_lock_missing_lock_or_checkout_warns_quietly() {
+        let dir = tempfile::tempdir().unwrap();
+        let codegen = dir.path().join("codegen");
+        fs::create_dir_all(&codegen).unwrap();
+        let trace = codegen.join("trace.json");
+        let warning = contracts_lock_warning(dir.path(), &trace).unwrap();
+        assert!(
+            warning.starts_with("no contracts.lock beside codegen/trace.json"),
+            "{warning}"
+        );
+        fs::write(
+            codegen.join("contracts.lock"),
+            r#"{"commit": "1ce0581b18005a3c321f723fb7d828acf43f4b7a"}"#,
+        )
+        .unwrap();
+        let warning = contracts_lock_warning(dir.path(), &trace).unwrap();
+        assert!(
+            warning.contains("1ce0581") && warning.contains("no indexed haiven-contracts checkout"),
+            "{warning}"
+        );
     }
 
     #[test]
