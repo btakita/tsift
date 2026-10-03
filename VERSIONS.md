@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **Index API contracts in JSON and YAML (`#sdktsiftcontracts`).** `.json`, `.yaml`, and `.yml` are now indexed. Symbols come from a contract projection rather than a tag query: a document whose root has `openapi`/`swagger`, `asyncapi`, or a JSON Schema marker (`$schema`, `$defs`, `definitions`) yields schemas, `Owner.property` properties, paths, operations named by `operationId`, channels, messages, and components. Every `$ref` with a JSON-pointer fragment becomes a call edge from its enclosing schema or operation, so `graph <Schema> --callers` lists everything that references a schema. Any other JSON/YAML file yields no symbols but is full-text searchable, and package-manager lockfiles are excluded from the walk. On haiven-contracts this turns 166 skipped `.json` files into 2,882 symbols and 1,205 `$ref` edges.
+
 ## 0.1.102
 
 - **Promote C++ to indexed navigation support (`#cppindex`).** `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, `.inl`, and `.h` files (`.h` is parsed as C++) now provide symbols and call edges to search and graph commands. Symbols are types, enumerators, namespaces, aliases, functions, methods, and fields, including header prototypes and member declarations. A symbol's extent climbs from its name through C++'s nested declarators to the owning declaration, so call edges resolve inside out-of-line and pointer-returning definitions. Before this, an Unreal plugin's 54 headers and 12 sources were skipped entirely and could not be searched or explained.
