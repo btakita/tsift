@@ -29,6 +29,17 @@ default set, which leaves out opt-in languages such as Jai (its generated
 grammar is 29 MB of C); add `--features lang-jai`, or `--features all-languages`
 to match the release binaries.
 
+`.lua` is not indexed by default (ast-grep still reads it as Lua). A Roblox/Rojo
+project that keeps Luau in `.lua` files opts in with `.tsift/config.toml`:
+
+```toml
+[languages.extensions]
+lua = "luau"
+```
+
+or `[languages] detect_rojo = true`, which applies the same mapping only when
+the project root has a Rojo `default.project.json`.
+
 ## Quick Start
 
 ```sh

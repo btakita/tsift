@@ -162,6 +162,19 @@ isolated = true
 federation = false
 ```
 
+Language opt-ins (`#projectlevelopt`) are read from the `.tsift/config.toml` of
+the root being indexed (the repository root, or a submodule's own root for a
+workspace scope). The built-in extension table stays the default; a project can
+remap extensions, such as a Roblox/Rojo legacy project keeping Luau in `.lua`:
+
+```toml
+[languages.extensions]
+lua = "luau"
+
+[languages]
+detect_rojo = true   # optional; maps .lua to luau only when default.project.json exists
+```
+
 Workspace scope ids default to the submodule leaf name when it is unique. If two submodules share the same trailing directory name, tsift promotes those scopes to their full `.gitmodules` paths (for example `pkg/app/foo`, `vendor/foo`) so `--scope` / `--submodule` selectors and `.tsift/indexes/<scope>/index.db` stay collision-free. To target one duplicate scope in `.tsift/config.toml`, use the quoted full path key such as `[overrides."vendor/foo"]`.
 
 Workspace discovery does not treat a `.gitmodules` stanza as sufficient proof of a scope. A declared path is resolvable when its directory is present or the repository index owns a `160000` gitlink for it; an absent path with no gitlink is retained only as a stale-configuration diagnostic. If no declarations resolve, the repository root remains the indexing and query boundary: `index --workspace` indexes `.tsift/index.db`, and `status` recommends or reports that root index instead of an unfixable empty scoped workspace.
@@ -232,7 +245,7 @@ all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript
 | Zig | `tree-sitter-zig` | 1.1.2 | `LANGUAGE` | `.zig` |
 | Bash | `tree-sitter-bash` | 0.25.1 | `LANGUAGE` | `.sh`, `.bash`, `.zsh` |
 | GDScript | `tree-sitter-gdscript` | 6.1.0 | `LANGUAGE` | `.gd` |
-| Luau | `tree-sitter-luau` | 1.2.0 | `LANGUAGE` | `.luau` |
+| Luau | `tree-sitter-luau` | 1.2.0 | `LANGUAGE` | `.luau` (`.lua` with the project opt-in below) |
 | Markdown | `tree-sitter-md` | 0.5.3 | `LANGUAGE` + `LANGUAGE_INLINE` | `.md`, `.mdx` |
 | Jai (opt-in `lang-jai`) | `tsift-tree-sitter-jai` (renamed `tree-sitter-jai`) | workspace crate | `LANGUAGE` | `.jai` |
 

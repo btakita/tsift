@@ -200,7 +200,30 @@ Luau (Roblox's typed Lua dialect) joined the indexed-only tier under
 1.2, ABI 14). It is in `default`; its `parser.c` is 0.7 MB. Only `.luau` maps
 to it: `.lua` stays with `lang-lua`, the structural-only ast-grep Lua grammar,
 because Lua 5.2+ syntax (`goto`, bitwise operators, `<const>`) is not Luau and
-would parse with errors. The grammar exports `tree_sitter_luau`, distinct from
+would parse with errors. Roblox/Rojo legacy projects that keep Luau in `.lua`
+files opt in per project (`#projectlevelopt`) in the indexed root's
+`.tsift/config.toml`:
+
+```toml
+[languages.extensions]
+lua = "luau"        # index .lua as Luau
+
+[languages]
+detect_rojo = true  # optional: same, only when default.project.json exists
+```
+
+`[languages.extensions]` maps any extension (leading dot optional) to an
+indexer language name and fails the index with the known names when the target
+is not one this build indexes; generated lockfiles stay excluded whatever the
+mapping says. `detect_rojo` is off by default and secondary: an explicit
+`lua` mapping wins over it. Without either, `.lua` is not indexed and
+`ast-grep` still reads it as Lua. Flipping the opt-in re-extracts or drops the
+affected files on the next index even though their mtimes did not move, because
+the stored file language no longer matches. The opt-in governs the index walk
+only; `ast-grep` structural matching keeps reading `.lua` as Lua. The pinned
+grammar (1.2.0, the latest on crates.io) has no `declare` or `type function`
+rule (`type` parses only `[export] type Name = T` and `typeof(...)`), so those
+Luau forms produce no symbols. The grammar exports `tree_sitter_luau`, distinct from
 ast-grep's `tree_sitter_lua`, so both link into one binary. `.luau` files
 contribute `function` symbols for `function f`, `local function f`,
 `function M.f`, and a `function` literal bound by `local f =`, `M.f =`, or a

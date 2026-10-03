@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tsift_graph::lang::Lang;
 
+use crate::config::LanguageMap;
+
 #[derive(Debug, Clone)]
 pub struct FileEntry {
     pub path: PathBuf,
@@ -85,6 +87,7 @@ pub fn walk_files_with_skips_excluding(
 ) -> Result<(Vec<FileEntry>, SkipStats)> {
     let mut entries = Vec::new();
     let mut skips = SkipStats::default();
+    let languages = LanguageMap::for_root(root)?;
     let walker = build_walker(root, excluded_roots);
     for result in walker {
         let dir_entry = result.with_context(|| format!("walking {}", root.display()))?;
@@ -93,7 +96,7 @@ pub fn walk_files_with_skips_excluding(
         }
         let path = dir_entry.path();
         let ext = path.extension().and_then(|e| e.to_str());
-        let lang = match Lang::from_path(path) {
+        let lang = match languages.resolve(path) {
             Some(l) => l,
             None => {
                 skips.record(ext);
@@ -134,6 +137,7 @@ pub fn walk_files_pruned_excluding(
     let dirs_pruned = 0usize;
     let mut dirs_walked = 0usize;
     let files_pruned = 0usize;
+    let languages = LanguageMap::for_root(root)?;
 
     let walker = build_walker(root, excluded_roots);
 
@@ -158,7 +162,7 @@ pub fn walk_files_pruned_excluding(
         }
 
         let ext = path.extension().and_then(|e| e.to_str());
-        let lang = match Lang::from_path(path) {
+        let lang = match languages.resolve(path) {
             Some(l) => l,
             None => {
                 skips.record(ext);

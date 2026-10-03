@@ -117,7 +117,9 @@ impl Lang {
             "jai" => Some(Self::Jai),
             // Only `.luau`: plain `.lua` (5.2+ goto, bitwise operators,
             // `<const>` attributes) is not Luau, and stays structural-only
-            // under ast-grep's Lua grammar.
+            // under ast-grep's Lua grammar. A Roblox/Rojo project that keeps
+            // Luau in `.lua` opts in through `.tsift/config.toml`
+            // `[languages.extensions] lua = "luau"` (tsift-index `LanguageMap`).
             #[cfg(feature = "lang-luau")]
             "luau" => Some(Self::Luau),
             #[cfg(feature = "lang-gdscript")]
@@ -140,11 +142,18 @@ impl Lang {
     /// that generated lockfiles resolve to nothing: they are JSON/YAML by
     /// extension, routinely megabytes, and never navigated by hand.
     pub fn from_path(path: &std::path::Path) -> Option<Self> {
-        let name = path.file_name()?.to_str()?;
-        if GENERATED_LOCKFILES.contains(&name) {
+        if Self::is_generated_lockfile(path) {
             return None;
         }
         Self::from_extension(path.extension()?.to_str()?)
+    }
+
+    /// Whether a path is a generated package-manager lockfile, which no
+    /// language claims even when a project remaps its extension.
+    pub fn is_generated_lockfile(path: &std::path::Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| GENERATED_LOCKFILES.contains(&name))
     }
 
     pub fn tree_sitter_language(&self) -> Language {
@@ -830,10 +839,8 @@ impl Lang {
                         }
                         // An enum member or bit_field field is one name inside
                         // its type's braces; its extent is the name, not the type.
-                        if matches!(
-                            node.kind(),
-                            "enum_declaration" | "bit_field_declaration"
-                        ) && matches!(kind_str, "enum_member" | "field")
+                        if matches!(node.kind(), "enum_declaration" | "bit_field_declaration")
+                            && matches!(kind_str, "enum_member" | "field")
                         {
                             node = capture.node;
                         }
@@ -1396,7 +1403,10 @@ mod tests {
         #[cfg(feature = "lang-json")]
         {
             use std::path::Path;
-            assert_eq!(Lang::from_path(Path::new("a/schema.json")), Some(Lang::Json));
+            assert_eq!(
+                Lang::from_path(Path::new("a/schema.json")),
+                Some(Lang::Json)
+            );
             assert_eq!(Lang::from_path(Path::new("a/package-lock.json")), None);
             assert_eq!(Lang::from_path(Path::new("Makefile")), None);
         }
@@ -1796,10 +1806,7 @@ func main() {
             pairs.contains(&"main -> helper".to_string()),
             "expected a main -> helper call edge, got {pairs:?}"
         );
-        let callees: Vec<&str> = call_sites
-            .iter()
-            .map(|site| site.callee.as_str())
-            .collect();
+        let callees: Vec<&str> = call_sites.iter().map(|site| site.callee.as_str()).collect();
         assert!(
             callees.contains(&"Println"),
             "selector calls resolve to the field name, got {callees:?}"
@@ -1828,10 +1835,20 @@ public struct Clipboard {
         let symbols = Lang::CSharp.extract_symbols(source).unwrap();
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         for expected in [
-            "IOpener", "Handle", "Changed", "State", "Ready", "Clipboard", "Text",
-            "Set", "Reset",
+            "IOpener",
+            "Handle",
+            "Changed",
+            "State",
+            "Ready",
+            "Clipboard",
+            "Text",
+            "Set",
+            "Reset",
         ] {
-            assert!(names.contains(&expected), "missing {expected}, got {names:?}");
+            assert!(
+                names.contains(&expected),
+                "missing {expected}, got {names:?}"
+            );
         }
         let kind_of = |name: &str| {
             symbols
@@ -1939,11 +1956,29 @@ char *ring_name(struct ring *r)
         let symbols = Lang::C.extract_symbols(source).unwrap();
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         for expected in [
-            "RING_CAP", "RING_NEXT", "ring_count", "ring_ptr", "ring_cb", "ring_state",
-            "RING_EMPTY", "ring_word", "ring", "buf", "head", "name", "on_push", "ring_total",
-            "ring_label", "ring_slots", "ring_push", "ring_name",
+            "RING_CAP",
+            "RING_NEXT",
+            "ring_count",
+            "ring_ptr",
+            "ring_cb",
+            "ring_state",
+            "RING_EMPTY",
+            "ring_word",
+            "ring",
+            "buf",
+            "head",
+            "name",
+            "on_push",
+            "ring_total",
+            "ring_label",
+            "ring_slots",
+            "ring_push",
+            "ring_name",
         ] {
-            assert!(names.contains(&expected), "missing {expected}, got {names:?}");
+            assert!(
+                names.contains(&expected),
+                "missing {expected}, got {names:?}"
+            );
         }
         for absent in ["ring_fwd", "RING_H", "local"] {
             assert!(
@@ -2047,10 +2082,23 @@ int Haiven::Rest::FClient::Connect(const std::string& Url) { return 0; }
         let symbols = Lang::Cpp.extract_symbols(source).unwrap();
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         for expected in [
-            "Rest", "ChannelId", "Count", "EState", "Ready", "FRequest", "Path", "Send",
-            "FClient", "Connect", "GetChannel", "Build",
+            "Rest",
+            "ChannelId",
+            "Count",
+            "EState",
+            "Ready",
+            "FRequest",
+            "Path",
+            "Send",
+            "FClient",
+            "Connect",
+            "GetChannel",
+            "Build",
         ] {
-            assert!(names.contains(&expected), "missing {expected}, got {names:?}");
+            assert!(
+                names.contains(&expected),
+                "missing {expected}, got {names:?}"
+            );
         }
         assert!(
             !names.contains(&"FForward"),
@@ -2212,14 +2260,28 @@ main :: proc() {
         // `Red` is declared once; `Green = Red` is a use, not a second member.
         assert_eq!(kind_of("Red"), "enum_member");
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
-        for absent in ["demo", "fmt", "private", "string", "u8", "local", "SCRATCH", "a", "b"] {
-            assert!(!names.contains(&absent), "{absent} is not a declaration: {names:?}");
+        for absent in [
+            "demo", "fmt", "private", "string", "u8", "local", "SCRATCH", "a", "b",
+        ] {
+            assert!(
+                !names.contains(&absent),
+                "{absent} is not a declaration: {names:?}"
+            );
         }
         let main = symbols.iter().find(|s| s.name == "main").unwrap();
-        assert!(main.end_line > main.line, "a procedure spans its body: {main:?}");
-        assert!(main.body_start_byte.is_some(), "a procedure has a body span: {main:?}");
+        assert!(
+            main.end_line > main.line,
+            "a procedure spans its body: {main:?}"
+        );
+        assert!(
+            main.body_start_byte.is_some(),
+            "a procedure has a body span: {main:?}"
+        );
         let green = symbols.iter().find(|s| s.name == "Green").unwrap();
-        assert_eq!(green.node_kind, "identifier", "a member's extent is its name");
+        assert_eq!(
+            green.node_kind, "identifier",
+            "a member's extent is its name"
+        );
     }
 
     #[cfg(feature = "lang-odin")]
@@ -2298,11 +2360,31 @@ length :: (v: Vector2) -> float {
         let symbols = Lang::Jai.extract_symbols(source).unwrap();
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         for expected in [
-            "Math", "MAX_COUNT", "Handle", "lo", "hi", "Callback", "counter", "Vector2", "x",
-            "y", "ORIGIN", "Shape", "radius", "side", "Color", "RED", "GREEN", "Flags",
-            "VISIBLE", "length",
+            "Math",
+            "MAX_COUNT",
+            "Handle",
+            "lo",
+            "hi",
+            "Callback",
+            "counter",
+            "Vector2",
+            "x",
+            "y",
+            "ORIGIN",
+            "Shape",
+            "radius",
+            "side",
+            "Color",
+            "RED",
+            "GREEN",
+            "Flags",
+            "VISIBLE",
+            "length",
         ] {
-            assert!(names.contains(&expected), "missing {expected}, got {names:?}");
+            assert!(
+                names.contains(&expected),
+                "missing {expected}, got {names:?}"
+            );
         }
         for value in ["u32", "local_total", "LOCAL_LIMIT", "Basic"] {
             assert!(

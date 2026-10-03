@@ -13,7 +13,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tagpath::{family as tagpath_family, query as tagpath_query};
 use tsift_graph as graph;
-use tsift_graph::lang::Lang;
 pub use tsift_sqlite::{ReadOnlyRecovery, copy_read_only_snapshot, read_only_snapshot_recovery};
 
 pub struct IndexDb {
@@ -498,9 +497,7 @@ fn hash_projection_query(
         for column in 0..column_count {
             match row.get_ref(column)? {
                 ValueRef::Null => update_field(hasher, b'N', &[]),
-                ValueRef::Integer(value) => {
-                    update_field(hasher, b'I', &value.to_le_bytes())
-                }
+                ValueRef::Integer(value) => update_field(hasher, b'I', &value.to_le_bytes()),
                 ValueRef::Real(value) => update_field(hasher, b'F', &value.to_bits().to_le_bytes()),
                 ValueRef::Text(value) => update_field(hasher, b'S', value),
                 ValueRef::Blob(value) => update_field(hasher, b'B', value),
@@ -884,9 +881,11 @@ impl IndexDb {
 
         for entry in entries {
             match stored.get(&entry.path) {
-                Some((secs, nanos, _lang)) => {
+                Some((secs, nanos, lang)) => {
                     let stored_mtime = pair_to_system_time(*secs, *nanos);
-                    if entry.mtime != stored_mtime {
+                    // A language change with an unchanged mtime (a project's
+                    // `[languages]` opt-in flipped) still needs a re-extract.
+                    if entry.mtime != stored_mtime || lang != entry.lang.name() {
                         changes.push(FileChange {
                             path: entry.path.clone(),
                             kind: ChangeKind::Modified,
@@ -1033,6 +1032,7 @@ impl IndexDb {
         excluded_roots: &[PathBuf],
     ) -> Result<IndexSummary> {
         crate::roots::ensure_indexable_root(root)?;
+        let languages = crate::config::LanguageMap::for_root(root)?;
         let stored = self.load_stored_files()?;
 
         let (entries, pruned_dirs, dir_mtimes, prune_stats, skipped) = if prune {
@@ -1136,7 +1136,7 @@ impl IndexDb {
                         delete_fts.execute(rusqlite::params![&path_str])?;
                         delete_edges.execute(rusqlite::params![&path_str])?;
                         delete_routes.execute(rusqlite::params![&path_str])?;
-                        let lang = Lang::from_path(&change.path);
+                        let lang = languages.resolve(&change.path);
                         if let Some(lang) = lang {
                             let lang_name = lang.name();
                             let source = warning_on_error(
@@ -2159,10 +2159,40 @@ const PARTIAL_TAG_SCORE_BETA: f64 = 0.5;
 /// routinely appear as meaningful name parts (`new`, `type`, `string`, `map`)
 /// stay out, because dropping them would lose real hits.
 const LANGUAGE_KEYWORD_TAGS: &[&str] = &[
-    "async", "await", "case", "catch", "class", "def", "elif", "else", "endif", "enum", "export",
-    "extends", "finally", "fn", "func", "function", "impl", "implements", "import", "interface",
-    "lambda", "namespace", "package", "private", "protected", "public", "return", "struct",
-    "switch", "throw", "trait", "typedef", "while", "yield",
+    "async",
+    "await",
+    "case",
+    "catch",
+    "class",
+    "def",
+    "elif",
+    "else",
+    "endif",
+    "enum",
+    "export",
+    "extends",
+    "finally",
+    "fn",
+    "func",
+    "function",
+    "impl",
+    "implements",
+    "import",
+    "interface",
+    "lambda",
+    "namespace",
+    "package",
+    "private",
+    "protected",
+    "public",
+    "return",
+    "struct",
+    "switch",
+    "throw",
+    "trait",
+    "typedef",
+    "while",
+    "yield",
 ];
 
 fn is_language_keyword_tag(tag: &str) -> bool {
@@ -3276,6 +3306,55 @@ def list_items():
         let summary = db.apply_changes(dir.path()).unwrap();
         assert_eq!(summary.new, 1);
         assert_eq!(db.file_count().unwrap(), 4);
+    }
+
+    /// `#projectlevelopt`: a Roblox/Rojo legacy project keeps Luau in `.lua`.
+    /// By default `.lua` is not an indexer language (it stays with ast-grep's
+    /// structural-only Lua grammar); the project's `[languages.extensions]`
+    /// opt-in indexes it as Luau, and flipping the opt-in back re-reads it
+    /// even though the file's mtime never moved.
+    #[test]
+    fn lua_files_index_as_luau_only_with_the_project_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("Signal.lua"),
+            "export type Handler = (number) -> ()\nlocal function connect(handler: Handler)\nend\n",
+        )
+        .unwrap();
+        let db = db_in(root);
+
+        db.apply_changes(root).unwrap();
+        assert_eq!(db.file_count().unwrap(), 0, "default: .lua is not Luau");
+        let path = root.join("Signal.lua");
+        let path = path.to_string_lossy();
+        assert!(db.symbols_for_file(&path).unwrap().is_empty());
+
+        fs::write(
+            root.join(".tsift/config.toml"),
+            "[languages.extensions]\nlua = \"luau\"\n",
+        )
+        .unwrap();
+        let summary = db.apply_changes(root).unwrap();
+        assert_eq!(summary.new, 1);
+        let symbols = db.symbols_for_file(&path).unwrap();
+        let names = symbols
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), symbol.kind.as_str()))
+            .collect::<Vec<_>>();
+        assert!(names.contains(&("connect", "function")), "{names:?}");
+        assert!(names.contains(&("Handler", "type_alias")), "{names:?}");
+        assert!(symbols.iter().all(|symbol| symbol.language == "luau"));
+
+        // Re-running with the opt-in in place is a no-op.
+        let summary = db.apply_changes(root).unwrap();
+        assert_eq!(summary.unchanged, 1);
+
+        fs::remove_file(root.join(".tsift/config.toml")).unwrap();
+        let summary = db.apply_changes(root).unwrap();
+        assert_eq!(summary.deleted, 1);
+        assert_eq!(db.file_count().unwrap(), 0);
+        assert!(db.symbols_for_file(&path).unwrap().is_empty());
     }
 
     /// The ambient-root guard is a backstop at the index *build* boundary, not

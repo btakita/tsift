@@ -1,8 +1,9 @@
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tsift_graph::lang::Lang;
 
 /// Synthetic scope id for files owned by a workspace root rather than one of
 /// its configured submodule scopes.
@@ -27,6 +28,105 @@ pub struct Config {
     pub autoindex: AutoindexConfig,
     #[serde(default)]
     pub findings: FindingsConfig,
+    #[serde(default)]
+    pub languages: LanguagesConfig,
+}
+
+/// Project-level language opt-ins (`#projectlevelopt`).
+///
+/// The built-in extension table stays the default. A project can remap an
+/// extension to another indexer language, which is how a Roblox/Rojo legacy
+/// project that keeps Luau in `.lua` files gets them indexed as Luau:
+///
+/// ```toml
+/// [languages.extensions]
+/// lua = "luau"
+/// ```
+///
+/// `detect_rojo = true` is a secondary, opt-in shortcut: when the indexed root
+/// holds a Rojo `default.project.json`, `.lua` is read as Luau unless
+/// `[languages.extensions]` maps `lua` explicitly.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LanguagesConfig {
+    /// Extension (without the leading dot) to indexer language name, such as
+    /// `lua = "luau"`.
+    #[serde(default)]
+    pub extensions: BTreeMap<String, String>,
+    #[serde(default)]
+    pub detect_rojo: bool,
+}
+
+/// The Rojo project file whose presence `detect_rojo` keys on.
+pub const ROJO_PROJECT_FILE: &str = "default.project.json";
+
+/// Resolves a file's indexer language: the built-in [`Lang::from_path`]
+/// table, with a project's `[languages]` extension overrides applied first.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LanguageMap {
+    overrides: HashMap<String, Lang>,
+}
+
+impl LanguageMap {
+    /// The built-in table, with no project overrides.
+    pub fn builtin() -> Self {
+        Self::default()
+    }
+
+    /// Load the overrides a project root declares in `.tsift/config.toml`.
+    pub fn for_root(root: &Path) -> Result<Self> {
+        let config = Config::load(root)?;
+        Self::from_config(&config.languages, root)
+    }
+
+    pub fn from_config(languages: &LanguagesConfig, root: &Path) -> Result<Self> {
+        let mut overrides = HashMap::new();
+        if languages.detect_rojo
+            && root.join(ROJO_PROJECT_FILE).is_file()
+            && let Some(luau) = lang_by_name("luau")
+        {
+            overrides.insert("lua".to_string(), luau);
+        }
+        for (extension, name) in &languages.extensions {
+            let extension = extension.trim_start_matches('.');
+            if extension.is_empty() {
+                bail!("[languages.extensions] has an empty extension key");
+            }
+            let Some(lang) = lang_by_name(name) else {
+                let known = Lang::all()
+                    .iter()
+                    .map(|lang| lang.name())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "[languages.extensions] maps `.{extension}` to `{name}`, which this tsift build does not index. Known languages: {known}"
+                );
+            };
+            overrides.insert(extension.to_string(), lang);
+        }
+        Ok(Self { overrides })
+    }
+
+    pub fn is_builtin(&self) -> bool {
+        self.overrides.is_empty()
+    }
+
+    /// The language a path is indexed as, or `None` when no language claims
+    /// it. Generated lockfiles stay excluded whatever the overrides say.
+    pub fn resolve(&self, path: &Path) -> Option<Lang> {
+        if !self.overrides.is_empty()
+            && let Some(lang) = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .and_then(|ext| self.overrides.get(ext))
+        {
+            return (!Lang::is_generated_lockfile(path)).then_some(*lang);
+        }
+        Lang::from_path(path)
+    }
+}
+
+fn lang_by_name(name: &str) -> Option<Lang> {
+    Lang::all().into_iter().find(|lang| lang.name() == name)
 }
 
 /// Prompt-hook indexing policy.
@@ -366,13 +466,7 @@ fn collect_workspace_paths(
         if nested_root.is_dir() || gitlinks.contains(&local_path) {
             paths.push(relative_path);
             if nested_root.is_dir() {
-                collect_workspace_paths(
-                    root,
-                    &relative,
-                    paths,
-                    unresolved_paths,
-                    seen_paths,
-                )?;
+                collect_workspace_paths(root, &relative, paths, unresolved_paths, seen_paths)?;
             }
         } else {
             unresolved_paths.push(relative_path);
@@ -757,8 +851,88 @@ url = https://example.com/deploy
                 .iter()
                 .map(|scope| (scope.id.as_str(), scope.relative_path.as_str()))
                 .collect::<Vec<_>>(),
-            vec![("parent", "src/parent"), ("nested", "src/parent/vendor/nested")]
+            vec![
+                ("parent", "src/parent"),
+                ("nested", "src/parent/vendor/nested")
+            ]
         );
         assert!(discovery.unresolvable.is_empty());
+    }
+
+    fn language_map(dir: &Path, toml: &str) -> Result<LanguageMap> {
+        std::fs::create_dir_all(dir.join(".tsift")).unwrap();
+        std::fs::write(dir.join(".tsift/config.toml"), toml).unwrap();
+        LanguageMap::for_root(dir)
+    }
+
+    fn resolved(map: &LanguageMap, path: &str) -> Option<&'static str> {
+        map.resolve(Path::new(path)).map(|lang| lang.name())
+    }
+
+    #[test]
+    fn language_map_defaults_to_the_builtin_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let map = LanguageMap::for_root(dir.path()).unwrap();
+        assert!(map.is_builtin());
+        assert_eq!(resolved(&map, "src/init.lua"), None);
+        assert_eq!(resolved(&map, "src/init.luau"), Some("luau"));
+        assert_eq!(resolved(&map, "src/main.rs"), Some("rust"));
+    }
+
+    #[test]
+    fn language_map_maps_lua_to_luau_on_opt_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let map = language_map(dir.path(), "[languages.extensions]\nlua = \"luau\"\n").unwrap();
+        assert_eq!(resolved(&map, "src/init.lua"), Some("luau"));
+        assert_eq!(resolved(&map, "src/init.luau"), Some("luau"));
+        assert_eq!(resolved(&map, "src/main.rs"), Some("rust"));
+
+        // A leading dot on the key is accepted.
+        let map =
+            language_map(dir.path(), "[languages.extensions]\n\".lua\" = \"luau\"\n").unwrap();
+        assert_eq!(resolved(&map, "src/init.lua"), Some("luau"));
+    }
+
+    #[test]
+    fn language_map_rejects_an_unknown_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = language_map(dir.path(), "[languages.extensions]\nlua = \"lua\"\n").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("`.lua` to `lua`"), "{message}");
+        assert!(message.contains("luau"), "{message}");
+    }
+
+    #[test]
+    fn language_map_keeps_generated_lockfiles_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        let map = language_map(dir.path(), "[languages.extensions]\njson = \"yaml\"\n").unwrap();
+        assert_eq!(resolved(&map, "a/package-lock.json"), None);
+        assert_eq!(resolved(&map, "a/schema.json"), Some("yaml"));
+    }
+
+    #[test]
+    fn rojo_detection_is_opt_in_and_secondary_to_explicit_mapping() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(ROJO_PROJECT_FILE), "{}").unwrap();
+
+        // A Rojo project file alone changes nothing.
+        let map = LanguageMap::for_root(dir.path()).unwrap();
+        assert_eq!(resolved(&map, "src/init.lua"), None);
+
+        let map = language_map(dir.path(), "[languages]\ndetect_rojo = true\n").unwrap();
+        assert_eq!(resolved(&map, "src/init.lua"), Some("luau"));
+
+        // An explicit mapping wins over detection.
+        let map = language_map(
+            dir.path(),
+            "[languages]\ndetect_rojo = true\n[languages.extensions]\nlua = \"bash\"\n",
+        )
+        .unwrap();
+        assert_eq!(resolved(&map, "src/init.lua"), Some("bash"));
+
+        // Detection without the Rojo file does nothing.
+        std::fs::remove_file(dir.path().join(ROJO_PROJECT_FILE)).unwrap();
+        let map = language_map(dir.path(), "[languages]\ndetect_rojo = true\n").unwrap();
+        assert_eq!(resolved(&map, "src/init.lua"), None);
     }
 }
