@@ -2495,6 +2495,27 @@ pub(crate) fn cmd_graph_db(
         GraphDbQuery::SnapshotImport { artifact, replace } => {
             return cmd_graph_db_snapshot_import(&root, scope, artifact, *replace, format);
         }
+        GraphDbQuery::Import {
+            file,
+            source,
+            format: import_format,
+            remove,
+            list,
+        } => {
+            return crate::graph_import::cmd_graph_db_import(
+                crate::graph_import::GraphDbImportOptions {
+                    root: &root,
+                    path,
+                    scope,
+                    file: file.as_deref(),
+                    source: source.as_deref(),
+                    format: (*import_format).into(),
+                    remove: *remove,
+                    list: *list,
+                },
+                format,
+            );
+        }
         GraphDbQuery::BackendEval {
             candidates,
             targets,

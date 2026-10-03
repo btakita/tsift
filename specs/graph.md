@@ -139,6 +139,47 @@ Source-watermark drift recommends incremental `refresh --json` in status, doctor
 and read diagnostics. Projection-version mismatch and invalid projection metadata
 continue to require `refresh --rebuild --json`.
 
+### External Edge Import (`graph-db import`)
+
+`tsift graph-db [--path P] [--scope S] import <FILE> [--source ID] [--format auto|edges|haiven-trace]` loads nodes and edges produced outside tsift (a code generator's trace, a dependency manifest, a hand-written map) into the same `graph.db` the indexer projects (`#sdktsiftedges`). `import --list` reports the stored imports; `import --remove --source ID` (or `--remove FILE`) drops one. A relative `FILE` resolves against the cwd, falling back to `--path`.
+
+**File format (`tsift-graph-edges/v1`, JSON).**
+
+```json
+{
+  "format": "tsift-graph-edges/v1",
+  "source": "deps",
+  "nodes": [
+    {"id": "svc", "kind": "service", "label": "chat-service",
+     "join": {"name": "ChatService", "languages": ["rust"]},
+     "properties": {"owner": "chat"}}
+  ],
+  "edges": [
+    {"from": "svc", "to": "ChatMessageV0", "kind": "consumes", "properties": {"weight": 2}}
+  ]
+}
+```
+
+- `format` is optional; any other value is rejected. `source` is the import's stable id (precedence: `--source`, the file's `source`, the file's root-relative path). `nodes` is optional; `edges` is required. Ids, `from`, `to`, and `kind` must be non-empty and node ids unique, or the import fails before anything is written. Property values may be any JSON; non-strings are stored as their JSON text.
+- `join` names a node's indexed counterpart: a bare string or `{name}` matches `symbol` nodes by name (exact label, which includes qualified `Owner.member` names); `languages` narrows to symbols of those index languages; `path` narrows to one root-relative file; `path` + `line` (1-based) matches the symbol declared at that site; `path` alone matches the `file` node.
+- **Endpoint resolution.** A declared node whose join matches is *replaced by* the indexed node(s) — imported edges hang directly off the indexed symbol, so any traversal that starts from indexed code walks into them. A join that matches more than one node links all of them (counted `ambiguous_joins`); more than 8 matches is not a join. A declared node whose join matches nothing is kept as an imported node of its own kind (`unmatched_joins`). An edge endpoint that is not a declared node id is joined by name (`matched_endpoints`); if nothing matches it becomes an `external` node (`external_endpoints`) rather than an error. Edges identical to an existing `(from, to, kind)` row are skipped (`duplicate_edges`).
+- Imported nodes get stable ids `gimp-<hash(source, local id)>` and carry `provider=tsift-graph-import`, `import_source`, `import_id`; imported edges carry `provider` and `import_source`, so `edges --property import_source=<ID>` scans one import.
+
+**Storage and refresh.** The validated, normalized file is written atomically to `graph-imports/` beside the scope's `graph.db` (`.tsift/graph-imports/` for the root, `.tsift/indexes/<scope>/graph-imports/` for a scope) and the projection is refreshed. Every projection build appends the stored imports after all indexed rows, so imports survive `refresh` and `refresh --rebuild`, and their content hashes are part of the source watermark (a changed import invalidates `cached_source_watermark_reuse`). Re-importing a source rewrites its stored file, so the refresh replaces that source's rows instead of accumulating them; `--remove` deletes it and refreshes. A stored file that no longer parses is skipped with a warning rather than blocking the refresh. Each source projects one `graph_import` summary node (`graph_import:<source>`) holding its resolution counts; the import report reads those back as `projected`.
+
+**haiven-sdk `codegen/trace.json` adapter.** `--format auto` recognizes a trace (top-level `contracts` plus `conformance.suites`, no `edges`) and lowers it into the generic shape (`adapter: haiven-trace`):
+
+| Trace node | Kind | Join (contract languages `json`/`yaml`) | Edges |
+|---|---|---|---|
+| `contracts.<Stem>` | `contract` | JSON Schema titled `<Stem>` | `declared_in` → `sdk_declaration`, `declares_record` → `contract_record` |
+| `vocabularies.<Name>` | `vocabulary` | symbol `<Name>` | `declared_in` |
+| `rest."<METHOD> <path>"` | `rest_operation` | OpenAPI `operationId` (from `model.json`) | `declared_in`, `exercised_by` |
+| `ws.requests.<op>` / `ws.events.<type>` | `ws_request` / `ws_event` | AsyncAPI operation `<op>`/`<type>` | `declared_in`, `exercised_by` |
+| each `declared.<language>` `path:line` | `sdk_declaration` | the indexed symbol at `path:line` | — |
+| scenario `suite#id` | `conformance_scenario` | — | `in_suite` → `conformance_suite` |
+
+When the trace's sibling `model.json` exists, payload links are added: a contract is `carried_by` each WebSocket event/request whose payload it is, and a REST component is `used_by` each operation whose body or response names it. With those, a contract change's blast radius across SDKs is one query from the indexed contract symbol: `graph-db kind symbol --property ref_id=<Stem>` finds its id, and `graph-db neighborhood <id> --depth 2` returns its per-language declarations, the frames that carry it with their declarations, and the conformance scenarios that exercise those frames. `tests/graph_db_import.rs` locks this on a trace-shaped fixture, plus idempotent re-import, refresh survival, replacement of a changed trace, `--remove`, and external-endpoint counting.
+
 ### Graph DB Performance Release Gate
 
 The Graph DB performance release gate turns repeated `graph-db backend-eval` samples into a binding promote/block decision for candidate `GraphStore` backends. The gate is implemented in `src/perf_gate.rs` and exercised by `tests/perf_gate.rs`; the canonical sample store is `fixtures/graph-db-performance-history.json` and the canonical digest path is `tsift metric-digest --baseline fixtures/graph-db-performance-history.json`.

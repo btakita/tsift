@@ -3,6 +3,7 @@ mod commands;
 mod community_detection;
 mod conflict_matrix;
 mod context_pack;
+mod graph_import;
 mod output;
 mod rewrite;
 mod search_budget;
@@ -4710,6 +4711,18 @@ fn traversal_projection_from_graph(
         &mut edges,
     )?;
     append_tsift_memory_graph_projection_rows(root, &mut nodes, &mut edges)?;
+    // #sdktsiftedges: external edge files imported with `graph-db import` join
+    // the projection last, so their endpoints can land on any row above.
+    let mut import_warnings = Vec::new();
+    graph_import::append_stored_graph_imports(
+        &graph_substrate_db_path(root, scope),
+        &mut nodes,
+        &mut edges,
+        &mut import_warnings,
+    );
+    for warning in import_warnings {
+        eprintln!("warning: {warning}");
+    }
 
     let projection_hash = projection_content_hash(&nodes, &edges)?;
     let meta = SubstrateGraphNode::new(
@@ -10558,6 +10571,9 @@ pub(crate) fn graph_db_report_from_store(
         GraphDbQuery::SnapshotImport { .. } => {
             bail!("graph-db snapshot-import must be handled by the snapshot command path");
         }
+        GraphDbQuery::Import { .. } => {
+            bail!("graph-db import must be handled by the import command path");
+        }
         GraphDbQuery::BackendEval { .. } => {
             bail!("graph-db backend-eval must be handled by the benchmark command path");
         }
@@ -14082,6 +14098,9 @@ pub(crate) fn traversal_source_watermark(
     }
 
     push_traversal_summaries_watermark_part(root, &mut parts)?;
+    parts.extend(graph_import::graph_import_watermark_parts(
+        &graph_substrate_db_path(root, scope),
+    ));
 
     Ok(Some(content_hash(&parts)?))
 }

@@ -1950,6 +1950,14 @@ pub enum TokenGateCommand {
     },
 }
 
+/// Input format for `graph-db import` (#sdktsiftedges).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum GraphImportFormat {
+    Auto,
+    Edges,
+    HaivenTrace,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum GraphDbBackend {
     Sqlite,
@@ -2008,6 +2016,23 @@ pub enum GraphDbQuery {
         /// Replace an existing local .tsift/graph.db after validation.
         #[arg(long)]
         replace: bool,
+    },
+    /// Import an external edge file (tsift-graph-edges/v1 JSON, or a haiven-sdk codegen trace.json) into graph.db; re-importing the same source replaces it
+    Import {
+        /// Edge file to import. See specs/graph-db-import.md for the format.
+        file: Option<PathBuf>,
+        /// Stable source id for this import (default: the file's `source`, else its root-relative path). Re-importing a source replaces its rows.
+        #[arg(long)]
+        source: Option<String>,
+        /// Input format; `auto` detects a haiven-sdk trace.json and otherwise reads tsift-graph-edges/v1
+        #[arg(long, value_enum, default_value = "auto")]
+        format: GraphImportFormat,
+        /// Remove the stored import for --source (or FILE's source) instead of importing
+        #[arg(long)]
+        remove: bool,
+        /// List stored imports and their resolution counts without changing anything
+        #[arg(long, conflicts_with_all = ["remove", "file"])]
+        list: bool,
     },
     /// Benchmark experimental read-only GraphStore candidates against SQLite before promotion
     BackendEval {

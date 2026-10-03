@@ -42,6 +42,7 @@ tsift graph-db --path . --json compact
 tsift graph-db --path . --json kind backlog --property ref_id=cvxa --limit 5
 tsift graph-db --path . --json evidence cvxa --depth 3 --limit 8
 tsift graph-db --path . --json related --kind all "realtime avatar memory"
+tsift graph-db --path . --json import codegen/trace.json   # external edges; re-import replaces
 tsift conflict-matrix --path tasks/software/tsift.md cvxa --json
 tsift dependency-dag --path tasks/software/tsift.md cvxa --json
 tsift graph-db --path . --json doctor
