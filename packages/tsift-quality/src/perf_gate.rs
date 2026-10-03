@@ -863,6 +863,16 @@ pub fn evaluate_preparation_hotspot(
 /// it well before climbing back to the pre-fix ~445 ms band.
 pub const CONTEXT_PACK_DIFF_BUDGET_MICROS: u128 = 350_000;
 
+/// Static budget for `graph_refresh.link_ast_navigation_edges` over the
+/// haiven-shaped synthetic corpus in `tsift-cli`'s `ast_navigation_tests`
+/// (#graphrefreshperf): ~18k AST spans, one 12k-member generated header, and a
+/// C++17 nested-namespace pair (identical spans) in every header. Pre-fix the
+/// enclosing-module walk never terminated on that identical-span parent cycle and
+/// parent resolution was quadratic per file; post-fix it is an `O(n log n)`
+/// sweep. The ceiling is generous for unoptimized CI test builds, while a
+/// reintroduced quadratic scan or unguarded parent walk blows well past it.
+pub const AST_NAVIGATION_LINK_BUDGET_MICROS: u128 = 2_000_000;
+
 #[cfg(test)]
 mod tests {
     use super::*;

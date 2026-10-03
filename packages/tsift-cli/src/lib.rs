@@ -12,6 +12,15 @@ mod session_review_budget;
 mod token_savings;
 mod workflow;
 
+// Declared after the other modules on purpose: tree-sitter-kotlin-ng (tsift-graph)
+// and tree-sitter-kotlin-sg (ast-grep) both export the C symbol
+// `tree_sitter_kotlin`, so the grammar the test binary links depends on crate
+// load order. Declaring this module first (it names `tsift_quality` early)
+// flipped the link to the -sg grammar and broke Kotlin indexing in unrelated
+// tests ("Invalid field name `name`").
+#[cfg(test)]
+mod ast_navigation_tests;
+
 pub(crate) use community_detection::{
     CommunityDetectionReport, annotate_community_members_with_context,
     community_tagpath_cache_part, community_tagpath_cache_part_for_loaded,
@@ -13497,33 +13506,141 @@ fn traversal_ast_span_contains(
         && parent.end_byte >= child.end_byte
 }
 
-fn traversal_ast_parent_handle<'a>(
-    entry: &TraversalAstSpanIndexEntry,
-    entries: &'a [TraversalAstSpanIndexEntry],
-) -> Option<&'a str> {
-    entries
+/// Brute-force reference for [`traversal_ast_parent_indices`]: for every entry,
+/// the smallest containing span in the same file (ties broken by
+/// `(start, end, kind, name, node_kind)` and then by the first candidate in file
+/// order). Quadratic in the number of spans per file, so it is only used when the
+/// file's spans are not laminar (crossing spans) and as the test oracle.
+fn traversal_ast_parent_indices_quadratic(
+    file_entries: &[&TraversalAstSpanIndexEntry],
+) -> Vec<Option<usize>> {
+    file_entries
         .iter()
-        .filter(|candidate| traversal_ast_span_contains(candidate, entry))
-        .min_by_key(|candidate| {
-            (
-                candidate.end_byte.saturating_sub(candidate.start_byte),
-                candidate.start_byte,
-                candidate.end_byte,
-                candidate.kind.as_str(),
-                candidate.name.as_str(),
-                candidate.node_kind.as_str(),
-            )
+        .map(|entry| {
+            file_entries
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| traversal_ast_span_contains(candidate, entry))
+                .min_by_key(|(_, candidate)| {
+                    (
+                        candidate.end_byte.saturating_sub(candidate.start_byte),
+                        candidate.start_byte,
+                        candidate.end_byte,
+                        candidate.kind.as_str(),
+                        candidate.name.as_str(),
+                        candidate.node_kind.as_str(),
+                    )
+                })
+                .map(|(index, _)| index)
         })
-        .map(|candidate| candidate.handle.as_str())
+        .collect()
+}
+
+/// Resolve the AST parent of every span in one file in `O(n log n)`.
+///
+/// Spans are grouped by identical `(start, end)` and swept in `(start asc, end
+/// desc)` order with a stack of open groups, so each group's nearest enclosing
+/// group is the stack top. The result is identical to
+/// [`traversal_ast_parent_indices_quadratic`]: a span's parent is the first
+/// other-handle member (in `(kind, name, node_kind, file order)` order) of its own
+/// identical-span group, else of the nearest enclosing group, walking outward.
+/// Files whose spans cross (or could tie through a zero-length span on a shared
+/// boundary, or carry an inverted span) fall back to the quadratic reference so
+/// output semantics never change (#graphrefreshperf).
+fn traversal_ast_parent_indices(file_entries: &[&TraversalAstSpanIndexEntry]) -> Vec<Option<usize>> {
+    let len = file_entries.len();
+    if len < 2 {
+        return vec![None; len];
+    }
+    if file_entries
+        .iter()
+        .any(|entry| entry.end_byte < entry.start_byte)
+    {
+        return traversal_ast_parent_indices_quadratic(file_entries);
+    }
+    let has_zero_len = file_entries
+        .iter()
+        .any(|entry| entry.end_byte == entry.start_byte);
+
+    let mut order = (0..len).collect::<Vec<_>>();
+    order.sort_by(|&left, &right| {
+        let (l, r) = (file_entries[left], file_entries[right]);
+        l.start_byte
+            .cmp(&r.start_byte)
+            .then(r.end_byte.cmp(&l.end_byte))
+            .then(l.kind.cmp(&r.kind))
+            .then(l.name.cmp(&r.name))
+            .then(l.node_kind.cmp(&r.node_kind))
+            .then(left.cmp(&right))
+    });
+
+    // Groups of identical spans, members already in tie-break order.
+    let mut groups = Vec::<(usize, usize, Vec<usize>)>::new();
+    let mut group_of = vec![0usize; len];
+    for index in order {
+        let entry = file_entries[index];
+        match groups.last_mut() {
+            Some((start, end, members))
+                if *start == entry.start_byte && *end == entry.end_byte =>
+            {
+                members.push(index);
+            }
+            _ => groups.push((entry.start_byte, entry.end_byte, vec![index])),
+        }
+        group_of[index] = groups.len() - 1;
+    }
+
+    let mut enclosing_group = vec![None::<usize>; groups.len()];
+    let mut stack = Vec::<usize>::new();
+    for (group_index, (start, end, _)) in groups.iter().enumerate() {
+        while let Some(&top) = stack.last() {
+            let (_, top_end, _) = &groups[top];
+            if *top_end >= *end {
+                break;
+            }
+            if *top_end > *start || (*top_end == *start && has_zero_len) {
+                return traversal_ast_parent_indices_quadratic(file_entries);
+            }
+            stack.pop();
+        }
+        enclosing_group[group_index] = stack.last().copied();
+        stack.push(group_index);
+    }
+
+    (0..len)
+        .map(|index| {
+            let handle = file_entries[index].handle.as_str();
+            let mut group = Some(group_of[index]);
+            while let Some(group_index) = group {
+                if let Some(&parent) = groups[group_index]
+                    .2
+                    .iter()
+                    .find(|&&candidate| file_entries[candidate].handle != handle)
+                {
+                    return Some(parent);
+                }
+                group = enclosing_group[group_index];
+            }
+            None
+        })
+        .collect()
 }
 
 fn traversal_ast_enclosing_module_handle<'a>(
     entry: &TraversalAstSpanIndexEntry,
-    entries_by_handle: &'a BTreeMap<String, TraversalAstSpanIndexEntry>,
-    parent_by_handle: &BTreeMap<String, String>,
+    entries_by_handle: &BTreeMap<&str, &'a TraversalAstSpanIndexEntry>,
+    parent_by_handle: &BTreeMap<&str, &str>,
 ) -> Option<&'a str> {
-    let mut current = parent_by_handle.get(&entry.handle);
+    let mut current = parent_by_handle.get(entry.handle.as_str());
+    // Identical-span siblings (e.g. C++17 `namespace a::b { ... }`, which the
+    // indexer emits as two namespace spans over the same bytes) are each other's
+    // AST parent, so the parent chain can cycle. Without this guard the walk spun
+    // forever on such a cycle when neither span is a module (#graphrefreshperf).
+    let mut visited = BTreeSet::<&str>::new();
     while let Some(handle) = current {
+        if !visited.insert(*handle) {
+            break;
+        }
         let Some(parent) = entries_by_handle.get(handle) else {
             break;
         };
@@ -13535,7 +13652,7 @@ fn traversal_ast_enclosing_module_handle<'a>(
         {
             return Some(parent.handle.as_str());
         }
-        current = parent_by_handle.get(&parent.handle);
+        current = parent_by_handle.get(parent.handle.as_str());
     }
     None
 }
@@ -13544,37 +13661,35 @@ fn link_ast_navigation_edges(
     graph: &mut TraversalGraphBuild,
     entries: &[TraversalAstSpanIndexEntry],
 ) {
-    let mut entries_by_file = BTreeMap::<String, Vec<TraversalAstSpanIndexEntry>>::new();
+    let mut entries_by_file = BTreeMap::<&str, Vec<&TraversalAstSpanIndexEntry>>::new();
     let entries_by_handle = entries
         .iter()
-        .map(|entry| (entry.handle.clone(), entry.clone()))
+        .map(|entry| (entry.handle.as_str(), entry))
         .collect::<BTreeMap<_, _>>();
-    let mut parent_by_handle = BTreeMap::<String, String>::new();
-    let mut children_by_parent = BTreeMap::<Option<String>, Vec<TraversalAstSpanIndexEntry>>::new();
+    let mut parent_by_handle = BTreeMap::<&str, &str>::new();
+    let mut children_by_parent = BTreeMap::<Option<&str>, Vec<&TraversalAstSpanIndexEntry>>::new();
 
     for entry in entries {
         entries_by_file
-            .entry(entry.file.clone())
+            .entry(entry.file.as_str())
             .or_default()
-            .push(entry.clone());
+            .push(entry);
     }
 
     for file_entries in entries_by_file.values() {
-        for entry in file_entries {
-            let parent = traversal_ast_parent_handle(entry, file_entries).map(str::to_string);
-            if let Some(parent) = &parent {
-                parent_by_handle.insert(entry.handle.clone(), parent.clone());
+        let parents = traversal_ast_parent_indices(file_entries);
+        for (entry, parent) in file_entries.iter().zip(parents) {
+            let parent = parent.map(|index| file_entries[index].handle.as_str());
+            if let Some(parent) = parent {
+                parent_by_handle.insert(entry.handle.as_str(), parent);
             }
-            let sibling_key = parent.clone().or_else(|| entry.file_handle.clone());
-            children_by_parent
-                .entry(sibling_key)
-                .or_default()
-                .push(entry.clone());
+            let sibling_key = parent.or(entry.file_handle.as_deref());
+            children_by_parent.entry(sibling_key).or_default().push(entry);
         }
     }
 
     for entry in entries {
-        let parent = parent_by_handle.get(&entry.handle);
+        let parent = parent_by_handle.get(entry.handle.as_str()).copied();
         if let Some(parent) = parent {
             graph.add_edge(
                 parent,
