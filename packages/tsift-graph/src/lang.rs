@@ -53,6 +53,8 @@ pub enum Lang {
     C,
     #[cfg(feature = "lang-cpp")]
     Cpp,
+    #[cfg(feature = "lang-odin")]
+    Odin,
     #[cfg(feature = "lang-gdscript")]
     GdScript,
     #[cfg(feature = "lang-markdown")]
@@ -101,6 +103,8 @@ impl Lang {
             "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h" | "inl" | "ipp" => {
                 Some(Self::Cpp)
             }
+            #[cfg(feature = "lang-odin")]
+            "odin" => Some(Self::Odin),
             #[cfg(feature = "lang-gdscript")]
             "gd" => Some(Self::GdScript),
             #[cfg(feature = "lang-markdown")]
@@ -152,6 +156,8 @@ impl Lang {
             Self::C => tree_sitter_c::LANGUAGE.into(),
             #[cfg(feature = "lang-cpp")]
             Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            #[cfg(feature = "lang-odin")]
+            Self::Odin => tree_sitter_odin::LANGUAGE.into(),
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => tree_sitter_gdscript::LANGUAGE.into(),
             #[cfg(feature = "lang-markdown")]
@@ -191,6 +197,8 @@ impl Lang {
             Self::C => "c",
             #[cfg(feature = "lang-cpp")]
             Self::Cpp => "cpp",
+            #[cfg(feature = "lang-odin")]
+            Self::Odin => "odin",
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => "gdscript",
             #[cfg(feature = "lang-markdown")]
@@ -403,6 +411,32 @@ impl Lang {
                 (field_declaration declarator: (field_identifier) @field.name)
             "#
             }
+            #[cfg(feature = "lang-odin")]
+            Self::Odin => {
+                // Odin's grammar has no field names: a declaration's name is a
+                // bare `identifier` child sitting before its `::`/`:`/`:=`, and
+                // the value after it can be an identifier too (`X :: Y`,
+                // `Green = Red`). These patterns over-capture on purpose;
+                // `odin_capture_is_symbol` keeps only the declared names. A
+                // `const_declaration` whose value is a type is a type alias, and
+                // dedup lets that kind win over the generic `const`.
+                r#"
+                (procedure_declaration (identifier) @function.name)
+                (overloaded_procedure_declaration (identifier) @function.name)
+                (struct_declaration (identifier) @struct.name)
+                (union_declaration (identifier) @union.name)
+                (enum_declaration (identifier) @enum.name)
+                (enum_declaration (identifier) @enum_member.name)
+                (bit_field_declaration (identifier) @struct.name)
+                (bit_field_declaration (identifier) @field.name)
+                (field (identifier) @field.name)
+                (const_declaration (identifier) @const.name)
+                (const_declaration (identifier) @type_alias.name [(distinct_type) (bit_set_type) (array_type) (pointer_type) (type)])
+                (const_type_declaration (identifier) @const.name)
+                (variable_declaration (identifier) @variable.name)
+                (var_declaration (identifier) @variable.name)
+            "#
+            }
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => {
                 // `class_name Foo` declares the script's own type and is the
@@ -512,6 +546,16 @@ impl Lang {
 (call_expression function: (template_function name: (identifier) @call.name))
 "#,
             ),
+            #[cfg(feature = "lang-odin")]
+            Self::Odin => Some(
+                // Every Odin call is a `call_expression` with an identifier
+                // callee: `pkg.f()` and `a.b.f()` nest the call under a
+                // `member_expression`, and `obj->f()` under a
+                // `selector_call_expression`, rather than qualifying the name.
+                r#"
+(call_expression function: (identifier) @call.name)
+"#,
+            ),
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => Some(
                 // A bare `foo()` is `(call (identifier) ...)`, while `a.foo()`
@@ -596,7 +640,24 @@ impl Lang {
                     if *self == Self::Cpp {
                         node = c_family_declaration_for(node);
                     }
-                    let body_span = symbol_body_span(node);
+                    #[allow(unused_mut)]
+                    let mut body_span = symbol_body_span(node);
+                    #[cfg(feature = "lang-odin")]
+                    if *self == Self::Odin {
+                        if !odin_capture_is_symbol(kind_str, capture.node) {
+                            continue;
+                        }
+                        // An enum member or bit_field field is one name inside
+                        // its type's braces; its extent is the name, not the type.
+                        if matches!(
+                            node.kind(),
+                            "enum_declaration" | "bit_field_declaration"
+                        ) && matches!(kind_str, "enum_member" | "field")
+                        {
+                            node = capture.node;
+                        }
+                        body_span = odin_body_span(node).or(body_span);
+                    }
                     symbols.push(Symbol {
                         name,
                         kind: kind_str.to_string(),
@@ -708,6 +769,8 @@ impl Lang {
             Self::C,
             #[cfg(feature = "lang-cpp")]
             Self::Cpp,
+            #[cfg(feature = "lang-odin")]
+            Self::Odin,
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript,
             #[cfg(feature = "lang-markdown")]
@@ -808,6 +871,86 @@ fn c_family_declaration_for(mut node: tree_sitter::Node<'_>) -> tree_sitter::Nod
     node
 }
 
+/// Whether an Odin name capture is the name a declaration declares.
+///
+/// The symbol patterns capture every `identifier` child of a declaration,
+/// because the grammar gives the name no field. The name is the identifier
+/// before the declaration's separator; anything after it is a value or a type.
+/// Enum members follow `{` or `,` (a value follows `=`), and `bit_field`
+/// fields are the identifiers followed by `:`. Constants and variables are
+/// symbols only at package level -- including inside a top-level `when` or
+/// `foreign` block -- not as locals inside a procedure body.
+#[cfg(feature = "lang-odin")]
+fn odin_capture_is_symbol(kind: &str, name: tree_sitter::Node<'_>) -> bool {
+    let Some(decl) = name.parent() else {
+        return false;
+    };
+    match decl.kind() {
+        "field" => true,
+        "enum_declaration" if kind == "enum_member" => name
+            .prev_sibling()
+            .is_some_and(|prev| matches!(prev.kind(), "{" | ",")),
+        "bit_field_declaration" if kind == "field" => {
+            name.next_sibling().is_some_and(|next| next.kind() == ":")
+        }
+        "procedure_declaration"
+        | "overloaded_procedure_declaration"
+        | "struct_declaration"
+        | "union_declaration"
+        | "enum_declaration"
+        | "bit_field_declaration" => odin_precedes(name, "::"),
+        "const_declaration" => odin_precedes(name, "::") && odin_package_level(decl),
+        "const_type_declaration" | "var_declaration" => {
+            odin_precedes(name, ":") && odin_package_level(decl)
+        }
+        "variable_declaration" => odin_precedes(name, ":=") && odin_package_level(decl),
+        _ => false,
+    }
+}
+
+#[cfg(feature = "lang-odin")]
+fn odin_precedes(node: tree_sitter::Node<'_>, separator: &str) -> bool {
+    let mut next = node.next_sibling();
+    while let Some(sibling) = next {
+        if sibling.kind() == separator {
+            return true;
+        }
+        next = sibling.next_sibling();
+    }
+    false
+}
+
+#[cfg(feature = "lang-odin")]
+fn odin_package_level(decl: tree_sitter::Node<'_>) -> bool {
+    let mut node = decl.parent();
+    while let Some(current) = node {
+        match current.kind() {
+            "source_file" => return true,
+            "block" | "when_statement" | "foreign_block" => node = current.parent(),
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// An Odin procedure's body is the `block` of its `procedure` literal, one level
+/// below the declaration that names it.
+#[cfg(feature = "lang-odin")]
+fn odin_body_span(node: tree_sitter::Node<'_>) -> Option<(usize, usize)> {
+    if node.kind() != "procedure_declaration" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let procedure = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "procedure")?;
+    let mut cursor = procedure.walk();
+    let block = procedure
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "block")?;
+    Some((block.start_byte(), block.end_byte()))
+}
+
 fn symbol_body_span(node: tree_sitter::Node<'_>) -> Option<(usize, usize)> {
     if let Some(body) = node.child_by_field_name("body") {
         return Some((body.start_byte(), body.end_byte()));
@@ -886,6 +1029,7 @@ mod tests {
             ("cpp", "cpp"),
             ("h", "cpp"),
             ("hpp", "cpp"),
+            ("odin", "odin"),
             ("gd", "gdscript"),
             ("md", "markdown"),
             ("mdx", "markdown"),
@@ -1560,6 +1704,130 @@ int Run(Client* client) {
             assert!(
                 call_sites.iter().any(|site| site.callee == callee),
                 "member and qualified calls must expose {callee}: {call_sites:?}"
+            );
+        }
+    }
+
+    // #odinindex: Odin is a fully indexed language. Its grammar gives a
+    // declaration's name no field, so the fixture pins the cases where a bare
+    // identifier is *not* a name: values (`Green = Red`, `Alias :: int`), the
+    // members of a proc group, attribute arguments, and procedure locals.
+    #[cfg(feature = "lang-odin")]
+    #[test]
+    fn test_extract_odin_symbols() {
+        let source = br#"package demo
+
+import "core:fmt"
+
+MAX :: 10
+Name :: distinct string
+Handler :: #type proc(x: int)
+LIMIT : int : 5
+counter: int
+total := 5
+Point :: struct { x, y: f32 }
+Shape :: union { Point, int }
+Color :: enum u8 { Red, Green = Red, Blue }
+Reg :: bit_field u32 { lo: u8 | 4, hi: u8 | 4 }
+
+add :: proc(a, b: int) -> int { return a + b }
+add_f :: proc(a, b: f32) -> f32 { return a + b }
+@(private)
+add_any :: proc{add, add_f}
+
+when ODIN_OS == .Linux {
+	os_name :: proc() -> string { return "linux" }
+}
+
+foreign import libc "system:c"
+foreign libc {
+	puts :: proc(s: cstring) -> i32 ---
+}
+
+main :: proc() {
+	local := 1
+	SCRATCH :: 3
+	fmt.println(add(local, SCRATCH))
+}
+"#;
+        let symbols = Lang::Odin.extract_symbols(source).unwrap();
+        let kind_of = |name: &str| {
+            let found: Vec<&str> = symbols
+                .iter()
+                .filter(|s| s.name == name)
+                .map(|s| s.kind.as_str())
+                .collect();
+            assert_eq!(found.len(), 1, "{name} must be one symbol, got {found:?}");
+            found[0].to_string()
+        };
+        for (name, kind) in [
+            ("MAX", "const"),
+            ("Name", "type_alias"),
+            ("Handler", "type_alias"),
+            ("LIMIT", "const"),
+            ("counter", "variable"),
+            ("total", "variable"),
+            ("Point", "struct"),
+            ("x", "field"),
+            ("y", "field"),
+            ("Shape", "union"),
+            ("Color", "enum"),
+            ("Green", "enum_member"),
+            ("Blue", "enum_member"),
+            ("Reg", "struct"),
+            ("lo", "field"),
+            ("add", "function"),
+            ("add_any", "function"),
+            ("os_name", "function"),
+            ("puts", "function"),
+            ("main", "function"),
+        ] {
+            assert_eq!(kind_of(name), kind, "wrong kind for {name}");
+        }
+        // `Red` is declared once; `Green = Red` is a use, not a second member.
+        assert_eq!(kind_of("Red"), "enum_member");
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        for absent in ["demo", "fmt", "private", "string", "u8", "local", "SCRATCH", "a", "b"] {
+            assert!(!names.contains(&absent), "{absent} is not a declaration: {names:?}");
+        }
+        let main = symbols.iter().find(|s| s.name == "main").unwrap();
+        assert!(main.end_line > main.line, "a procedure spans its body: {main:?}");
+        assert!(main.body_start_byte.is_some(), "a procedure has a body span: {main:?}");
+        let green = symbols.iter().find(|s| s.name == "Green").unwrap();
+        assert_eq!(green.node_kind, "identifier", "a member's extent is its name");
+    }
+
+    #[cfg(feature = "lang-odin")]
+    #[test]
+    fn test_extract_odin_call_edges() {
+        let source = br#"package demo
+
+helper :: proc() -> int { return 1 }
+
+run :: proc(o: ^Obj) -> int {
+	o->update(1)
+	fmt.println("hi")
+	inner :: proc() { helper() }
+	return helper()
+}
+"#;
+        let symbols = Lang::Odin.extract_symbols(source).unwrap();
+        let call_sites = crate::extract_call_sites(Lang::Odin, source).unwrap();
+        let edges = crate::resolve_edges(&symbols, &call_sites);
+        let pairs: Vec<String> = edges
+            .iter()
+            .map(|edge| format!("{} -> {}", edge.caller, edge.callee))
+            .collect();
+        for expected in ["run -> helper", "inner -> helper"] {
+            assert!(
+                pairs.contains(&expected.to_string()),
+                "expected {expected}, got {pairs:?}"
+            );
+        }
+        for callee in ["update", "println"] {
+            assert!(
+                call_sites.iter().any(|site| site.callee == callee),
+                "selector and package-qualified calls must expose {callee}: {call_sites:?}"
             );
         }
     }

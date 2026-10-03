@@ -140,6 +140,15 @@ const CASES: &[Case] = &[
         expect_kind: "function",
         truncated: "int main( { return",
     },
+    #[cfg(feature = "lang-odin")]
+    Case {
+        lang: Lang::Odin,
+        extensions: &["odin"],
+        source: "package main\n\nmain :: proc() {}\n",
+        expect_name: "main",
+        expect_kind: "function",
+        truncated: "package main\nmain :: proc( {",
+    },
     #[cfg(feature = "lang-gdscript")]
     Case {
         lang: Lang::GdScript,

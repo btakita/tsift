@@ -66,7 +66,7 @@ reaches is what it can actually do:
 | Fans out to | Meaning | Languages |
 |---|---|---|
 | `tsift-astgrep` + `tsift-graph` + `tsift-search` | Indexable **and** structural. Searchable, graphable, and eligible for the symbol-resolved edit kinds | rust, python, typescript, javascript, kotlin, bash, go, csharp, c, cpp, markdown, json, yaml |
-| `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig, gdscript — `ast-grep-language` ships no Zig or GDScript grammar |
+| `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig, odin, gdscript — `ast-grep-language` ships no Zig, Odin, or GDScript grammar |
 | `tsift-astgrep` only | **Structural-only**: `ast-grep search`/`rewrite` and the `structural_rewrite` edit intent work; the language is not indexed, not searchable, and not graphable | css, dart, elixir, haskell, hcl, html, java, lua, nix, php, ruby, scala, solidity, swift |
 
 Structural-only is a deliberate tier, not an oversight. A tree-sitter grammar is
@@ -120,6 +120,22 @@ grammar fails on classes and namespaces (a build without `lang-cpp` reads `.h`
 as C). This differs on purpose from the ast-grep side above, where `.h`
 resolves to C for pattern matching. `rename_symbol` stays structural for C,
 as for C++.
+
+Odin joined the indexed-only tier under `#odinindex`, through the
+`tree-sitter-odin` grammar (tree-sitter-grammars, 1.3). It never had an ast-grep
+grammar, so it went straight to search and graph with no structural tier
+beneath it. `.odin` files contribute procedure (including `proc{...}` groups),
+struct, union, enum, enum-member, `bit_field`, field, constant, type-alias, and
+package-level variable symbols; a constant whose value is a type (`distinct`,
+`#type proc`, pointer, array, or `bit_set`) is a type alias. The grammar gives a
+declaration's name no field, so the tag query captures every identifier child
+and a filter keeps the one before the declaration's `::`/`:`/`:=` separator;
+values, proc-group members, and enum values (`Green = Red`) are uses, not
+declarations. Constants and variables count only at package level, including
+inside a top-level `when` or `foreign` block. Every Odin call is a
+`call_expression` with an identifier callee (`pkg.f()` and `obj->f()` nest it),
+so one call pattern covers bare, package-qualified, and selector calls. Like
+C++, `rename_symbol` is not promoted: Odin has no semantic-edit contract.
 
 JSON and YAML followed under `#sdktsiftcontracts`, as data rather than code.
 `.json`, `.yaml`, and `.yml` are indexed, but symbols come only from API

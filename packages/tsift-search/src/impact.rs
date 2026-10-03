@@ -438,6 +438,8 @@ fn is_import_line(lang: Lang, line: &str) -> bool {
         Lang::C => trimmed.starts_with("#include "),
         #[cfg(feature = "lang-cpp")]
         Lang::Cpp => trimmed.starts_with("#include ") || trimmed.starts_with("import "),
+        #[cfg(feature = "lang-odin")]
+        Lang::Odin => trimmed.starts_with("import ") || trimmed.starts_with("foreign import "),
         // GDScript has no `import`: a script pulls in another script by
         // extending it or by `preload`/`load`ing a `res://` path.
         #[cfg(feature = "lang-gdscript")]

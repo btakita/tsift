@@ -146,6 +146,9 @@ pub fn identifier_node_kinds(lang: Lang) -> &'static [&'static str] {
             "field_identifier",
             "namespace_identifier",
         ],
+        // Odin has a single `identifier` node for declarations and references.
+        #[cfg(feature = "lang-odin")]
+        Lang::Odin => &["identifier"],
         // GDScript splits the two: `name` is the declared name of a statement
         // or block, `identifier` is every reference to one.
         #[cfg(feature = "lang-gdscript")]
