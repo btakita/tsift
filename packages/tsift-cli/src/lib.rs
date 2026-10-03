@@ -6101,6 +6101,26 @@ struct GraphDbOutputBudgetReport {
     candidate_nodes: usize,
     candidate_edges: usize,
     dropped_by_budget: Vec<GraphDbDroppedByBudget>,
+    /// True when the caller passed an explicit `--limit 0`: no per-kind quota
+    /// and no estimated-token cap were applied.
+    #[serde(default)]
+    unlimited: bool,
+    /// Total candidate nodes the budget dropped (all kinds, all reasons).
+    #[serde(default)]
+    dropped_nodes: usize,
+    /// Total candidate edges the budget dropped (all kinds, all reasons).
+    #[serde(default)]
+    dropped_edges: usize,
+    /// Dropped node counts keyed by node kind (sum over all drop reasons).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    dropped_nodes_by_kind: BTreeMap<String, usize>,
+    /// Dropped edge counts keyed by edge kind (sum over all drop reasons).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    dropped_edges_by_kind: BTreeMap<String, usize>,
+    /// Operator hint naming the flag that lifts the budget, present only when
+    /// something was dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
     diagnostics: Vec<String>,
 }
 
@@ -9077,9 +9097,18 @@ const GRAPH_DB_OUTPUT_DEFAULT_TOKEN_CAP: usize = 6_000;
 const GRAPH_DB_OUTPUT_MIN_TOKEN_CAP: usize = 1_200;
 const GRAPH_DB_OUTPUT_MAX_TOKEN_CAP: usize = 12_000;
 
+/// Output-budget limit convention shared by every graph-db command that runs
+/// `graph_db_apply_output_budget*` (neighborhood, related, evidence):
+/// `None` = implicit default budget (per-kind quotas + 6k estimated-token cap),
+/// `Some(0)` = explicit unlimited (no quota, no token cap), `Some(n)` = scaled caps.
+fn graph_db_output_budget_unlimited(limit: Option<usize>) -> bool {
+    limit == Some(0)
+}
+
 fn graph_db_output_token_cap(limit: Option<usize>) -> usize {
     match limit {
-        Some(0) | None => GRAPH_DB_OUTPUT_DEFAULT_TOKEN_CAP,
+        Some(0) => usize::MAX,
+        None => GRAPH_DB_OUTPUT_DEFAULT_TOKEN_CAP,
         Some(limit) => limit
             .saturating_mul(320)
             .clamp(GRAPH_DB_OUTPUT_MIN_TOKEN_CAP, GRAPH_DB_OUTPUT_MAX_TOKEN_CAP),
@@ -9087,7 +9116,10 @@ fn graph_db_output_token_cap(limit: Option<usize>) -> usize {
 }
 
 fn graph_db_node_kind_quota(kind: &str, limit: Option<usize>) -> usize {
-    if matches!(limit, Some(0) | None) {
+    if graph_db_output_budget_unlimited(limit) {
+        return usize::MAX;
+    }
+    if limit.is_none() {
         return match kind {
             "source_handle" => 10,
             "worker_context" | "worker_result" => 8,
@@ -9107,7 +9139,10 @@ fn graph_db_node_kind_quota(kind: &str, limit: Option<usize>) -> usize {
 }
 
 fn graph_db_edge_kind_quota(kind: &str, limit: Option<usize>) -> usize {
-    if matches!(limit, Some(0) | None) {
+    if graph_db_output_budget_unlimited(limit) {
+        return usize::MAX;
+    }
+    if limit.is_none() {
         return match kind {
             "mentions" | "mentions_concept" | "mentions_entity" => 24,
             "semantic_relation" | "calls" | "defines" => 20,
@@ -9541,6 +9576,34 @@ fn graph_db_apply_output_budget_with_depths_and_cursor(
         .filter(|edge| selected_edge_ids.contains(&graph_db_edge_key(edge)))
         .collect::<Vec<_>>();
     let dropped_by_budget = graph_db_budget_drop_report(drops);
+    let unlimited = graph_db_output_budget_unlimited(limit);
+    let mut dropped_nodes_by_kind = BTreeMap::<String, usize>::new();
+    let mut dropped_edges_by_kind = BTreeMap::<String, usize>::new();
+    for drop in &dropped_by_budget {
+        let bucket = if drop.item == "node" {
+            &mut dropped_nodes_by_kind
+        } else {
+            &mut dropped_edges_by_kind
+        };
+        *bucket.entry(drop.kind.clone()).or_default() += drop.dropped;
+    }
+    let dropped_nodes = dropped_nodes_by_kind.values().sum::<usize>();
+    let dropped_edges = dropped_edges_by_kind.values().sum::<usize>();
+    let hint = (dropped_nodes > 0 || dropped_edges > 0).then(|| {
+        let by_kind = dropped_nodes_by_kind
+            .iter()
+            .map(|(kind, count)| format!("{kind}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let by_kind = if by_kind.is_empty() {
+            String::new()
+        } else {
+            format!(" (nodes by kind: {by_kind})")
+        };
+        format!(
+            "output budget dropped {dropped_nodes} node(s) and {dropped_edges} edge(s){by_kind}; rerun with --limit 0 for unlimited output, or page with --cursor <next_cursor>"
+        )
+    });
     let truncated = has_remaining_candidates;
     let next_cursor = if truncated {
         selected_nodes.last().map(|node| node.id.clone())
@@ -9556,9 +9619,16 @@ fn graph_db_apply_output_budget_with_depths_and_cursor(
             candidate_nodes,
             selected_edges.len(),
             candidate_edges,
-            max_tokens
+            if unlimited {
+                "unlimited (--limit 0)".to_string()
+            } else {
+                max_tokens.to_string()
+            }
         ),
     ];
+    if let Some(hint) = &hint {
+        diagnostics.push(hint.clone());
+    }
     if cursor.is_some() {
         diagnostics.push(format!(
             "cursor skipped {} previously returned candidate(s)",
@@ -9576,13 +9646,20 @@ fn graph_db_apply_output_budget_with_depths_and_cursor(
         nodes: selected_nodes,
         edges: selected_edges,
         report: GraphDbOutputBudgetReport {
-            max_tokens,
+            // `0` mirrors the `--limit 0` convention: no estimated-token cap.
+            max_tokens: if unlimited { 0 } else { max_tokens },
             estimated_tokens,
             selected_nodes: selected_node_ids.len(),
             selected_edges: selected_edge_ids.len(),
             candidate_nodes,
             candidate_edges,
             dropped_by_budget,
+            unlimited,
+            dropped_nodes,
+            dropped_edges,
+            dropped_nodes_by_kind,
+            dropped_edges_by_kind,
+            hint,
             diagnostics,
         },
         truncated,
@@ -10758,12 +10835,16 @@ pub(crate) fn graph_db_report_from_store(
                 edge_kind.as_deref(),
                 graph_db_query_options_for_store(&options),
             )? {
+                // `options.limit` collapses `--limit 0` to `None` (unpaged store
+                // read); the output budget must still see the explicit `Some(0)`
+                // so it disables per-kind quotas and the token cap instead of
+                // falling back to the implicit default budget.
                 let budgeted = graph_db_apply_output_budget(
                     std::slice::from_ref(&id),
                     &BTreeMap::new(),
                     paged.nodes,
                     paged.edges,
-                    options.limit,
+                    limit,
                 );
                 let budget_report = budgeted.report;
                 let ranked_neighbor_cap = graph_db_ranked_neighbor_cap(options.limit);
@@ -10889,6 +10970,13 @@ pub(crate) fn print_graph_db_human(report: &GraphDbReport, compact: bool) {
             edge.kind,
             edge.to_id
         );
+    }
+    if let Some(hint) = report
+        .output_budget
+        .as_ref()
+        .and_then(|budget| budget.hint.as_ref())
+    {
+        println!("output_budget: {hint}");
     }
     if let Some(knowledge) = &report.knowledge_retrieval {
         println!(
@@ -26792,6 +26880,88 @@ fn main() { api::handler(); }
                 .iter()
                 .any(|operation| operation.command.starts_with("neighborhood"))
         );
+    }
+
+    #[test]
+    fn graph_db_neighborhood_limit_zero_lifts_per_kind_quota_and_token_cap() {
+        // 40 `symbol` neighbors: exceeds the default per-kind quota (12) AND,
+        // with ~1KB details, the default 6k estimated-token cap.
+        let mut nodes = vec![SubstrateGraphNode::new("origin", "file", "origin.rs")];
+        let mut edges = Vec::new();
+        for idx in 0..40 {
+            let id = format!("sym-{idx:02}");
+            nodes.push(
+                SubstrateGraphNode::new(id.clone(), "symbol", format!("ChatMessageV0 {idx}"))
+                    .with_property("detail", "y".repeat(1_000)),
+            );
+            edges.push(SubstrateGraphEdge::new("origin", id, "defines"));
+        }
+        let store = SqliteGraphStore::in_memory().unwrap();
+        GraphProjection { nodes, edges }
+            .upsert_into(&store)
+            .unwrap();
+        let run = |limit: Option<usize>| {
+            graph_db_report_from_store(
+                Path::new("."),
+                None,
+                "fixture",
+                GraphDbQuery::Neighborhood {
+                    id: "origin".to_string(),
+                    depth: 1,
+                    edge_kind: None,
+                    cursor: None,
+                    limit,
+                    property_filters: Vec::new(),
+                },
+                &store,
+                current_graph_db_freshness(),
+                Vec::new(),
+            )
+            .unwrap()
+        };
+
+        // Default budget truncates and reports what it dropped, per kind.
+        let default = run(None);
+        let budget = default.output_budget.as_ref().unwrap();
+        assert!(!budget.unlimited);
+        let returned_symbols = default
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "symbol")
+            .count();
+        assert!(returned_symbols < 40, "default budget must truncate");
+        assert_eq!(budget.dropped_nodes, 40 - returned_symbols);
+        assert_eq!(
+            budget.dropped_nodes_by_kind.get("symbol").copied(),
+            Some(40 - returned_symbols)
+        );
+        assert!(budget.dropped_edges > 0);
+        let hint = budget.hint.as_deref().expect("truncation hint");
+        assert!(hint.contains("--limit 0"), "{hint}");
+        assert!(hint.contains("symbol="), "{hint}");
+        assert!(default.page.as_ref().unwrap().truncated);
+        let json = serde_json::to_value(&default).unwrap();
+        assert_eq!(
+            json["output_budget"]["dropped_nodes_by_kind"]["symbol"],
+            serde_json::json!(40 - returned_symbols)
+        );
+
+        // Explicit `--limit 0` returns everything and reports zero drops.
+        let unlimited = run(Some(0));
+        let budget = unlimited.output_budget.as_ref().unwrap();
+        assert!(budget.unlimited);
+        assert_eq!(budget.max_tokens, 0);
+        assert_eq!(unlimited.nodes.len(), 41);
+        assert_eq!(unlimited.edges.len(), 40);
+        assert_eq!(budget.dropped_nodes, 0);
+        assert_eq!(budget.dropped_edges, 0);
+        assert!(budget.dropped_by_budget.is_empty());
+        assert!(budget.dropped_nodes_by_kind.is_empty());
+        assert!(budget.hint.is_none());
+        assert!(!unlimited.page.as_ref().unwrap().truncated);
+        let json = serde_json::to_value(&unlimited).unwrap();
+        assert!(json["output_budget"].get("dropped_nodes_by_kind").is_none());
+        assert!(json["output_budget"].get("hint").is_none());
     }
 
     #[test]

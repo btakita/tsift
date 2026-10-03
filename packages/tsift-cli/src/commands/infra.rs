@@ -2736,6 +2736,30 @@ pub(crate) fn cmd_graph_db(
             metrics.push(envelope_metric("readiness", &readiness.status));
             next_commands.extend(readiness.next_commands.clone());
         }
+        let mut budget_suffix = String::new();
+        if let Some(budget) = &report.output_budget {
+            metrics.push(envelope_metric("budget_unlimited", budget.unlimited));
+            metrics.push(envelope_metric("dropped_nodes", budget.dropped_nodes));
+            metrics.push(envelope_metric("dropped_edges", budget.dropped_edges));
+            if !budget.dropped_nodes_by_kind.is_empty() {
+                metrics.push(envelope_metric(
+                    "dropped_nodes_by_kind",
+                    budget
+                        .dropped_nodes_by_kind
+                        .iter()
+                        .map(|(kind, count)| format!("{kind}={count}"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ));
+            }
+            if let Some(hint) = &budget.hint {
+                budget_suffix = format!(
+                    "; output budget dropped {} node(s), {} edge(s)",
+                    budget.dropped_nodes, budget.dropped_edges
+                );
+                next_commands.push(hint.clone());
+            }
+        }
         next_commands.push(format!(
             "Use tsift convex-sync {} --json to inspect or refresh Convex projection rows",
             shell_quote(root.to_string_lossy().as_ref())
@@ -2747,11 +2771,12 @@ pub(crate) fn cmd_graph_db(
             "query",
             ToolEnvelopeSummary {
                 text: format!(
-                    "Graph DB {} query returned {} node(s), {} edge(s), freshness {}",
+                    "Graph DB {} query returned {} node(s), {} edge(s), freshness {}{}",
                     report.backend,
                     report.nodes.len() + usize::from(report.node.is_some()),
                     report.edges.len(),
-                    report.freshness.status
+                    report.freshness.status,
+                    budget_suffix
                 ),
                 metrics,
             },

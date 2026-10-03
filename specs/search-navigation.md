@@ -33,6 +33,7 @@ tsift conflict-matrix --path tasks/software/tsift.md pwcm g6kf --json # parallel
 tsift dispatch-trace --path tasks/software/tsift.md pwcm g6kf --format html # graph-backed dispatch trace
 tsift dependency-dag --path tasks/software/tsift.md pwcm g6kf --json # graph-backed dependency DAG and topo batches
 tsift graph-db --path . --json neighborhood <id> --depth 2 --edge-kind mentions --property path=tasks/software/tsift.md --limit 20 # bounded subgraph
+tsift graph-db --path . --json neighborhood <id> --depth 2 --limit 0 # unlimited: no per-kind quota or token cap; output_budget reports dropped counts otherwise
 tsift graph-db --path . --json path <from-id> <to-id> --max-hops 64 # bounded shortest directed path
 tsift graph-db --path . --json map # two-tier overview: communities, hubs, edge kinds, modules
 tsift graph-db --path . --json map --focus detect_communities # overview + focus tier for one symbol
