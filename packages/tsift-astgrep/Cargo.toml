@@ -17,6 +17,12 @@ serde = { version = "1", features = ["derive"] }
 ast-grep-core = "0.44"
 ast-grep-language = { version = "0.44", default-features = false }
 ignore = "0.4"
+# tsift's ONE Kotlin grammar. `ast-grep-language`'s own `tree-sitter-kotlin`
+# feature pulls `tree-sitter-kotlin-sg`, which exports the same C symbol
+# (`tree_sitter_kotlin`) as this crate; linking both made the grammar every
+# caller got depend on link order (#kotlinsymclash). `lang-kotlin` therefore
+# never enables that feature and the engine binds Kotlin to this grammar itself.
+tree-sitter-kotlin-ng = { version = "1", optional = true }
 
 [features]
 # Mirrors the tsift `lang-*` feature fan-out. `ast-grep-language` gates each
@@ -27,7 +33,7 @@ lang-rust = ["ast-grep-language/tree-sitter-rust"]
 lang-python = ["ast-grep-language/tree-sitter-python"]
 lang-typescript = ["ast-grep-language/tree-sitter-typescript"]
 lang-javascript = ["ast-grep-language/tree-sitter-javascript"]
-lang-kotlin = ["ast-grep-language/tree-sitter-kotlin"]
+lang-kotlin = ["dep:tree-sitter-kotlin-ng"]
 lang-bash = ["ast-grep-language/tree-sitter-bash"]
 lang-markdown = ["ast-grep-language/tree-sitter-md"]
 # `lang-zig`, `lang-gdscript`, and `lang-jai` exist in tsift but

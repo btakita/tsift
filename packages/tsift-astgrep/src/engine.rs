@@ -54,7 +54,7 @@ fn empty_pattern_error(pattern: &str) -> Result<()> {
 /// with the error preserved.
 fn compile_pattern(pattern: &str, lang: AstGrepLang) -> Result<Pattern> {
     empty_pattern_error(pattern)?;
-    Pattern::try_new(pattern, lang.support_lang()).map_err(|err| {
+    Pattern::try_new(pattern, lang.engine_lang()).map_err(|err| {
         anyhow::anyhow!(
             "invalid structural pattern for {lang}: {err} (pattern: `{pattern}`)",
             lang = lang.name()
@@ -69,12 +69,12 @@ pub fn search_source(
     pattern: &str,
 ) -> Result<Vec<StructuralMatch>> {
     let pattern = compile_pattern(pattern, lang)?;
-    let grep = AstGrep::new(source, lang.support_lang());
+    let grep = AstGrep::new(source, lang.engine_lang());
     Ok(collect_matches(&grep, &pattern))
 }
 
 fn collect_matches(
-    grep: &AstGrep<ast_grep_core::tree_sitter::StrDoc<ast_grep_language::SupportLang>>,
+    grep: &AstGrep<ast_grep_core::tree_sitter::StrDoc<crate::lang::EngineLang>>,
     pattern: &Pattern,
 ) -> Vec<StructuralMatch> {
     let mut out = Vec::new();
@@ -124,7 +124,7 @@ pub fn rewrite_source(
     let pattern = compile_pattern(pattern, lang)?;
     // One parse serves both the match report and the edit list; matching and
     // rewriting must never disagree about what the pattern hit.
-    let grep = AstGrep::new(source, lang.support_lang());
+    let grep = AstGrep::new(source, lang.engine_lang());
     let matches = collect_matches(&grep, &pattern);
     let edits = grep.root().replace_all(&pattern, rewrite);
 

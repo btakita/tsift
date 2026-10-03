@@ -1,3 +1,13 @@
+// Declared first on purpose. Before #kotlinsymclash, tree-sitter-kotlin-ng
+// (tsift-graph) and tree-sitter-kotlin-sg (ast-grep) both exported the C symbol
+// `tree_sitter_kotlin`, and declaring a test module that names `tsift_quality`
+// here flipped the link to the -sg grammar ("Invalid field name `name`"). Only
+// kotlin-ng is linked now; keeping these first keeps that trigger exercised.
+#[cfg(test)]
+mod ast_navigation_tests;
+#[cfg(test)]
+mod kotlin_grammar_link_tests;
+
 mod cli;
 mod commands;
 mod community_detection;
@@ -11,15 +21,6 @@ mod semantic_edit;
 mod session_review_budget;
 mod token_savings;
 mod workflow;
-
-// Declared after the other modules on purpose: tree-sitter-kotlin-ng (tsift-graph)
-// and tree-sitter-kotlin-sg (ast-grep) both export the C symbol
-// `tree_sitter_kotlin`, so the grammar the test binary links depends on crate
-// load order. Declaring this module first (it names `tsift_quality` early)
-// flipped the link to the -sg grammar and broke Kotlin indexing in unrelated
-// tests ("Invalid field name `name`").
-#[cfg(test)]
-mod ast_navigation_tests;
 
 pub(crate) use community_detection::{
     CommunityDetectionReport, annotate_community_members_with_context,

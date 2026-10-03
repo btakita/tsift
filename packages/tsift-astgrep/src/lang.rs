@@ -355,13 +355,26 @@ impl AstGrepLang {
     /// with the same grammar the rewrite was matched against, and keeps
     /// structural-tier languages usable without a `tsift-graph` binding.
     pub fn tree_sitter_language(&self) -> TSLanguage {
-        self.support_lang().get_ts_language()
+        self.engine_lang().get_ts_language()
     }
 
+    /// The language handle the ast-grep engine parses and matches with.
+    pub(crate) fn engine_lang(&self) -> EngineLang {
+        match self.support_lang() {
+            Some(support) => EngineLang::Support(support),
+            #[cfg(feature = "lang-kotlin")]
+            None => EngineLang::Kotlin,
+            #[cfg(not(feature = "lang-kotlin"))]
+            None => unreachable!("only Kotlin bypasses ast-grep-language"),
+        }
+    }
+
+    /// The `ast-grep-language` binding for this language, or `None` when tsift
+    /// binds the grammar itself (Kotlin — see [`EngineLang::Kotlin`]).
     #[allow(unused)]
-    pub(crate) fn support_lang(&self) -> ast_grep_language::SupportLang {
+    pub(crate) fn support_lang(&self) -> Option<ast_grep_language::SupportLang> {
         use ast_grep_language::SupportLang;
-        match *self {
+        let support = match *self {
             #[cfg(feature = "lang-rust")]
             AstGrepLang::Rust => SupportLang::Rust,
             #[cfg(feature = "lang-python")]
@@ -373,7 +386,7 @@ impl AstGrepLang {
             #[cfg(feature = "lang-javascript")]
             AstGrepLang::JavaScript => SupportLang::JavaScript,
             #[cfg(feature = "lang-kotlin")]
-            AstGrepLang::Kotlin => SupportLang::Kotlin,
+            AstGrepLang::Kotlin => return None,
             #[cfg(feature = "lang-bash")]
             AstGrepLang::Bash => SupportLang::Bash,
             #[cfg(feature = "lang-markdown")]
@@ -418,6 +431,103 @@ impl AstGrepLang {
             AstGrepLang::Swift => SupportLang::Swift,
             #[cfg(feature = "lang-yaml")]
             AstGrepLang::Yaml => SupportLang::Yaml,
+        };
+        #[allow(unreachable_code)]
+        Some(support)
+    }
+}
+
+/// The language type the ast-grep engine is instantiated with.
+///
+/// Every language but Kotlin delegates to `ast-grep-language`'s
+/// [`SupportLang`](ast_grep_language::SupportLang). Kotlin is bound here to
+/// `tree-sitter-kotlin-ng`, the grammar `tsift-graph` indexes with, because
+/// `ast-grep-language`'s Kotlin feature links `tree-sitter-kotlin-sg`, and both
+/// crates export the C symbol `tree_sitter_kotlin`. With both linked, which
+/// grammar *every* caller received (indexer included) was decided by link order
+/// (#kotlinsymclash). Owning the binding keeps exactly one Kotlin grammar in the
+/// binary and makes structural Kotlin patterns parse with the indexed grammar.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum EngineLang {
+    Support(ast_grep_language::SupportLang),
+    #[cfg(feature = "lang-kotlin")]
+    Kotlin,
+}
+
+impl EngineLang {
+    /// Pattern-preprocessing rules for the variant. Kotlin keeps ast-grep's own
+    /// `µ` expando: `ast_grep_language::Kotlin`'s preprocessing never touches its
+    /// (unlinked) grammar, and `µ` is a letter to kotlin-ng's identifier rule.
+    fn pattern_rules(&self) -> ast_grep_language::SupportLang {
+        match *self {
+            EngineLang::Support(support) => support,
+            #[cfg(feature = "lang-kotlin")]
+            EngineLang::Kotlin => ast_grep_language::SupportLang::Kotlin,
+        }
+    }
+}
+
+impl ast_grep_core::Language for EngineLang {
+    fn pre_process_pattern<'q>(&self, query: &'q str) -> std::borrow::Cow<'q, str> {
+        self.pattern_rules().pre_process_pattern(query)
+    }
+    fn meta_var_char(&self) -> char {
+        self.pattern_rules().meta_var_char()
+    }
+    fn expando_char(&self) -> char {
+        self.pattern_rules().expando_char()
+    }
+    fn extract_meta_var(&self, source: &str) -> Option<ast_grep_core::meta_var::MetaVariable> {
+        self.pattern_rules().extract_meta_var(source)
+    }
+    fn kind_to_id(&self, kind: &str) -> u16 {
+        match self {
+            EngineLang::Support(support) => support.kind_to_id(kind),
+            #[cfg(feature = "lang-kotlin")]
+            EngineLang::Kotlin => self.get_ts_language().id_for_node_kind(kind, true),
+        }
+    }
+    fn field_to_id(&self, field: &str) -> Option<u16> {
+        match self {
+            EngineLang::Support(support) => support.field_to_id(field),
+            #[cfg(feature = "lang-kotlin")]
+            EngineLang::Kotlin => self
+                .get_ts_language()
+                .field_id_for_name(field)
+                .map(|id| id.get()),
+        }
+    }
+    fn build_pattern(
+        &self,
+        builder: &ast_grep_core::matcher::PatternBuilder,
+    ) -> Result<ast_grep_core::Pattern, ast_grep_core::matcher::PatternError> {
+        builder.build(|src| ast_grep_core::tree_sitter::StrDoc::try_new(src, *self))
+    }
+}
+
+impl LanguageExt for EngineLang {
+    fn get_ts_language(&self) -> TSLanguage {
+        match self {
+            EngineLang::Support(support) => support.get_ts_language(),
+            #[cfg(feature = "lang-kotlin")]
+            EngineLang::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
+        }
+    }
+    fn injectable_languages(&self) -> Option<&'static [&'static str]> {
+        match self {
+            EngineLang::Support(support) => support.injectable_languages(),
+            #[cfg(feature = "lang-kotlin")]
+            EngineLang::Kotlin => None,
+        }
+    }
+    fn extract_injections<L: LanguageExt>(
+        &self,
+        root: ast_grep_core::Node<ast_grep_core::tree_sitter::StrDoc<L>>,
+    ) -> Vec<(String, Vec<ast_grep_core::tree_sitter::TSRange>)> {
+        match self {
+            EngineLang::Support(support) => support.extract_injections(root),
+            #[cfg(feature = "lang-kotlin")]
+            EngineLang::Kotlin => Vec::new(),
         }
     }
 }
@@ -499,7 +609,11 @@ mod tests {
         // variant present here but mismapped there is a wrong-grammar parse,
         // which is worse than a refusal because it silently under-matches.
         for lang in AstGrepLang::all() {
-            let support = lang.support_lang();
+            let Some(support) = lang.support_lang() else {
+                // Only Kotlin is bound outside ast-grep-language (#kotlinsymclash).
+                assert_eq!(lang.name(), "kotlin", "language {lang} has no engine binding");
+                continue;
+            };
             assert_eq!(
                 support.to_string().to_ascii_lowercase().replace(['-', '#'], ""),
                 lang.name().replace('-', ""),
@@ -539,6 +653,62 @@ mod tests {
                 assert!(!same, "languages {a} and {b} resolve to the same grammar");
             }
         }
+    }
+}
+
+/// Exactly one Kotlin grammar may be linked (#kotlinsymclash).
+///
+/// `tree-sitter-kotlin-ng` (indexed by `tsift-graph`, bound by the engine here)
+/// and `tree-sitter-kotlin-sg` (`ast-grep-language`'s Kotlin feature) both export
+/// the C symbol `tree_sitter_kotlin`. When both were linked, the definition the
+/// linker kept decided the grammar for every caller. These tests pin the grammar
+/// the symbol resolves to by properties only kotlin-ng has.
+#[cfg(all(test, feature = "lang-kotlin"))]
+mod kotlin_grammar_pin_tests {
+    use super::*;
+    use crate::search_source;
+
+    /// Shape of `tree-sitter-kotlin-ng`; `tree-sitter-kotlin-sg` fails all three.
+    pub(crate) fn assert_is_kotlin_ng(grammar: &TSLanguage, who: &str) {
+        assert!(
+            grammar.field_id_for_name("name").is_some(),
+            "{who}: Kotlin grammar has no `name` field — the linked `tree_sitter_kotlin` \
+             is tree-sitter-kotlin-sg, not tree-sitter-kotlin-ng (#kotlinsymclash)"
+        );
+        assert_ne!(
+            grammar.id_for_node_kind("identifier", true),
+            0,
+            "{who}: Kotlin grammar has no named `identifier` kind (kotlin-ng's identifier)"
+        );
+        assert_eq!(
+            grammar.id_for_node_kind("simple_identifier", true),
+            0,
+            "{who}: Kotlin grammar has `simple_identifier` — that is tree-sitter-kotlin-sg"
+        );
+    }
+
+    #[test]
+    fn engine_kotlin_grammar_is_kotlin_ng() {
+        assert_is_kotlin_ng(&AstGrepLang::Kotlin.tree_sitter_language(), "tsift-astgrep");
+        let ng: TSLanguage = tree_sitter_kotlin_ng::LANGUAGE.into();
+        assert_eq!(
+            AstGrepLang::Kotlin.tree_sitter_language().node_kind_count(),
+            ng.node_kind_count(),
+            "the engine's Kotlin grammar must be the one tsift-graph indexes with"
+        );
+    }
+
+    #[test]
+    fn kotlin_metavariable_patterns_capture_under_kotlin_ng() {
+        // The `µ` expando must still parse as an identifier in kotlin-ng, or
+        // every metavariable pattern silently stops matching.
+        let src = "fun main() {\n    foo(1)\n    foo(bar)\n}\n";
+        let hits = search_source(src, AstGrepLang::Kotlin, "foo($A)").unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[1].captures.get("A").map(String::as_str), Some("bar"));
+        let decls = search_source(src, AstGrepLang::Kotlin, "fun $F() { $$$B }").unwrap();
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].captures.get("F").map(String::as_str), Some("main"));
     }
 }
 

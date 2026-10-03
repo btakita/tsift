@@ -58,6 +58,37 @@ uncompiled language an up-front resolution failure that names the supported set.
 - `.h` resolves to C, matching ripgrep and tree-sitter convention. C++ headers
   also use `.h`; pass `--lang cpp` to force that.
 
+### One grammar per C symbol
+
+Each tree-sitter grammar crate exports one C entry point (`tree_sitter_<lang>`).
+If two linked crates export the same one, the linker keeps whichever definition
+it reaches first, so both the indexer and the structural engine get a grammar
+chosen by link order. Kotlin had this problem: `tsift-graph` indexes with
+`tree-sitter-kotlin-ng`, and `ast-grep-language`'s Kotlin feature linked
+`tree-sitter-kotlin-sg`, which also exports `tree_sitter_kotlin`. Adding a
+module to `tsift-cli` flipped the link to -sg, and the Kotlin tag queries failed
+with "Invalid field name `name`".
+
+Since `#kotlinsymclash`, `tsift-astgrep`'s `lang-kotlin` feature never enables
+`ast-grep-language/tree-sitter-kotlin`. The engine runs on its own
+`EngineLang`, which forwards every language to `SupportLang` except Kotlin.
+Kotlin is bound to `tree-sitter-kotlin-ng` and keeps ast-grep's `µ`
+metavariable expando, which kotlin-ng's identifier rule accepts as a letter.
+Structural Kotlin patterns now parse with the same grammar the index uses.
+
+Every other grammar is shared by name: `ast-grep-language` and `tsift-graph`
+resolve to the same crate version, and an `nm` scan of all grammar archives
+linked by an `all-languages` build finds no C symbol defined twice. The
+`tsift-cli` test `kotlin_grammar_link_tests` guards this in three ways:
+
+- it asserts kotlin-ng-only grammar shape (a `name` field, no
+  `simple_identifier` kind) from both `tsift_graph::Lang::Kotlin` and
+  `AstGrepLang::Kotlin`;
+- it indexes a Kotlin snippet end to end;
+- it rejects a `Cargo.lock` that resolves more than one version of any
+  `tree-sitter-*` crate or that holds both members of a known clashing pair.
+  This check does not depend on which definition the linker keeps.
+
 ### Indexable vs structural-only
 
 A tsift `lang-*` feature fans out to up to three crates, and the set a language
