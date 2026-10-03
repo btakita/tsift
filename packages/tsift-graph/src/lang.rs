@@ -14,6 +14,16 @@ pub struct Symbol {
     pub body_end_byte: Option<usize>,
 }
 
+/// Package-manager lockfiles with an indexed extension, excluded by
+/// [`Lang::from_path`].
+const GENERATED_LOCKFILES: &[&str] = &[
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "pnpm-lock.yaml",
+    "composer.lock",
+    "deno.lock",
+];
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Lang {
@@ -45,6 +55,10 @@ pub enum Lang {
     GdScript,
     #[cfg(feature = "lang-markdown")]
     Markdown,
+    #[cfg(feature = "lang-json")]
+    Json,
+    #[cfg(feature = "lang-yaml")]
+    Yaml,
 }
 
 #[allow(dead_code)]
@@ -83,8 +97,23 @@ impl Lang {
             "gd" => Some(Self::GdScript),
             #[cfg(feature = "lang-markdown")]
             "md" | "mdx" => Some(Self::Markdown),
+            #[cfg(feature = "lang-json")]
+            "json" => Some(Self::Json),
+            #[cfg(feature = "lang-yaml")]
+            "yaml" | "yml" => Some(Self::Yaml),
             _ => None,
         }
+    }
+
+    /// Resolve a file path's language. Like [`Self::from_extension`], except
+    /// that generated lockfiles resolve to nothing: they are JSON/YAML by
+    /// extension, routinely megabytes, and never navigated by hand.
+    pub fn from_path(path: &std::path::Path) -> Option<Self> {
+        let name = path.file_name()?.to_str()?;
+        if GENERATED_LOCKFILES.contains(&name) {
+            return None;
+        }
+        Self::from_extension(path.extension()?.to_str()?)
     }
 
     pub fn tree_sitter_language(&self) -> Language {
@@ -117,6 +146,10 @@ impl Lang {
             Self::GdScript => tree_sitter_gdscript::LANGUAGE.into(),
             #[cfg(feature = "lang-markdown")]
             Self::Markdown => tsift_md_ast::markdown_language(),
+            #[cfg(feature = "lang-json")]
+            Self::Json => tree_sitter_json::LANGUAGE.into(),
+            #[cfg(feature = "lang-yaml")]
+            Self::Yaml => tree_sitter_yaml::LANGUAGE.into(),
         }
     }
 
@@ -150,6 +183,10 @@ impl Lang {
             Self::GdScript => "gdscript",
             #[cfg(feature = "lang-markdown")]
             Self::Markdown => "markdown",
+            #[cfg(feature = "lang-json")]
+            Self::Json => "json",
+            #[cfg(feature = "lang-yaml")]
+            Self::Yaml => "yaml",
         }
     }
 
@@ -313,6 +350,12 @@ impl Lang {
                 (fenced_code_block (info_string (language) @code_block.name))
             "#
             }
+            // Contract documents are projected by `crate::contract`, not by a
+            // query; these only have to compile against the grammar.
+            #[cfg(feature = "lang-json")]
+            Self::Json => "(pair key: (string) @key.name)",
+            #[cfg(feature = "lang-yaml")]
+            Self::Yaml => "(block_mapping_pair key: (_) @key.name)",
         }
     }
 
@@ -424,6 +467,14 @@ impl Lang {
                 .into_iter()
                 .map(md_symbol_to_symbol)
                 .collect());
+        }
+        #[cfg(any(feature = "lang-json", feature = "lang-yaml"))]
+        if let Some(root) = self.lower_contract(&tree, source) {
+            return Ok(crate::contract::project(&root));
+        }
+        #[cfg(any(feature = "lang-json", feature = "lang-yaml"))]
+        if self.is_contract_format() {
+            return Ok(Vec::new());
         }
         let query = Query::new(&ts_lang, self.symbol_query())?;
         let mut cursor = QueryCursor::new();
@@ -564,7 +615,42 @@ impl Lang {
             Self::GdScript,
             #[cfg(feature = "lang-markdown")]
             Self::Markdown,
+            #[cfg(feature = "lang-json")]
+            Self::Json,
+            #[cfg(feature = "lang-yaml")]
+            Self::Yaml,
         ]
+    }
+
+    /// Whether this is a data format whose symbols come from the contract
+    /// projection (JSON Schema / OpenAPI / AsyncAPI) rather than a query.
+    pub fn is_contract_format(&self) -> bool {
+        #[cfg(feature = "lang-json")]
+        if *self == Self::Json {
+            return true;
+        }
+        #[cfg(feature = "lang-yaml")]
+        if *self == Self::Yaml {
+            return true;
+        }
+        false
+    }
+
+    /// Lower a parsed JSON/YAML tree into the contract value tree; `None` for
+    /// every other language, or a document with no value in it.
+    #[cfg(any(feature = "lang-json", feature = "lang-yaml"))]
+    pub(crate) fn lower_contract(
+        &self,
+        tree: &tree_sitter::Tree,
+        source: &[u8],
+    ) -> Option<crate::contract::Value> {
+        match self {
+            #[cfg(feature = "lang-json")]
+            Self::Json => crate::contract::lower_json(tree.root_node(), source),
+            #[cfg(feature = "lang-yaml")]
+            Self::Yaml => crate::contract::lower_yaml(tree.root_node(), source),
+            _ => None,
+        }
     }
 
     /// Whether this language is prose rather than code. A document language is
@@ -712,6 +798,13 @@ mod tests {
     #[test]
     fn test_unknown_extension_returns_none() {
         assert!(Lang::from_extension("xyz").is_none());
+        #[cfg(feature = "lang-json")]
+        {
+            use std::path::Path;
+            assert_eq!(Lang::from_path(Path::new("a/schema.json")), Some(Lang::Json));
+            assert_eq!(Lang::from_path(Path::new("a/package-lock.json")), None);
+            assert_eq!(Lang::from_path(Path::new("Makefile")), None);
+        }
         assert!(Lang::from_extension("").is_none());
         assert!(Lang::from_extension("txt").is_none());
     }

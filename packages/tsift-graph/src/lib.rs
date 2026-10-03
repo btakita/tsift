@@ -8,6 +8,8 @@ use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
 use tsift_core::{GraphEdge, GraphNode, GraphProjection, GraphProvenance};
 
 pub mod lang;
+#[cfg(any(feature = "lang-json", feature = "lang-yaml"))]
+mod contract;
 pub use lang::{Lang, Symbol};
 
 pub mod complexity;
@@ -148,6 +150,19 @@ struct PendingRoute {
 }
 
 pub fn extract_call_sites(lang: Lang, source: &[u8]) -> Result<Vec<CallSite>> {
+    // A contract document's `$ref` pointers are its call sites.
+    #[cfg(any(feature = "lang-json", feature = "lang-yaml"))]
+    if lang.is_contract_format() {
+        let mut parser = Parser::new();
+        parser.set_language(&lang.tree_sitter_language())?;
+        let tree = parser
+            .parse(source, None)
+            .ok_or_else(|| anyhow::anyhow!("parse failed"))?;
+        return Ok(lang
+            .lower_contract(&tree, source)
+            .map(|root| contract::ref_sites(&root))
+            .unwrap_or_default());
+    }
     let query_str = match lang.call_query() {
         Some(q) => q,
         None => return Ok(Vec::new()),
@@ -554,7 +569,14 @@ fn resolve_edges_uncached(symbols: &[Symbol], call_sites: &[CallSite]) -> Vec<Ca
         let caller = symbols
             .iter()
             .filter(|s| {
-                matches!(s.kind.as_str(), "function" | "method" | "class" | "mod")
+                matches!(
+                    s.kind.as_str(),
+                    "function" | "method" | "class" | "mod"
+                    // Contract nodes whose `$ref`s are their call sites
+                    // (`crate::contract`). A property is not a caller: its
+                    // refs belong to the schema that declares it.
+                    | "schema" | "operation" | "channel" | "message" | "component"
+                )
             })
             .filter(|s| site.line >= s.line && site.line <= s.end_line)
             .min_by_key(|s| s.end_line - s.line);

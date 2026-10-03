@@ -149,6 +149,24 @@ const CASES: &[Case] = &[
         expect_kind: "heading",
         truncated: "```\nunclosed fence\n",
     },
+    #[cfg(feature = "lang-json")]
+    Case {
+        lang: Lang::Json,
+        extensions: &["json"],
+        source: "{\"openapi\": \"3.1.0\", \"paths\": {\"/x\": {\"get\": {\"operationId\": \"getX\"}}}}\n",
+        expect_name: "getX",
+        expect_kind: "operation",
+        truncated: "{\"$schema\": \"x\", \"$defs\": {\"A\": {",
+    },
+    #[cfg(feature = "lang-yaml")]
+    Case {
+        lang: Lang::Yaml,
+        extensions: &["yaml", "yml"],
+        source: "asyncapi: 3.0.0\nchannels:\n  chatMessage:\n    address: chat.message\n",
+        expect_name: "chatMessage",
+        expect_kind: "channel",
+        truncated: "openapi: 3.0.0\npaths:\n  /x:\n    get: {operationId: [",
+    },
 ];
 
 /// Invariants that must hold for every extracted symbol, in every language.

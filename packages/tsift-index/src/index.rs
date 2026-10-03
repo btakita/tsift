@@ -1136,11 +1136,7 @@ impl IndexDb {
                         delete_fts.execute(rusqlite::params![&path_str])?;
                         delete_edges.execute(rusqlite::params![&path_str])?;
                         delete_routes.execute(rusqlite::params![&path_str])?;
-                        let lang = change
-                            .path
-                            .extension()
-                            .and_then(|e| e.to_str())
-                            .and_then(Lang::from_extension);
+                        let lang = Lang::from_path(&change.path);
                         if let Some(lang) = lang {
                             let lang_name = lang.name();
                             let source = warning_on_error(

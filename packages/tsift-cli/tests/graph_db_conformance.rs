@@ -545,8 +545,13 @@ fn attach_required_convex_indexes(snapshot: &mut Value) {
     snapshot["indexes"] = required_convex_indexes_json();
 }
 
+/// Snapshots go under the hidden `.tsift/` state dir: `.json` is an indexed
+/// extension, so a snapshot in the project tree would itself become a new
+/// graph node and perturb the sync under test.
 fn write_snapshot(project: &Path, name: &str, snapshot: &Value) -> PathBuf {
-    let path = project.join(name);
+    let dir = project.join(".tsift");
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
     fs::write(&path, serde_json::to_vec_pretty(snapshot).unwrap()).unwrap();
     path
 }

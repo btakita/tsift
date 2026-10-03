@@ -150,6 +150,12 @@ pub fn identifier_node_kinds(lang: Lang) -> &'static [&'static str] {
         // Markdown has headings, not identifiers; `rename_heading` is its kind.
         #[cfg(feature = "lang-markdown")]
         Lang::Markdown => &[],
+        // Contract keys are data, not identifiers; renaming a schema means
+        // rewriting its `$ref` pointers, which is not a structural rename.
+        #[cfg(feature = "lang-json")]
+        Lang::Json => &[],
+        #[cfg(feature = "lang-yaml")]
+        Lang::Yaml => &[],
     }
 }
 
@@ -1843,7 +1849,9 @@ export type { Beta };
         // empty set and make every rename in that language a no-op.
         for lang in Lang::all() {
             let kinds = identifier_node_kinds(lang);
-            if lang.name() == "markdown" {
+            // Prose and data formats have no identifiers to rename.
+            if lang.is_document() || lang.is_contract_format() {
+                assert!(kinds.is_empty(), "{} declares identifier kinds", lang.name());
                 continue;
             }
             assert!(

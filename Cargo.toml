@@ -47,7 +47,7 @@ tsift-tokensave = { path = "packages/tsift-tokensave", version = "0.1.102" }
 tsift-libsql = { path = "packages/tsift-libsql", version = "0.1.102", optional = true }
 
 [features]
-default = ["cli", "lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-csharp", "lang-cpp", "lang-gdscript", "lang-markdown"]
+default = ["cli", "lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-csharp", "lang-cpp", "lang-gdscript", "lang-markdown", "lang-json", "lang-yaml"]
 backend-libsql = ["dep:tsift-libsql"]
 backend-surrealdb = ["cli", "tsift-cli/backend-surrealdb"]
 cli = ["dep:tsift-cli"]
@@ -63,6 +63,10 @@ lang-csharp = ["tsift-astgrep/lang-csharp", "tsift-graph/lang-csharp", "tsift-se
 lang-cpp = ["tsift-astgrep/lang-cpp", "tsift-graph/lang-cpp", "tsift-search/lang-cpp"]
 lang-gdscript = ["tsift-graph/lang-gdscript", "tsift-search/lang-gdscript"]
 lang-markdown = ["tsift-astgrep/lang-markdown", "tsift-graph/lang-markdown", "tsift-search/lang-markdown"]
+# JSON/YAML index only their API contracts (JSON Schema, OpenAPI, AsyncAPI);
+# any other document is full-text searchable with no symbols.
+lang-json = ["tsift-astgrep/lang-json", "tsift-graph/lang-json", "tsift-search/lang-json"]
+lang-yaml = ["tsift-astgrep/lang-yaml", "tsift-graph/lang-yaml", "tsift-search/lang-yaml"]
 # Structural-only languages. These fan out to `tsift-astgrep` ONLY: ast-grep can
 # match and rewrite them, but `tsift-graph`/`tsift-search` have no tag queries
 # for them, so they are not indexable, not searchable, and have no semantic-edit
@@ -77,7 +81,6 @@ lang-haskell = ["tsift-astgrep/lang-haskell"]
 lang-hcl = ["tsift-astgrep/lang-hcl"]
 lang-html = ["tsift-astgrep/lang-html"]
 lang-java = ["tsift-astgrep/lang-java"]
-lang-json = ["tsift-astgrep/lang-json"]
 lang-lua = ["tsift-astgrep/lang-lua"]
 lang-nix = ["tsift-astgrep/lang-nix"]
 lang-php = ["tsift-astgrep/lang-php"]
@@ -85,7 +88,6 @@ lang-ruby = ["tsift-astgrep/lang-ruby"]
 lang-scala = ["tsift-astgrep/lang-scala"]
 lang-solidity = ["tsift-astgrep/lang-solidity"]
 lang-swift = ["tsift-astgrep/lang-swift"]
-lang-yaml = ["tsift-astgrep/lang-yaml"]
 all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-gdscript", "lang-markdown", "lang-c", "lang-cpp", "lang-csharp", "lang-css", "lang-dart", "lang-elixir", "lang-go", "lang-haskell", "lang-hcl", "lang-html", "lang-java", "lang-json", "lang-lua", "lang-nix", "lang-php", "lang-ruby", "lang-scala", "lang-solidity", "lang-swift", "lang-yaml"]
 
 [dev-dependencies]

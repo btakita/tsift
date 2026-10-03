@@ -65,9 +65,9 @@ reaches is what it can actually do:
 
 | Fans out to | Meaning | Languages |
 |---|---|---|
-| `tsift-astgrep` + `tsift-graph` + `tsift-search` | Indexable **and** structural. Searchable, graphable, and eligible for the symbol-resolved edit kinds | rust, python, typescript, javascript, kotlin, bash, go, csharp, cpp, markdown |
+| `tsift-astgrep` + `tsift-graph` + `tsift-search` | Indexable **and** structural. Searchable, graphable, and eligible for the symbol-resolved edit kinds | rust, python, typescript, javascript, kotlin, bash, go, csharp, cpp, markdown, json, yaml |
 | `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig, gdscript — `ast-grep-language` ships no Zig or GDScript grammar |
-| `tsift-astgrep` only | **Structural-only**: `ast-grep search`/`rewrite` and the `structural_rewrite` edit intent work; the language is not indexed, not searchable, and not graphable | c, css, dart, elixir, haskell, hcl, html, java, json, lua, nix, php, ruby, scala, solidity, swift, yaml |
+| `tsift-astgrep` only | **Structural-only**: `ast-grep search`/`rewrite` and the `structural_rewrite` edit intent work; the language is not indexed, not searchable, and not graphable | c, css, dart, elixir, haskell, hcl, html, java, lua, nix, php, ruby, scala, solidity, swift |
 
 Structural-only is a deliberate tier, not an oversight. A tree-sitter grammar is
 enough to match and rewrite a shape, but indexing additionally needs per-language
@@ -104,6 +104,34 @@ pointer and reference declarators) to the declaration that owns them, so a
 caller's body is inside it and call edges resolve. `.c` stays structural-only.
 C++ is indexed for search and graph, but `rename_symbol` is not promoted: its
 semantic-edit contract stays structural until a C++ target matcher exists.
+
+JSON and YAML followed under `#sdktsiftcontracts`, as data rather than code.
+`.json`, `.yaml`, and `.yml` are indexed, but symbols come only from API
+contracts, through a projection (`tsift-graph::contract`) rather than a tag
+query. A document is a contract when its root has `openapi`/`swagger`,
+`asyncapi`, or a JSON Schema marker (`$schema`, `$defs`, `definitions`, or
+`$id` with `type`/`properties`). It then yields:
+
+- **JSON Schema:** the root schema named by its `title`, each `$defs` /
+  `definitions` entry as a `schema`, and properties as `Owner.property`
+  (recursing through `items`, `allOf`/`anyOf`/`oneOf`, and the rest of the
+  sub-schema keywords).
+- **OpenAPI:** each route as a `path`; each method as an `operation`, named by
+  its `operationId` or `METHOD /route`; `components.schemas` as schemas; every
+  other component as a `component`.
+- **AsyncAPI:** `channel`s, their `message`s, v2 `publish`/`subscribe` and v3
+  `operations` as `operation`s, and components as above.
+
+Every `$ref` with a JSON-pointer fragment is a call site whose callee is the
+pointer's last segment (`#/components/schemas/Chat` → `Chat`), so `graph
+--callers Chat` lists the operations and schemas that reference it. A property
+is not a caller; its refs are attributed to the schema declaring it. A ref to a
+whole external file has no in-document name and yields no edge. Any other JSON
+or YAML document (`package.json`, a CI workflow) yields no symbols and is still
+full-text indexed. Package-manager lockfiles (`package-lock.json`,
+`pnpm-lock.yaml`, ...) are excluded by `Lang::from_path`, because they are
+large, generated, and never navigated. Contract keys are not identifiers, so
+`rename_symbol` does not apply to either format.
 
 Promoting a structural-only language therefore means adding the graph/search
 side. That unlocks `rename_symbol` immediately — it reads occurrences out of the

@@ -93,7 +93,7 @@ pub fn walk_files_with_skips_excluding(
         }
         let path = dir_entry.path();
         let ext = path.extension().and_then(|e| e.to_str());
-        let lang = match ext.and_then(Lang::from_extension) {
+        let lang = match Lang::from_path(path) {
             Some(l) => l,
             None => {
                 skips.record(ext);
@@ -158,7 +158,7 @@ pub fn walk_files_pruned_excluding(
         }
 
         let ext = path.extension().and_then(|e| e.to_str());
-        let lang = match ext.and_then(Lang::from_extension) {
+        let lang = match Lang::from_path(path) {
             Some(l) => l,
             None => {
                 skips.record(ext);
@@ -225,7 +225,8 @@ mod tests {
         fs::write(root.join("lib.py"), "def hello(): pass").unwrap();
         fs::write(root.join("app.tsx"), "export default () => <div/>").unwrap();
         fs::write(root.join("notes.txt"), "not a code file").unwrap();
-        fs::write(root.join("data.json"), "{}").unwrap();
+        fs::write(root.join("data.bin"), "\0").unwrap();
+        fs::write(root.join("package-lock.json"), "{}").unwrap();
         fs::create_dir_all(root.join("sub")).unwrap();
         fs::write(root.join("sub/mod.rs"), "pub mod inner;").unwrap();
         dir
@@ -244,7 +245,9 @@ mod tests {
         assert!(names.contains(&"app.tsx".to_string()));
         assert!(names.contains(&"mod.rs".to_string()));
         assert!(!names.contains(&"notes.txt".to_string()));
-        assert!(!names.contains(&"data.json".to_string()));
+        assert!(!names.contains(&"data.bin".to_string()));
+        // Indexed by extension, excluded by name as a generated lockfile.
+        assert!(!names.contains(&"package-lock.json".to_string()));
     }
 
     #[test]
