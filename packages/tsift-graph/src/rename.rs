@@ -134,6 +134,9 @@ pub fn identifier_node_kinds(lang: Lang) -> &'static [&'static str] {
         Lang::Go => &["identifier", "type_identifier", "field_identifier"],
         #[cfg(feature = "lang-csharp")]
         Lang::CSharp => &["identifier"],
+        // C splits names like C++ below, without namespaces.
+        #[cfg(feature = "lang-c")]
+        Lang::C => &["identifier", "type_identifier", "field_identifier"],
         // C++ splits names by position like Go: members are `field_identifier`,
         // types `type_identifier`, namespaces `namespace_identifier`.
         #[cfg(feature = "lang-cpp")]

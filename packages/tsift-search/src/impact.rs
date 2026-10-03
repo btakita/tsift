@@ -434,6 +434,8 @@ fn is_import_line(lang: Lang, line: &str) -> bool {
         }
         #[cfg(feature = "lang-csharp")]
         Lang::CSharp => trimmed.starts_with("using ") || trimmed.starts_with("global using "),
+        #[cfg(feature = "lang-c")]
+        Lang::C => trimmed.starts_with("#include "),
         #[cfg(feature = "lang-cpp")]
         Lang::Cpp => trimmed.starts_with("#include ") || trimmed.starts_with("import "),
         // GDScript has no `import`: a script pulls in another script by

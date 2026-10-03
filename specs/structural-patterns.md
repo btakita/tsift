@@ -65,9 +65,9 @@ reaches is what it can actually do:
 
 | Fans out to | Meaning | Languages |
 |---|---|---|
-| `tsift-astgrep` + `tsift-graph` + `tsift-search` | Indexable **and** structural. Searchable, graphable, and eligible for the symbol-resolved edit kinds | rust, python, typescript, javascript, kotlin, bash, go, csharp, cpp, markdown, json, yaml |
+| `tsift-astgrep` + `tsift-graph` + `tsift-search` | Indexable **and** structural. Searchable, graphable, and eligible for the symbol-resolved edit kinds | rust, python, typescript, javascript, kotlin, bash, go, csharp, c, cpp, markdown, json, yaml |
 | `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig, gdscript — `ast-grep-language` ships no Zig or GDScript grammar |
-| `tsift-astgrep` only | **Structural-only**: `ast-grep search`/`rewrite` and the `structural_rewrite` edit intent work; the language is not indexed, not searchable, and not graphable | c, css, dart, elixir, haskell, hcl, html, java, lua, nix, php, ruby, scala, solidity, swift |
+| `tsift-astgrep` only | **Structural-only**: `ast-grep search`/`rewrite` and the `structural_rewrite` edit intent work; the language is not indexed, not searchable, and not graphable | css, dart, elixir, haskell, hcl, html, java, lua, nix, php, ruby, scala, solidity, swift |
 
 Structural-only is a deliberate tier, not an oversight. A tree-sitter grammar is
 enough to match and rewrite a shape, but indexing additionally needs per-language
@@ -101,9 +101,25 @@ Header prototypes and member declarations count as symbols, because a header
 declares most of a C++ API without bodies. A symbol's extent climbs from its
 name through the declarators (`function_declarator`, `qualified_identifier`,
 pointer and reference declarators) to the declaration that owns them, so a
-caller's body is inside it and call edges resolve. `.c` stays structural-only.
+caller's body is inside it and call edges resolve.
 C++ is indexed for search and graph, but `rename_symbol` is not promoted: its
 semantic-edit contract stays structural until a C++ target matcher exists.
+
+C followed under `#cindex`, with the `tree-sitter-c` grammar. `.c` files
+contribute struct, union, enum, enumerator, typedef (`type_alias`, including
+pointer and function-pointer typedefs), function, field, global (`variable`),
+and macro symbols. Prototypes count as symbols like C++ header declarations,
+including pointer-returning ones. A global is a file-scope declaration, also
+under `#if`/`#ifdef`/`#else`, so function locals stay out; a `#define` is a
+macro only when it has a value or parameters, so include guards stay out. Calls
+are plain `f()` and function-pointer members `p->f()`. The extent climb is the
+C++ one plus `init_declarator`, `array_declarator`, and
+`parenthesized_declarator`. Indexing keeps `.h` on C++: the extension cannot
+tell a C header from a C++ one, and the C++ grammar parses both while the C
+grammar fails on classes and namespaces (a build without `lang-cpp` reads `.h`
+as C). This differs on purpose from the ast-grep side above, where `.h`
+resolves to C for pattern matching. `rename_symbol` stays structural for C,
+as for C++.
 
 JSON and YAML followed under `#sdktsiftcontracts`, as data rather than code.
 `.json`, `.yaml`, and `.yml` are indexed, but symbols come only from API

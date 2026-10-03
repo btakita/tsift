@@ -49,6 +49,8 @@ pub enum Lang {
     Go,
     #[cfg(feature = "lang-csharp")]
     CSharp,
+    #[cfg(feature = "lang-c")]
+    C,
     #[cfg(feature = "lang-cpp")]
     Cpp,
     #[cfg(feature = "lang-gdscript")]
@@ -87,8 +89,14 @@ impl Lang {
             "go" => Some(Self::Go),
             #[cfg(feature = "lang-csharp")]
             "cs" => Some(Self::CSharp),
-            // `.h` is read as C++: the tree-sitter C++ grammar parses C headers
-            // too, and C has no indexed grammar of its own here.
+            #[cfg(feature = "lang-c")]
+            "c" => Some(Self::C),
+            // `.h` is read as C++: the extension cannot tell a C header from a
+            // C++ one, and the C++ grammar parses both, while the C grammar
+            // fails on a C++ header's classes and namespaces. A build without
+            // C++ falls back to reading `.h` as C.
+            #[cfg(all(feature = "lang-c", not(feature = "lang-cpp")))]
+            "h" => Some(Self::C),
             #[cfg(feature = "lang-cpp")]
             "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h" | "inl" | "ipp" => {
                 Some(Self::Cpp)
@@ -140,6 +148,8 @@ impl Lang {
             Self::Go => tree_sitter_go::LANGUAGE.into(),
             #[cfg(feature = "lang-csharp")]
             Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+            #[cfg(feature = "lang-c")]
+            Self::C => tree_sitter_c::LANGUAGE.into(),
             #[cfg(feature = "lang-cpp")]
             Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
             #[cfg(feature = "lang-gdscript")]
@@ -177,6 +187,8 @@ impl Lang {
             Self::Go => "go",
             #[cfg(feature = "lang-csharp")]
             Self::CSharp => "csharp",
+            #[cfg(feature = "lang-c")]
+            Self::C => "c",
             #[cfg(feature = "lang-cpp")]
             Self::Cpp => "cpp",
             #[cfg(feature = "lang-gdscript")]
@@ -291,6 +303,76 @@ impl Lang {
                 (local_function_statement name: (identifier) @function.name)
                 (property_declaration name: (identifier) @property.name)
                 (enum_member_declaration name: (identifier) @enum_member.name)
+            "#
+            }
+            #[cfg(feature = "lang-c")]
+            Self::C => {
+                // Same shape as C++ minus classes, namespaces, and qualified
+                // names. Only a specifier with a body defines a type, prototypes
+                // count because a header declares a C API without bodies, and a
+                // global is a file-scope declaration (also under `#if`/`#ifdef`)
+                // so function locals stay out. A `#define` is a macro only with a
+                // value, which leaves include guards out.
+                r#"
+                (struct_specifier name: (type_identifier) @struct.name body: (field_declaration_list))
+                (union_specifier name: (type_identifier) @union.name body: (field_declaration_list))
+                (enum_specifier name: (type_identifier) @enum.name body: (enumerator_list))
+                (enumerator name: (identifier) @enum_member.name)
+                (type_definition declarator: (type_identifier) @type_alias.name)
+                (type_definition declarator: (pointer_declarator declarator: (type_identifier) @type_alias.name))
+                (type_definition declarator: (function_declarator declarator: (parenthesized_declarator (pointer_declarator declarator: (type_identifier) @type_alias.name))))
+                (function_definition declarator: (function_declarator declarator: (identifier) @function.name))
+                (function_definition declarator: (pointer_declarator declarator: (function_declarator declarator: (identifier) @function.name)))
+                (function_definition declarator: (pointer_declarator declarator: (pointer_declarator declarator: (function_declarator declarator: (identifier) @function.name))))
+                (declaration declarator: (function_declarator declarator: (identifier) @function.name))
+                (declaration declarator: (pointer_declarator declarator: (function_declarator declarator: (identifier) @function.name)))
+                (declaration declarator: (pointer_declarator declarator: (pointer_declarator declarator: (function_declarator declarator: (identifier) @function.name))))
+                (field_declaration declarator: (field_identifier) @field.name)
+                (field_declaration declarator: (pointer_declarator declarator: (field_identifier) @field.name))
+                (field_declaration declarator: (array_declarator declarator: (field_identifier) @field.name))
+                (field_declaration declarator: (function_declarator declarator: (parenthesized_declarator (pointer_declarator declarator: (field_identifier) @field.name))))
+                (translation_unit (declaration declarator: [
+                    (identifier) @variable.name
+                    (init_declarator declarator: (identifier) @variable.name)
+                    (init_declarator declarator: (pointer_declarator declarator: (identifier) @variable.name))
+                    (init_declarator declarator: (array_declarator declarator: (identifier) @variable.name))
+                    (pointer_declarator declarator: (identifier) @variable.name)
+                    (array_declarator declarator: (identifier) @variable.name)
+                  ]))
+                (preproc_if (declaration declarator: [
+                    (identifier) @variable.name
+                    (init_declarator declarator: (identifier) @variable.name)
+                    (init_declarator declarator: (pointer_declarator declarator: (identifier) @variable.name))
+                    (init_declarator declarator: (array_declarator declarator: (identifier) @variable.name))
+                    (pointer_declarator declarator: (identifier) @variable.name)
+                    (array_declarator declarator: (identifier) @variable.name)
+                  ]))
+                (preproc_ifdef (declaration declarator: [
+                    (identifier) @variable.name
+                    (init_declarator declarator: (identifier) @variable.name)
+                    (init_declarator declarator: (pointer_declarator declarator: (identifier) @variable.name))
+                    (init_declarator declarator: (array_declarator declarator: (identifier) @variable.name))
+                    (pointer_declarator declarator: (identifier) @variable.name)
+                    (array_declarator declarator: (identifier) @variable.name)
+                  ]))
+                (preproc_else (declaration declarator: [
+                    (identifier) @variable.name
+                    (init_declarator declarator: (identifier) @variable.name)
+                    (init_declarator declarator: (pointer_declarator declarator: (identifier) @variable.name))
+                    (init_declarator declarator: (array_declarator declarator: (identifier) @variable.name))
+                    (pointer_declarator declarator: (identifier) @variable.name)
+                    (array_declarator declarator: (identifier) @variable.name)
+                  ]))
+                (preproc_elif (declaration declarator: [
+                    (identifier) @variable.name
+                    (init_declarator declarator: (identifier) @variable.name)
+                    (init_declarator declarator: (pointer_declarator declarator: (identifier) @variable.name))
+                    (init_declarator declarator: (array_declarator declarator: (identifier) @variable.name))
+                    (pointer_declarator declarator: (identifier) @variable.name)
+                    (array_declarator declarator: (identifier) @variable.name)
+                  ]))
+                (preproc_def name: (identifier) @macro.name value: (preproc_arg))
+                (preproc_function_def name: (identifier) @macro.name)
             "#
             }
             #[cfg(feature = "lang-cpp")]
@@ -409,6 +491,15 @@ impl Lang {
 (invocation_expression function: (member_access_expression name: (generic_name (identifier) @call.name)))
 "#,
             ),
+            #[cfg(feature = "lang-c")]
+            Self::C => Some(
+                // `obj.f()` / `ptr->f()` through a function-pointer member is a
+                // `field_expression`, like C++ minus the qualified/template forms.
+                r#"
+(call_expression function: (identifier) @call.name)
+(call_expression function: (field_expression field: (field_identifier) @call.name))
+"#,
+            ),
             #[cfg(feature = "lang-cpp")]
             Self::Cpp => Some(
                 // `obj.f()` / `ptr->f()` are `field_expression`s, `ns::f()` and
@@ -497,9 +588,13 @@ impl Lang {
                         .to_string();
                     #[allow(unused_mut)]
                     let mut node = symbol_node_for_capture(kind_str, capture.node);
+                    #[cfg(feature = "lang-c")]
+                    if *self == Self::C {
+                        node = c_family_declaration_for(node);
+                    }
                     #[cfg(feature = "lang-cpp")]
                     if *self == Self::Cpp {
-                        node = cpp_declaration_for(node);
+                        node = c_family_declaration_for(node);
                     }
                     let body_span = symbol_body_span(node);
                     symbols.push(Symbol {
@@ -609,6 +704,8 @@ impl Lang {
             Self::Go,
             #[cfg(feature = "lang-csharp")]
             Self::CSharp,
+            #[cfg(feature = "lang-c")]
+            Self::C,
             #[cfg(feature = "lang-cpp")]
             Self::Cpp,
             #[cfg(feature = "lang-gdscript")]
@@ -684,13 +781,14 @@ fn symbol_node_for_capture<'tree>(
     node
 }
 
-/// A C++ name sits inside declarators -- `Ns::Type::f` in a
+/// A C or C++ name sits inside declarators -- `Ns::Type::f` in a
 /// `qualified_identifier` in a `function_declarator`, possibly under a
-/// `pointer_declarator` -- so its parent spans only the signature. The symbol's
-/// extent is the declaration that owns them, or a caller's body would fall
-/// outside it and the file would have no call edges.
-#[cfg(feature = "lang-cpp")]
-fn cpp_declaration_for(mut node: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+/// `pointer_declarator`; a C global under an `init_declarator` -- so its parent
+/// spans only the signature. The symbol's extent is the declaration that owns
+/// them, or a caller's body would fall outside it and the file would have no
+/// call edges.
+#[cfg(any(feature = "lang-c", feature = "lang-cpp"))]
+fn c_family_declaration_for(mut node: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
     while matches!(
         node.kind(),
         "function_declarator"
@@ -698,6 +796,9 @@ fn cpp_declaration_for(mut node: tree_sitter::Node<'_>) -> tree_sitter::Node<'_>
             | "pointer_declarator"
             | "reference_declarator"
             | "nested_namespace_specifier"
+            | "init_declarator"
+            | "array_declarator"
+            | "parenthesized_declarator"
     ) {
         let Some(parent) = node.parent() else {
             break;
@@ -781,6 +882,7 @@ mod tests {
             ("zsh", "bash"),
             ("go", "go"),
             ("cs", "csharp"),
+            ("c", "c"),
             ("cpp", "cpp"),
             ("h", "cpp"),
             ("hpp", "cpp"),
@@ -1249,6 +1351,123 @@ public struct Clipboard {
             call_sites.iter().any(|site| site.callee == "WriteLine"),
             "member invocations must expose their method name: {call_sites:?}"
         );
+    }
+
+    // #cindex: C is a fully indexed language, not only an ast-grep grammar.
+    // The fixture covers what a C source declares at file scope: types,
+    // typedefs (plain, pointer, function pointer), enumerators, prototypes,
+    // definitions (including a pointer-returning one), globals, and macros.
+    #[cfg(feature = "lang-c")]
+    #[test]
+    fn test_extract_c_symbols() {
+        let source = br#"#ifndef RING_H
+#define RING_H
+#include <stddef.h>
+
+#define RING_CAP 64
+#define RING_NEXT(i) (((i) + 1) % RING_CAP)
+
+struct ring_fwd;
+
+typedef int ring_count;
+typedef struct ring *ring_ptr;
+typedef void (*ring_cb)(int value);
+
+enum ring_state { RING_EMPTY, RING_FULL };
+
+union ring_word { int i; float f; };
+
+struct ring {
+    int buf[RING_CAP];
+    size_t head;
+    char *name;
+    ring_cb on_push;
+};
+
+static int ring_total = 0;
+const char *ring_label = "ring";
+int ring_slots[4];
+
+int ring_push(struct ring *r, int value);
+char *ring_name(struct ring *r);
+
+char *ring_name(struct ring *r)
+{
+    int local = 0;
+    return r->name;
+}
+#endif
+"#;
+        let symbols = Lang::C.extract_symbols(source).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        for expected in [
+            "RING_CAP", "RING_NEXT", "ring_count", "ring_ptr", "ring_cb", "ring_state",
+            "RING_EMPTY", "ring_word", "ring", "buf", "head", "name", "on_push", "ring_total",
+            "ring_label", "ring_slots", "ring_push", "ring_name",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}, got {names:?}");
+        }
+        for absent in ["ring_fwd", "RING_H", "local"] {
+            assert!(
+                !names.contains(&absent),
+                "forward declarations, include guards, and locals are not symbols: {names:?}"
+            );
+        }
+        let kind_of = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .kind
+                .clone()
+        };
+        assert_eq!(kind_of("ring"), "struct");
+        assert_eq!(kind_of("ring_word"), "union");
+        assert_eq!(kind_of("ring_state"), "enum");
+        assert_eq!(kind_of("RING_EMPTY"), "enum_member");
+        assert_eq!(kind_of("ring_count"), "type_alias");
+        assert_eq!(kind_of("ring_cb"), "type_alias");
+        assert_eq!(kind_of("ring_push"), "function");
+        assert_eq!(kind_of("ring_name"), "function");
+        assert_eq!(kind_of("head"), "field");
+        assert_eq!(kind_of("on_push"), "field");
+        assert_eq!(kind_of("ring_total"), "variable");
+        assert_eq!(kind_of("RING_NEXT"), "macro");
+        let definition = symbols
+            .iter()
+            .find(|s| s.name == "ring_name" && s.node_kind == "function_definition")
+            .unwrap_or_else(|| panic!("ring_name's extent must be its definition: {symbols:?}"));
+        assert!(definition.end_line > definition.line);
+    }
+
+    #[cfg(feature = "lang-c")]
+    #[test]
+    fn test_extract_c_call_edges() {
+        let source = br#"static int helper(void) { return 1; }
+char *lookup(struct table *t) {
+    t->on_miss(t);
+    log_line("miss");
+    helper();
+    return 0;
+}
+"#;
+        let symbols = Lang::C.extract_symbols(source).unwrap();
+        let call_sites = crate::extract_call_sites(Lang::C, source).unwrap();
+        let edges = crate::resolve_edges(&symbols, &call_sites);
+        let pairs: Vec<String> = edges
+            .iter()
+            .map(|edge| format!("{} -> {}", edge.caller, edge.callee))
+            .collect();
+        assert!(
+            pairs.contains(&"lookup -> helper".to_string()),
+            "a pointer-returning definition must own its body's calls, got {pairs:?}"
+        );
+        for callee in ["on_miss", "log_line"] {
+            assert!(
+                call_sites.iter().any(|site| site.callee == callee),
+                "plain and function-pointer member calls must expose {callee}: {call_sites:?}"
+            );
+        }
     }
 
     // #cppindex: C++ is a fully indexed language, not only an ast-grep grammar.

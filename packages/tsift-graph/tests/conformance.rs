@@ -122,6 +122,15 @@ const CASES: &[Case] = &[
         expect_kind: "method",
         truncated: "class Program { static int Main( {",
     },
+    #[cfg(feature = "lang-c")]
+    Case {
+        lang: Lang::C,
+        extensions: &["c"],
+        source: "int main(void) { return 0; }\n",
+        expect_name: "main",
+        expect_kind: "function",
+        truncated: "int main( { return",
+    },
     #[cfg(feature = "lang-cpp")]
     Case {
         lang: Lang::Cpp,
