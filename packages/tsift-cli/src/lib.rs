@@ -36922,6 +36922,7 @@ pub(crate) fn run_search_with_timeout(
     let status =
         wait_for_child_exit(&mut child, timeout).context("waiting for timed sift search worker")?;
     if status.is_none() {
+        maybe_apply_search_timeout_test_barrier()?;
         let _ = child.kill();
         let _ = child.wait();
         let _ = fs::remove_file(&output_path);
@@ -36993,6 +36994,36 @@ fn read_child_stdout(child: &mut std::process::Child) -> Result<String> {
             .context("reading search worker stdout")?;
     }
     Ok(stdout)
+}
+
+/// Test-only barrier for the timed-search timeout path (`#searchtimeoutflake`).
+///
+/// When `TSIFT_TEST_SEARCH_TIMEOUT_BARRIER_DIR` is set, the parent writes
+/// `<dir>/timed-out` once the worker has exceeded `--timeout` (the worker is
+/// still running at this point), then blocks until the test creates
+/// `<dir>/resume`. The timeout diagnosis is computed only after that, so a test
+/// can mutate the index "during the worker run" at a point that is ordered
+/// after the search precheck/autoindex, instead of guessing with a sleep.
+fn maybe_apply_search_timeout_test_barrier() -> Result<()> {
+    let Some(dir) = std::env::var_os("TSIFT_TEST_SEARCH_TIMEOUT_BARRIER_DIR") else {
+        return Ok(());
+    };
+    let dir = PathBuf::from(dir);
+    let timed_out = dir.join("timed-out");
+    fs::write(&timed_out, "")
+        .with_context(|| format!("writing search timeout barrier: {}", timed_out.display()))?;
+    let resume = dir.join("resume");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !resume.exists() {
+        if Instant::now() >= deadline {
+            bail!(
+                "search timeout test barrier never released: {}",
+                resume.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
 }
 
 pub(crate) fn maybe_apply_search_worker_test_hooks() -> Result<()> {

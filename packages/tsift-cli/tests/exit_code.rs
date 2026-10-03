@@ -9411,6 +9411,54 @@ fn search_timeout_kills_worker_process() {
     );
 }
 
+/// Run a timed `tsift search` that is guaranteed to time out, and apply
+/// `mutate` while the parent sits at the timeout barrier: after the search
+/// precheck/autoindex, after the worker has exceeded `--timeout`, while the
+/// worker is still alive, and before the timeout diagnosis is computed
+/// (`#searchtimeoutflake`). Returns the search output.
+fn run_search_timeout_with_mid_run_mutation(
+    root: &Path,
+    mutate: impl FnOnce(),
+) -> std::process::Output {
+    let barrier = tempfile::tempdir().unwrap();
+    let timed_out = barrier.path().join("timed-out");
+    let mut child = tsift_bin()
+        .env("TSIFT_TEST_SEARCH_WORKER_SLEEP_MS", "60000")
+        .env("TSIFT_TEST_SEARCH_TIMEOUT_BARRIER_DIR", barrier.path())
+        .args([
+            "search",
+            "--timeout",
+            "1",
+            "--path",
+            root.to_str().unwrap(),
+            "main",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let started = Instant::now();
+    while !timed_out.exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "search exited ({status}) before reaching the timeout barrier; stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "search never reached the timeout barrier"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    mutate();
+    fs::write(barrier.path().join("resume"), "").unwrap();
+    child.wait_with_output().unwrap()
+}
+
 #[test]
 fn search_timeout_reports_reindex_when_index_turns_stale_during_worker_run() {
     let dir = tempfile::tempdir().unwrap();
@@ -9423,35 +9471,15 @@ fn search_timeout_reports_reindex_when_index_turns_stale_during_worker_run() {
         .unwrap();
     assert!(status.success());
 
-    let source_for_writer = source.clone();
-    let writer = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(100));
-        fs::write(
-            &source_for_writer,
-            "fn helper() {}\nfn main() { helper(); }\n",
-        )
-        .unwrap();
+    let output = run_search_timeout_with_mid_run_mutation(dir.path(), || {
+        fs::write(&source, "fn helper() {}\nfn main() { helper(); }\n").unwrap();
     });
-
-    let output = tsift_bin()
-        .env("TSIFT_TEST_SEARCH_WORKER_SLEEP_MS", "5000")
-        .args([
-            "search",
-            "--timeout",
-            "1",
-            "--path",
-            dir.path().to_str().unwrap(),
-            "main",
-        ])
-        .output()
-        .unwrap();
-    writer.join().unwrap();
 
     assert!(!output.status.success(), "expected timeout failure");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("timed out after 1s"));
-    assert!(stderr.contains("index is stale"));
-    assert!(stderr.contains("Run `tsift index"));
+    assert!(stderr.contains("timed out after 1s"), "stderr: {stderr}");
+    assert!(stderr.contains("index is stale"), "stderr: {stderr}");
+    assert!(stderr.contains("Run `tsift index"), "stderr: {stderr}");
 }
 
 #[test]
@@ -9467,32 +9495,19 @@ fn search_timeout_reports_reindex_when_index_disappears_during_worker_run() {
         .unwrap();
     assert!(status.success());
 
-    let index_path_for_remover = index_path.clone();
-    let remover = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(100));
-        fs::remove_file(&index_path_for_remover).unwrap();
+    let output = run_search_timeout_with_mid_run_mutation(dir.path(), || {
+        fs::remove_file(&index_path).unwrap();
     });
-
-    let output = tsift_bin()
-        .env("TSIFT_TEST_SEARCH_WORKER_SLEEP_MS", "5000")
-        .args([
-            "search",
-            "--timeout",
-            "1",
-            "--path",
-            dir.path().to_str().unwrap(),
-            "main",
-        ])
-        .output()
-        .unwrap();
-    remover.join().unwrap();
 
     assert!(!output.status.success(), "expected timeout failure");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("timed out after 1s"));
-    assert!(stderr.contains("index is missing"));
-    assert!(stderr.contains("Run `tsift index"));
-    assert!(!stderr.contains("search root looks fresh"));
+    assert!(stderr.contains("timed out after 1s"), "stderr: {stderr}");
+    assert!(stderr.contains("index is missing"), "stderr: {stderr}");
+    assert!(stderr.contains("Run `tsift index"), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("search root looks fresh"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
