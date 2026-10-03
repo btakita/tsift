@@ -78,6 +78,8 @@ pub enum Lang {
     Yaml,
     #[cfg(feature = "lang-xsd")]
     Xsd,
+    #[cfg(feature = "lang-wsdl")]
+    Wsdl,
 }
 
 #[allow(dead_code)]
@@ -132,6 +134,8 @@ impl Lang {
             "yaml" | "yml" => Some(Self::Yaml),
             #[cfg(feature = "lang-xsd")]
             "xsd" => Some(Self::Xsd),
+            #[cfg(feature = "lang-wsdl")]
+            "wsdl" => Some(Self::Wsdl),
             _ => None,
         }
     }
@@ -189,6 +193,8 @@ impl Lang {
             Self::Yaml => tree_sitter_yaml::LANGUAGE.into(),
             #[cfg(feature = "lang-xsd")]
             Self::Xsd => tree_sitter_xml::LANGUAGE_XML.into(),
+            #[cfg(feature = "lang-wsdl")]
+            Self::Wsdl => tree_sitter_xml::LANGUAGE_XML.into(),
         }
     }
 
@@ -234,6 +240,8 @@ impl Lang {
             Self::Yaml => "yaml",
             #[cfg(feature = "lang-xsd")]
             Self::Xsd => "xsd",
+            #[cfg(feature = "lang-wsdl")]
+            Self::Wsdl => "wsdl",
         }
     }
 
@@ -528,6 +536,8 @@ impl Lang {
             // Projected by `crate::xml_contract`.
             #[cfg(feature = "lang-xsd")]
             Self::Xsd => "(STag (Name) @tag.name)",
+            #[cfg(feature = "lang-wsdl")]
+            Self::Wsdl => "(STag (Name) @tag.name)",
         }
     }
 
@@ -856,6 +866,8 @@ impl Lang {
             Self::Yaml,
             #[cfg(feature = "lang-xsd")]
             Self::Xsd,
+            #[cfg(feature = "lang-wsdl")]
+            Self::Wsdl,
         ]
     }
 
@@ -882,6 +894,10 @@ impl Lang {
     pub fn is_xml_contract(&self) -> bool {
         #[cfg(feature = "lang-xsd")]
         if *self == Self::Xsd {
+            return true;
+        }
+        #[cfg(feature = "lang-wsdl")]
+        if *self == Self::Wsdl {
             return true;
         }
         false
@@ -1166,6 +1182,8 @@ mod tests {
             // Only contract extensions are XML languages; plain `.xml` is not
             // indexed.
             assert_eq!(Lang::from_path(Path::new("a/pom.xml")), None);
+            #[cfg(feature = "lang-wsdl")]
+            assert_eq!(Lang::from_path(Path::new("a/quote.wsdl")), Some(Lang::Wsdl));
         }
         assert!(Lang::from_extension("").is_none());
         assert!(Lang::from_extension("txt").is_none());

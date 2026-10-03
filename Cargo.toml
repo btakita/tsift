@@ -47,7 +47,7 @@ tsift-tokensave = { path = "packages/tsift-tokensave", version = "0.1.102" }
 tsift-libsql = { path = "packages/tsift-libsql", version = "0.1.102", optional = true }
 
 [features]
-default = ["cli", "lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-csharp", "lang-c", "lang-cpp", "lang-odin", "lang-jai", "lang-gdscript", "lang-markdown", "lang-json", "lang-yaml", "lang-xsd"]
+default = ["cli", "lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-csharp", "lang-c", "lang-cpp", "lang-odin", "lang-jai", "lang-gdscript", "lang-markdown", "lang-json", "lang-yaml", "lang-xsd", "lang-wsdl"]
 backend-libsql = ["dep:tsift-libsql"]
 backend-surrealdb = ["cli", "tsift-cli/backend-surrealdb"]
 cli = ["dep:tsift-cli"]
@@ -70,9 +70,10 @@ lang-markdown = ["tsift-astgrep/lang-markdown", "tsift-graph/lang-markdown", "ts
 # any other document is full-text searchable with no symbols.
 lang-json = ["tsift-astgrep/lang-json", "tsift-graph/lang-json", "tsift-search/lang-json"]
 lang-yaml = ["tsift-astgrep/lang-yaml", "tsift-graph/lang-yaml", "tsift-search/lang-yaml"]
-# XML Schema is indexed through the same contract projection, over
-# tree-sitter-xml. ast-grep ships no XML grammar, so it is not structural.
+# XML Schema and WSDL are indexed through the same contract projection, over
+# tree-sitter-xml. ast-grep ships no XML grammar, so neither is structural.
 lang-xsd = ["tsift-graph/lang-xsd", "tsift-search/lang-xsd"]
+lang-wsdl = ["tsift-graph/lang-wsdl", "tsift-search/lang-wsdl"]
 # Structural-only languages. These fan out to `tsift-astgrep` ONLY: ast-grep can
 # match and rewrite them, but `tsift-graph`/`tsift-search` have no tag queries
 # for them, so they are not indexable, not searchable, and have no semantic-edit
@@ -93,6 +94,6 @@ lang-ruby = ["tsift-astgrep/lang-ruby"]
 lang-scala = ["tsift-astgrep/lang-scala"]
 lang-solidity = ["tsift-astgrep/lang-solidity"]
 lang-swift = ["tsift-astgrep/lang-swift"]
-all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-odin", "lang-jai", "lang-bash", "lang-gdscript", "lang-markdown", "lang-c", "lang-cpp", "lang-csharp", "lang-css", "lang-dart", "lang-elixir", "lang-go", "lang-haskell", "lang-hcl", "lang-html", "lang-java", "lang-json", "lang-lua", "lang-nix", "lang-php", "lang-ruby", "lang-scala", "lang-solidity", "lang-swift", "lang-yaml", "lang-xsd"]
+all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-odin", "lang-jai", "lang-bash", "lang-gdscript", "lang-markdown", "lang-c", "lang-cpp", "lang-csharp", "lang-css", "lang-dart", "lang-elixir", "lang-go", "lang-haskell", "lang-hcl", "lang-html", "lang-java", "lang-json", "lang-lua", "lang-nix", "lang-php", "lang-ruby", "lang-scala", "lang-solidity", "lang-swift", "lang-yaml", "lang-xsd", "lang-wsdl"]
 
 [dev-dependencies]

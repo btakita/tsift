@@ -203,6 +203,15 @@ const CASES: &[Case] = &[
         expect_kind: "schema",
         truncated: "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">\n  <xs:complexType name=\"Order\"><xs:sequence>",
     },
+    #[cfg(feature = "lang-wsdl")]
+    Case {
+        lang: Lang::Wsdl,
+        extensions: &["wsdl"],
+        source: "<definitions xmlns=\"http://schemas.xmlsoap.org/wsdl/\">\n  <portType name=\"QuotePort\">\n    <operation name=\"GetQuote\"/>\n  </portType>\n</definitions>\n",
+        expect_name: "QuotePort",
+        expect_kind: "interface",
+        truncated: "<description xmlns=\"http://www.w3.org/ns/wsdl\">\n  <interface name=\"Quote\"><operation name=",
+    },
 ];
 
 /// Invariants that must hold for every extracted symbol, in every language.

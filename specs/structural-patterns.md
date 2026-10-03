@@ -66,7 +66,7 @@ reaches is what it can actually do:
 | Fans out to | Meaning | Languages |
 |---|---|---|
 | `tsift-astgrep` + `tsift-graph` + `tsift-search` | Indexable **and** structural. Searchable, graphable, and eligible for the symbol-resolved edit kinds | rust, python, typescript, javascript, kotlin, bash, go, csharp, c, cpp, markdown, json, yaml |
-| `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig, odin, gdscript, jai, xsd — `ast-grep-language` ships no Zig, Odin, GDScript, Jai, or XML grammar |
+| `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig, odin, gdscript, jai, xsd, wsdl — `ast-grep-language` ships no Zig, Odin, GDScript, Jai, or XML grammar |
 | `tsift-astgrep` only | **Structural-only**: `ast-grep search`/`rewrite` and the `structural_rewrite` edit intent work; the language is not indexed, not searchable, and not graphable | css, dart, elixir, haskell, hcl, html, java, lua, nix, php, ruby, scala, solidity, swift |
 
 Structural-only is a deliberate tier, not an oversight. A tree-sitter grammar is
@@ -210,6 +210,33 @@ namespace is a built-in type (`xs:string`) and yields no site; a QName whose
 prefix is unbound yields none either. As with JSON, a property is not a
 caller, so `graph Address --callers` lists the component whose element is
 `type="tns:Address"` and the type whose `extension base="tns:Address"`.
+
+WSDL followed under `#wsdlcontract`. `.wsdl` uses the same lowering; a
+document is a contract when its root is WSDL 1.1 `definitions`
+(`http://schemas.xmlsoap.org/wsdl/`) or WSDL 2.0 `description`
+(`http://www.w3.org/ns/wsdl`). It then yields:
+
+- **Embedded schemas:** each `xs:schema` under `types`, projected through the
+  XSD dialect above, so a type or element defined inline is a symbol (and its
+  references are call sites) exactly as in a standalone `.xsd`.
+- **Messages (1.1):** `message` symbols, their `part`s as `Message.part`
+  properties.
+- **Interfaces:** 1.1 `portType` and 2.0 `interface` as `interface` symbols,
+  their operations as `Interface.operation` `operation` symbols.
+- **Bindings:** `binding` symbols, their operations as `Binding.operation`.
+- **Services:** `service` symbols, their 1.1 `port`s / 2.0 `endpoint`s as
+  `Service.port` `endpoint` symbols.
+
+QNames in `message=`, `element=`, `type=`, `binding=`, and `interface=` on
+WSDL elements are call sites, resolved like the XSD ones; values that are
+not QNames (a 2.0 binding's `type` URI, `element="#any"`) yield none, and
+extension elements (`soap:binding`, `soap:address`) are skipped. `binding`,
+`service`, and `endpoint` join the contract caller kinds, so the chain reads
+end to end: an endpoint calls its binding, a binding its port type or
+interface, a 1.1 operation its messages, a 1.1 message its parts' schema
+elements (a part is a property, so its refs belong to the message), and a 2.0
+operation its schema elements directly. `graph <Element> --callers` on an element shared
+by several operations lists each of them.
 
 Plain `.xml` is **not** indexed. Unlike `.json`, where a contract and a config
 share one extension and only the root's keys tell them apart, XML contracts

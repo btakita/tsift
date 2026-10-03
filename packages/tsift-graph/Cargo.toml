@@ -45,7 +45,7 @@ tree-sitter-xml = { version = "0.7", optional = true }
 cc = { version = "1.1", optional = true }
 
 [features]
-default = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-csharp", "lang-c", "lang-cpp", "lang-odin", "lang-jai", "lang-gdscript", "lang-markdown", "lang-json", "lang-yaml", "lang-xsd"]
+default = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-csharp", "lang-c", "lang-cpp", "lang-odin", "lang-jai", "lang-gdscript", "lang-markdown", "lang-json", "lang-yaml", "lang-xsd", "lang-wsdl"]
 lang-rust = ["dep:tree-sitter-rust"]
 lang-python = ["dep:tree-sitter-python"]
 lang-typescript = ["dep:tree-sitter-typescript"]
@@ -64,4 +64,6 @@ lang-markdown = ["dep:tsift-md-ast"]
 lang-json = ["dep:tree-sitter-json", "dep:serde_json"]
 lang-yaml = ["dep:tree-sitter-yaml", "dep:serde_json"]
 lang-xsd = ["dep:tree-sitter-xml"]
-all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-csharp", "lang-c", "lang-cpp", "lang-odin", "lang-jai", "lang-gdscript", "lang-markdown", "lang-json", "lang-yaml", "lang-xsd"]
+# A WSDL embeds XML Schema under <types>, projected by the XSD dialect.
+lang-wsdl = ["lang-xsd"]
+all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-csharp", "lang-c", "lang-cpp", "lang-odin", "lang-jai", "lang-gdscript", "lang-markdown", "lang-json", "lang-yaml", "lang-xsd", "lang-wsdl"]

@@ -27,7 +27,7 @@ tsift-summarize = { path = "../tsift-summarize", version = "0.1.102" }
 # Language features gate the per-Lang match arms in `impact::is_import_line`
 # and forward to tsift-graph so the matching tree-sitter grammars + Lang
 # variants are available. Mirrors root tsift's language feature set.
-default = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-csharp", "lang-c", "lang-cpp", "lang-odin", "lang-jai", "lang-gdscript", "lang-markdown", "lang-json", "lang-yaml", "lang-xsd"]
+default = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-csharp", "lang-c", "lang-cpp", "lang-odin", "lang-jai", "lang-gdscript", "lang-markdown", "lang-json", "lang-yaml", "lang-xsd", "lang-wsdl"]
 lang-rust = ["tsift-graph/lang-rust"]
 lang-python = ["tsift-graph/lang-python"]
 lang-typescript = ["tsift-graph/lang-typescript"]
@@ -46,7 +46,8 @@ lang-markdown = ["tsift-graph/lang-markdown"]
 lang-json = ["tsift-graph/lang-json"]
 lang-yaml = ["tsift-graph/lang-yaml"]
 lang-xsd = ["tsift-graph/lang-xsd"]
-all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-csharp", "lang-c", "lang-cpp", "lang-odin", "lang-jai", "lang-gdscript", "lang-markdown", "lang-json", "lang-yaml", "lang-xsd"]
+lang-wsdl = ["tsift-graph/lang-wsdl"]
+all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-csharp", "lang-c", "lang-cpp", "lang-odin", "lang-jai", "lang-gdscript", "lang-markdown", "lang-json", "lang-yaml", "lang-xsd", "lang-wsdl"]
 
 [dev-dependencies]
 tempfile = "3"

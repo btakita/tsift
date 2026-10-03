@@ -1,11 +1,13 @@
-//! Structural projection of XML API contracts (`#xsdcontract`).
+//! Structural projection of XML API contracts (`#xsdcontract`,
+//! `#wsdlcontract`).
 //!
-//! The XML counterpart of `crate::contract`: an XML Schema document is lowered
-//! through `crate::xml` (namespace-resolved, so `xs:`, `xsd:`, and a default
-//! namespace read alike) and projected into the nodes a reader navigates by.
-//! QName references (`type=`, `ref=`, `base=`, ...) become call sites naming
-//! the referenced component's local part, so `graph --callers` on a type lists
-//! the declarations that use it.
+//! The XML counterpart of `crate::contract`: an XML Schema or WSDL document is
+//! lowered through `crate::xml` (namespace-resolved, so `xs:`, `xsd:`, and a
+//! default namespace read alike) and projected into the nodes a reader
+//! navigates by. QName references (`type=`, `ref=`, `base=`, `message=`, ...)
+//! become call sites naming the referenced component's local part, so `graph
+//! --callers` on a type lists the declarations that use it. A WSDL's embedded
+//! `<types>` schemas go through the same XSD projection.
 
 use crate::xml::{self, Element, XSD_NS};
 use crate::{CallSite, Lang, Symbol};
@@ -82,10 +84,22 @@ pub(crate) fn project(lang: Lang, tree: &tree_sitter::Tree, source: &[u8]) -> Op
         return None;
     }
     let mut projection = Projection::default();
-    if let Some(root) = xml::lower(tree.root_node(), source)
-        && root.is(XSD_NS, "schema")
-    {
-        xsd_schema(&root, &mut projection);
+    if let Some(root) = xml::lower(tree.root_node(), source) {
+        match lang {
+            #[cfg(feature = "lang-wsdl")]
+            Lang::Wsdl => {
+                if root.is(WSDL11_NS, "definitions") {
+                    wsdl(&root, WSDL11_NS, &mut projection);
+                } else if root.is(WSDL20_NS, "description") {
+                    wsdl(&root, WSDL20_NS, &mut projection);
+                }
+            }
+            _ => {
+                if root.is(XSD_NS, "schema") {
+                    xsd_schema(&root, &mut projection);
+                }
+            }
+        }
     }
     Some(projection.finish())
 }
@@ -181,6 +195,99 @@ fn xsd_references(element: &Element, out: &mut Projection, depth: usize) {
         // `xs:union memberTypes` is a whitespace-separated QName list.
         out.reference(child, "memberTypes");
         xsd_references(child, out, depth + 1);
+    }
+}
+
+/// The WSDL 1.1 namespace.
+#[cfg(feature = "lang-wsdl")]
+pub(crate) const WSDL11_NS: &str = "http://schemas.xmlsoap.org/wsdl/";
+/// The WSDL 2.0 namespace.
+#[cfg(feature = "lang-wsdl")]
+pub(crate) const WSDL20_NS: &str = "http://www.w3.org/ns/wsdl";
+
+/// Attributes on WSDL elements whose value is a QName naming another
+/// component: a message (1.1 `input`/`output`/`fault`), a schema element or
+/// type (1.1 `part`, 2.0 message references), a binding (`port`/`endpoint`),
+/// a port type (1.1 `binding type=`), or an interface (2.0 `binding`/`service`).
+#[cfg(feature = "lang-wsdl")]
+const WSDL_QNAME_ATTRS: &[&str] = &["message", "element", "type", "binding", "interface"];
+
+/// Project a WSDL 1.1 `definitions` or 2.0 `description` root. Schemas
+/// embedded under `types` go through the XSD projection, so a type defined
+/// inline in a WSDL is a symbol like one in a standalone `.xsd`.
+#[cfg(feature = "lang-wsdl")]
+fn wsdl(root: &Element, ns: &str, out: &mut Projection) {
+    for child in &root.children {
+        if !child.in_ns(ns) {
+            continue;
+        }
+        let name = child.attr_value("name");
+        match (child.local.as_str(), name) {
+            ("types", _) => {
+                for schema in &child.children {
+                    if schema.is(XSD_NS, "schema") {
+                        xsd_schema(schema, out);
+                    }
+                }
+                continue;
+            }
+            ("message", Some(name)) => {
+                out.emit(child, name.to_string(), "message");
+                wsdl_members(child, ns, name, &["part"], "property", out);
+            }
+            ("portType" | "interface", Some(name)) => {
+                out.emit(child, name.to_string(), "interface");
+                wsdl_members(child, ns, name, &["operation"], "operation", out);
+            }
+            ("binding", Some(name)) => {
+                out.emit(child, name.to_string(), "binding");
+                wsdl_members(child, ns, name, &["operation"], "operation", out);
+            }
+            ("service", Some(name)) => {
+                out.emit(child, name.to_string(), "service");
+                wsdl_members(child, ns, name, &["port", "endpoint"], "endpoint", out);
+            }
+            _ => {}
+        }
+        wsdl_references(child, ns, out, 0);
+    }
+}
+
+/// The named children of a WSDL component, as `Owner.child` symbols.
+#[cfg(feature = "lang-wsdl")]
+fn wsdl_members(
+    parent: &Element,
+    ns: &str,
+    owner: &str,
+    locals: &[&str],
+    kind: &str,
+    out: &mut Projection,
+) {
+    for child in &parent.children {
+        if child.in_ns(ns)
+            && locals.contains(&child.local.as_str())
+            && let Some(name) = child.attr_value("name")
+        {
+            out.emit(child, format!("{owner}.{name}"), kind);
+        }
+    }
+}
+
+/// QName references on a WSDL element and its WSDL descendants. Extension
+/// elements (`soap:binding`, `soap:address`) are another vocabulary and
+/// carry none of these.
+#[cfg(feature = "lang-wsdl")]
+fn wsdl_references(element: &Element, ns: &str, out: &mut Projection, depth: usize) {
+    if depth > MAX_DEPTH || element.local == "documentation" {
+        return;
+    }
+    for attr in WSDL_QNAME_ATTRS {
+        out.reference(element, attr);
+    }
+    for child in &element.children {
+        if child.in_ns(ns) {
+            wsdl_references(child, ns, out, depth + 1);
+        }
     }
 }
 
@@ -367,5 +474,244 @@ mod tests {
         assert_eq!(address_callers, vec!["OrderType", "UsAddress"]);
         assert!(edges.contains(&("Order".to_string(), "OrderType".to_string())));
         assert!(edges.contains(&("Memo".to_string(), "Note".to_string())));
+    }
+
+    #[cfg(feature = "lang-wsdl")]
+    fn wsdl_projection(source: &str) -> Projection {
+        let lang = Lang::Wsdl;
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lang.tree_sitter_language()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        project(lang, &tree, source.as_bytes()).unwrap()
+    }
+
+    #[cfg(feature = "lang-wsdl")]
+    fn callers_of(lang: Lang, source: &str, callee: &str) -> Vec<String> {
+        let symbols = lang.extract_symbols(source.as_bytes()).unwrap();
+        let sites = crate::extract_call_sites(lang, source.as_bytes()).unwrap();
+        let mut callers: Vec<String> = crate::resolve_edges(&symbols, &sites)
+            .into_iter()
+            .filter(|edge| edge.callee == callee)
+            .map(|edge| edge.caller)
+            .collect();
+        callers.sort_unstable();
+        callers
+    }
+
+    #[cfg(feature = "lang-wsdl")]
+    const STOCK_WSDL11: &str = r#"<?xml version="1.0"?>
+<definitions name="StockQuote"
+    targetNamespace="http://example.com/stockquote.wsdl"
+    xmlns:tns="http://example.com/stockquote.wsdl"
+    xmlns:xsd1="http://example.com/stockquote.xsd"
+    xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/"
+    xmlns="http://schemas.xmlsoap.org/wsdl/">
+  <types>
+    <schema targetNamespace="http://example.com/stockquote.xsd"
+            xmlns="http://www.w3.org/2001/XMLSchema">
+      <element name="TradePriceRequest">
+        <complexType><all><element name="tickerSymbol" type="string"/></all></complexType>
+      </element>
+      <element name="TradePrice">
+        <complexType><all><element name="price" type="float"/></all></complexType>
+      </element>
+    </schema>
+  </types>
+  <message name="GetLastTradePriceInput">
+    <part name="body" element="xsd1:TradePriceRequest"/>
+  </message>
+  <message name="GetLastTradePriceOutput">
+    <part name="body" element="xsd1:TradePrice"/>
+  </message>
+  <message name="GetTradeHistoryInput">
+    <part name="body" element="xsd1:TradePriceRequest"/>
+  </message>
+  <portType name="StockQuotePortType">
+    <operation name="GetLastTradePrice">
+      <input message="tns:GetLastTradePriceInput"/>
+      <output message="tns:GetLastTradePriceOutput"/>
+    </operation>
+    <operation name="GetTradeHistory">
+      <input message="tns:GetTradeHistoryInput"/>
+    </operation>
+  </portType>
+  <binding name="StockQuoteSoapBinding" type="tns:StockQuotePortType">
+    <soap:binding style="document" transport="http://schemas.xmlsoap.org/soap/http"/>
+    <operation name="GetLastTradePrice">
+      <soap:operation soapAction="http://example.com/GetLastTradePrice"/>
+    </operation>
+  </binding>
+  <service name="StockQuoteService">
+    <documentation>My first service</documentation>
+    <port name="StockQuotePort" binding="tns:StockQuoteSoapBinding">
+      <soap:address location="http://example.com/stockquote"/>
+    </port>
+  </service>
+</definitions>
+"#;
+
+    #[cfg(feature = "lang-wsdl")]
+    #[test]
+    fn wsdl11_projects_components_and_embedded_schema() {
+        let projection = wsdl_projection(STOCK_WSDL11);
+        assert_eq!(
+            names(&projection.symbols),
+            vec![
+                pair("schema", "TradePriceRequest"),
+                pair("property", "TradePriceRequest.tickerSymbol"),
+                pair("schema", "TradePrice"),
+                pair("property", "TradePrice.price"),
+                pair("message", "GetLastTradePriceInput"),
+                pair("property", "GetLastTradePriceInput.body"),
+                pair("message", "GetLastTradePriceOutput"),
+                pair("property", "GetLastTradePriceOutput.body"),
+                pair("message", "GetTradeHistoryInput"),
+                pair("property", "GetTradeHistoryInput.body"),
+                pair("interface", "StockQuotePortType"),
+                pair("operation", "StockQuotePortType.GetLastTradePrice"),
+                pair("operation", "StockQuotePortType.GetTradeHistory"),
+                pair("binding", "StockQuoteSoapBinding"),
+                pair("operation", "StockQuoteSoapBinding.GetLastTradePrice"),
+                pair("service", "StockQuoteService"),
+                pair("endpoint", "StockQuoteService.StockQuotePort"),
+            ]
+        );
+        let port_type = projection
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == "StockQuotePortType")
+            .unwrap();
+        assert_eq!(port_type.node_kind, "portType");
+        assert!(
+            STOCK_WSDL11[port_type.start_byte..port_type.end_byte]
+                .starts_with("<portType name=\"StockQuotePortType\">")
+        );
+    }
+
+    #[cfg(feature = "lang-wsdl")]
+    #[test]
+    fn wsdl11_references_chain_service_to_schema() {
+        let lang = Lang::Wsdl;
+        // Embedded schema refs to built-ins (`string`, `float`) yield nothing.
+        assert!(callers_of(lang, STOCK_WSDL11, "string").is_empty());
+        assert_eq!(
+            callers_of(lang, STOCK_WSDL11, "TradePriceRequest"),
+            vec!["GetLastTradePriceInput", "GetTradeHistoryInput"]
+        );
+        assert_eq!(
+            callers_of(lang, STOCK_WSDL11, "GetLastTradePriceInput"),
+            vec!["StockQuotePortType.GetLastTradePrice"]
+        );
+        assert_eq!(
+            callers_of(lang, STOCK_WSDL11, "StockQuotePortType"),
+            vec!["StockQuoteSoapBinding"]
+        );
+        assert_eq!(
+            callers_of(lang, STOCK_WSDL11, "StockQuoteSoapBinding"),
+            vec!["StockQuoteService.StockQuotePort"]
+        );
+    }
+
+    #[cfg(feature = "lang-wsdl")]
+    const RESERVATION_WSDL20: &str = r##"<?xml version="1.0"?>
+<wsdl:description xmlns:wsdl="http://www.w3.org/ns/wsdl"
+    targetNamespace="http://example.com/reservation"
+    xmlns:tns="http://example.com/reservation"
+    xmlns:ghns="http://example.com/reservation/schema"
+    xmlns:wsoap="http://www.w3.org/ns/wsdl/soap">
+  <wsdl:types>
+    <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema"
+               targetNamespace="http://example.com/reservation/schema">
+      <xs:element name="checkAvailability" type="ghns:tCheckAvailability"/>
+      <xs:complexType name="tCheckAvailability">
+        <xs:sequence><xs:element name="checkInDate" type="xs:date"/></xs:sequence>
+      </xs:complexType>
+      <xs:element name="checkAvailabilityResponse" type="xs:double"/>
+    </xs:schema>
+  </wsdl:types>
+  <wsdl:interface name="reservationInterface">
+    <wsdl:operation name="opCheckAvailability" pattern="http://www.w3.org/ns/wsdl/in-out">
+      <wsdl:input messageLabel="In" element="ghns:checkAvailability"/>
+      <wsdl:output messageLabel="Out" element="ghns:checkAvailabilityResponse"/>
+    </wsdl:operation>
+    <wsdl:operation name="opQuoteAvailability" pattern="http://www.w3.org/ns/wsdl/in-out">
+      <wsdl:input messageLabel="In" element="ghns:checkAvailability"/>
+      <wsdl:output messageLabel="Out" element="#any"/>
+    </wsdl:operation>
+  </wsdl:interface>
+  <wsdl:binding name="reservationSOAPBinding" interface="tns:reservationInterface"
+      type="http://www.w3.org/ns/wsdl/soap" wsoap:protocol="http://www.w3.org/2003/05/soap/bindings/HTTP/">
+    <wsdl:operation ref="tns:opCheckAvailability" wsoap:mep="http://www.w3.org/2003/05/soap/mep/soap-response"/>
+  </wsdl:binding>
+  <wsdl:service name="reservationService" interface="tns:reservationInterface">
+    <wsdl:endpoint name="reservationEndpoint" binding="tns:reservationSOAPBinding"
+        address="http://greath.example.com/2004/reservation"/>
+  </wsdl:service>
+</wsdl:description>
+"##;
+
+    #[cfg(feature = "lang-wsdl")]
+    #[test]
+    fn wsdl20_projects_interfaces_and_operation_element_refs() {
+        let projection = wsdl_projection(RESERVATION_WSDL20);
+        assert_eq!(
+            names(&projection.symbols),
+            vec![
+                pair("schema", "checkAvailability"),
+                pair("schema", "tCheckAvailability"),
+                pair("property", "tCheckAvailability.checkInDate"),
+                pair("schema", "checkAvailabilityResponse"),
+                pair("interface", "reservationInterface"),
+                pair("operation", "reservationInterface.opCheckAvailability"),
+                pair("operation", "reservationInterface.opQuoteAvailability"),
+                pair("binding", "reservationSOAPBinding"),
+                pair("service", "reservationService"),
+                pair("endpoint", "reservationService.reservationEndpoint"),
+            ]
+        );
+        let lang = Lang::Wsdl;
+        // A schema element is called from every operation whose message
+        // references it.
+        assert_eq!(
+            callers_of(lang, RESERVATION_WSDL20, "checkAvailability"),
+            vec![
+                "reservationInterface.opCheckAvailability",
+                "reservationInterface.opQuoteAvailability",
+            ]
+        );
+        assert_eq!(
+            callers_of(lang, RESERVATION_WSDL20, "tCheckAvailability"),
+            vec!["checkAvailability"]
+        );
+        assert_eq!(
+            callers_of(lang, RESERVATION_WSDL20, "reservationInterface"),
+            vec!["reservationSOAPBinding", "reservationService"]
+        );
+        assert_eq!(
+            callers_of(lang, RESERVATION_WSDL20, "reservationSOAPBinding"),
+            vec!["reservationService.reservationEndpoint"]
+        );
+        // The binding's `type=` is a URI, and `#any` is a keyword: neither is
+        // a QName, so neither invents a callee.
+        let callees: Vec<&str> = projection
+            .sites
+            .iter()
+            .map(|site| site.callee.as_str())
+            .collect();
+        assert!(
+            !callees
+                .iter()
+                .any(|callee| callee.contains('/') || callee.contains('#'))
+        );
+    }
+
+    #[cfg(feature = "lang-wsdl")]
+    #[test]
+    fn non_wsdl_root_projects_nothing() {
+        let projection = wsdl_projection(
+            r#"<definitions xmlns="urn:not-wsdl"><message name="m"/></definitions>"#,
+        );
+        assert!(projection.symbols.is_empty());
+        assert!(projection.sites.is_empty());
     }
 }

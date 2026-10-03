@@ -1,5 +1,6 @@
-//! End-to-end coverage for the XML contract dialects (`#xsdcontract`): an
-//! indexed `.xsd` answers `graph --callers` through the real CLI.
+//! End-to-end coverage for the XML contract dialects (`#xsdcontract`,
+//! `#wsdlcontract`): an indexed `.xsd` or `.wsdl` answers `graph --callers`
+//! through the real CLI.
 
 use std::fs;
 use std::process::Command;
@@ -82,4 +83,39 @@ fn xsd_type_callers_list_type_and_base_references() {
         json.to_string().contains("orders.xsd"),
         "an XSD component must be a search candidate: {json}"
     );
+}
+
+/// `#wsdlcontract`: a schema element defined inline under a WSDL's `<types>`
+/// is a symbol, and its callers are the operations whose messages carry it.
+#[test]
+fn wsdl_schema_element_callers_span_operations() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("quote.wsdl"),
+        r#"<?xml version="1.0"?>
+<wsdl:description xmlns:wsdl="http://www.w3.org/ns/wsdl"
+    xmlns:tns="urn:quote" xmlns:q="urn:quote:schema" targetNamespace="urn:quote">
+  <wsdl:types>
+    <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema" targetNamespace="urn:quote:schema">
+      <xs:element name="QuoteRequest" type="xs:string"/>
+    </xs:schema>
+  </wsdl:types>
+  <wsdl:interface name="Quotes">
+    <wsdl:operation name="getQuote">
+      <wsdl:input element="q:QuoteRequest"/>
+    </wsdl:operation>
+    <wsdl:operation name="watchQuote">
+      <wsdl:input element="q:QuoteRequest"/>
+    </wsdl:operation>
+  </wsdl:interface>
+</wsdl:description>
+"#,
+    )
+    .unwrap();
+    let root = dir.path().to_str().unwrap();
+    index(root);
+
+    let request = callers(root, "QuoteRequest");
+    assert!(request.contains("Quotes.getQuote"), "{request}");
+    assert!(request.contains("Quotes.watchQuote"), "{request}");
 }

@@ -593,6 +593,9 @@ fn resolve_edges_uncached(symbols: &[Symbol], call_sites: &[CallSite]) -> Vec<Ca
                     // (`crate::contract`). A property is not a caller: its
                     // refs belong to the schema that declares it.
                     | "schema" | "operation" | "channel" | "message" | "component"
+                    // WSDL (`crate::xml_contract`): a binding names its port
+                    // type, a service its interface, an endpoint its binding.
+                    | "binding" | "service" | "endpoint"
                 )
             })
             .filter(|s| site.line >= s.line && site.line <= s.end_line)
