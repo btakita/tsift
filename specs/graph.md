@@ -161,7 +161,7 @@ continue to require `refresh --rebuild --json`.
 ```
 
 - `format` is optional; any other value is rejected. `source` is the import's stable id (precedence: `--source`, the file's `source`, the file's root-relative path). `nodes` is optional; `edges` is required. Ids, `from`, `to`, and `kind` must be non-empty and node ids unique, or the import fails before anything is written. Property values may be any JSON; non-strings are stored as their JSON text.
-- `join` names a node's indexed counterpart: a bare string or `{name}` matches `symbol` nodes by name (exact label, which includes qualified `Owner.member` names); `languages` narrows to symbols of those index languages; `path` narrows to one root-relative file; `path` + `line` (1-based) matches the symbol declared at that site; `path` alone matches the `file` node.
+- `join` names a node's indexed counterpart: a bare string or `{name}` matches `symbol` nodes by name (exact label, which includes qualified `Owner.member` names); `languages` narrows to symbols of those index languages; `path` narrows to one root-relative file; `path` + `line` (1-based) matches the symbol declared at that site; `path` alone matches the `file` node. `aliases` lists fallback names tried in order when `name` matches nothing.
 - **Endpoint resolution.** A declared node whose join matches is *replaced by* the indexed node(s) — imported edges hang directly off the indexed symbol, so any traversal that starts from indexed code walks into them. A join that matches more than one node links all of them (counted `ambiguous_joins`); more than 8 matches is not a join. A declared node whose join matches nothing is kept as an imported node of its own kind (`unmatched_joins`). An edge endpoint that is not a declared node id is joined by name (`matched_endpoints`); if nothing matches it becomes an `external` node (`external_endpoints`) rather than an error. Edges identical to an existing `(from, to, kind)` row are skipped (`duplicate_edges`).
 - Imported nodes get stable ids `gimp-<hash(source, local id)>` and carry `provider=tsift-graph-import`, `import_source`, `import_id`; imported edges carry `provider` and `import_source`, so `edges --property import_source=<ID>` scans one import.
 
@@ -173,7 +173,7 @@ continue to require `refresh --rebuild --json`.
 |---|---|---|---|
 | `contracts.<Stem>` | `contract` | JSON Schema titled `<Stem>` | `declared_in` → `sdk_declaration`, `declares_record` → `contract_record` |
 | `vocabularies.<Name>` | `vocabulary` | symbol `<Name>` | `declared_in` |
-| `rest."<METHOD> <path>"` | `rest_operation` | OpenAPI `operationId` (from `model.json`) | `declared_in`, `exercised_by` |
+| `rest."<METHOD> <path>"` | `rest_operation` | OpenAPI operation `<METHOD> <path>`, else its `operationId` (from `model.json`) | `declared_in`, `exercised_by` |
 | `ws.requests.<op>` / `ws.events.<type>` | `ws_request` / `ws_event` | AsyncAPI operation `<op>`/`<type>` | `declared_in`, `exercised_by` |
 | each `declared.<language>` `path:line` | `sdk_declaration` | the indexed symbol at `path:line` | — |
 | scenario `suite#id` | `conformance_scenario` | — | `in_suite` → `conformance_suite` |

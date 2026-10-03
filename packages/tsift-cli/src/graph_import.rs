@@ -106,6 +106,10 @@ pub(crate) struct JoinFields {
     /// With `path`: the 1-based line of the declaration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<i64>,
+    /// Fallback names tried in order when `name` matches nothing (e.g. an
+    /// operation known both as `GET /path` and by its `operationId`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
 }
 
 impl JoinSpec {
@@ -369,8 +373,28 @@ impl JoinIndex {
             .and_then(|detail| detail.split_whitespace().next())
     }
 
-    /// Indexed node ids this join lands on (empty = unmatched).
+    /// Indexed node ids this join lands on (empty = unmatched), trying
+    /// `name` and then each alias.
     fn resolve(&self, nodes: &[GraphNode], fields: &JoinFields) -> Vec<String> {
+        let matches = self.resolve_one(nodes, fields);
+        if !matches.is_empty() || fields.name.is_none() {
+            return matches;
+        }
+        for alias in &fields.aliases {
+            let aliased = JoinFields {
+                name: Some(alias.clone()),
+                aliases: Vec::new(),
+                ..fields.clone()
+            };
+            let matches = self.resolve_one(nodes, &aliased);
+            if !matches.is_empty() {
+                return matches;
+            }
+        }
+        Vec::new()
+    }
+
+    fn resolve_one(&self, nodes: &[GraphNode], fields: &JoinFields) -> Vec<String> {
         let candidates: Vec<usize> = match (&fields.path, fields.line, &fields.name) {
             (Some(path), Some(line), _) => self
                 .by_path_line
@@ -1048,6 +1072,7 @@ impl TraceLowering {
                     languages: Vec::new(),
                     path: Some(path),
                     line,
+                    aliases: Vec::new(),
                 })),
                 properties,
             );
@@ -1101,6 +1126,7 @@ fn contract_join(name: &str) -> Option<JoinSpec> {
         languages: contract_languages(),
         path: None,
         line: None,
+        aliases: Vec::new(),
     }))
 }
 
@@ -1110,7 +1136,7 @@ fn contract_join(name: &str) -> Option<JoinSpec> {
 /// |---|---|---|---|
 /// | `contracts.<Stem>` | `contract` | JSON Schema titled `<Stem>` | `declared_in` → `sdk_declaration`, `declares_record` → `contract_record` |
 /// | `vocabularies.<Name>` | `vocabulary` | symbol `<Name>` | `declared_in` |
-/// | `rest."<METHOD> <path>"` | `rest_operation` | OpenAPI `operationId` (from `model.json`) | `declared_in`, `exercised_by` |
+/// | `rest."<METHOD> <path>"` | `rest_operation` | OpenAPI operation `<METHOD> <path>`, else `operationId` (from `model.json`) | `declared_in`, `exercised_by` |
 /// | `ws.requests.<op>` / `ws.events.<type>` | `ws_request` / `ws_event` | AsyncAPI operation `<op>` | `declared_in`, `exercised_by` |
 /// | scenario `suite#id` | `conformance_scenario` | — | `in_suite` → `conformance_suite` |
 ///
@@ -1199,7 +1225,14 @@ pub(crate) fn lower_haiven_trace(trace: &Value, model: Option<&Value>) -> Result
             format!("rest:{operation}"),
             "rest_operation",
             operation,
-            operation_id.and_then(contract_join),
+            // The contract index names an operation by `operationId` when the
+            // description has one and `METHOD /path` otherwise; try both.
+            Some(JoinSpec::Spec(JoinFields {
+                name: Some(operation.clone()),
+                languages: contract_languages(),
+                aliases: operation_id.map(str::to_string).into_iter().collect(),
+                ..JoinFields::default()
+            })),
             properties,
         );
         lowering.declarations(&id, "rest", operation, entry.get("declared"));
@@ -1387,6 +1420,19 @@ mod tests {
         let nodes = vec![symbol("gsym-foo-ts", "Foo", "typescript", "foo.ts", 3)];
         let index = JoinIndex::build(&nodes);
         assert_eq!(index.resolve(&nodes, &fields), vec!["gsym-foo-ts"]);
+    }
+
+    #[test]
+    fn aliases_are_tried_when_the_name_matches_nothing() {
+        let nodes = vec![symbol("gsym-op", "listApps", "json", "openapi.json", 7)];
+        let index = JoinIndex::build(&nodes);
+        let fields = JoinFields {
+            name: Some("GET /apps".to_string()),
+            languages: vec!["json".to_string()],
+            aliases: vec!["listApps".to_string()],
+            ..JoinFields::default()
+        };
+        assert_eq!(index.resolve(&nodes, &fields), vec!["gsym-op"]);
     }
 
     #[test]
