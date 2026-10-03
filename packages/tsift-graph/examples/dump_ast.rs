@@ -49,6 +49,20 @@ const Result = union(enum) { ok: i32, err: []const u8 };
         4,
     );
 
+    #[cfg(feature = "lang-jai")]
+    dump(
+        "Jai",
+        Lang::Jai,
+        r#"
+#import "Basic";
+Vector2 :: struct { x: float; y: float; }
+Color :: enum u8 { RED; GREEN; }
+length :: (v: Vector2) -> float { return sqrt(v.x * v.x + v.y * v.y); }
+"#
+        .trim(),
+        4,
+    );
+
     #[cfg(feature = "lang-bash")]
     dump(
         "Bash",

@@ -440,6 +440,14 @@ fn is_import_line(lang: Lang, line: &str) -> bool {
         Lang::Cpp => trimmed.starts_with("#include ") || trimmed.starts_with("import "),
         #[cfg(feature = "lang-odin")]
         Lang::Odin => trimmed.starts_with("import ") || trimmed.starts_with("foreign import "),
+        // Jai pulls in a module with `#import "Name"` (optionally bound as
+        // `Name :: #import "Name"`) and a sibling file with `#load "file.jai"`.
+        #[cfg(feature = "lang-jai")]
+        Lang::Jai => {
+            trimmed.starts_with("#import ")
+                || trimmed.starts_with("#load ")
+                || trimmed.contains(":: #import ")
+        }
         // GDScript has no `import`: a script pulls in another script by
         // extending it or by `preload`/`load`ing a `res://` path.
         #[cfg(feature = "lang-gdscript")]
@@ -589,6 +597,15 @@ mod tests {
             &tokens,
         );
         assert_eq!(matched.into_iter().collect::<Vec<_>>(), vec!["api"]);
+    }
+
+    #[cfg(feature = "lang-jai")]
+    #[test]
+    fn jai_import_lines_are_import_and_load_directives() {
+        assert!(is_import_line(Lang::Jai, "#import \"Basic\";"));
+        assert!(is_import_line(Lang::Jai, "#load \"util.jai\";"));
+        assert!(is_import_line(Lang::Jai, "Math :: #import \"Math\";"));
+        assert!(!is_import_line(Lang::Jai, "main :: () {"));
     }
 
     #[cfg(feature = "lang-gdscript")]

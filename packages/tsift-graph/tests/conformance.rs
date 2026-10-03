@@ -149,6 +149,15 @@ const CASES: &[Case] = &[
         expect_kind: "function",
         truncated: "package main\nmain :: proc( {",
     },
+    #[cfg(feature = "lang-jai")]
+    Case {
+        lang: Lang::Jai,
+        extensions: &["jai"],
+        source: "main :: () {\n    print(\"hi\");\n}\n",
+        expect_name: "main",
+        expect_kind: "function",
+        truncated: "main :: ( {\n    print(",
+    },
     #[cfg(feature = "lang-gdscript")]
     Case {
         lang: Lang::GdScript,

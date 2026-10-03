@@ -1,6 +1,17 @@
 use anyhow::Result;
 use tree_sitter::{Language, Parser, Query, QueryCursor, StreamingIterator};
 
+// Jai has no grammar crate on crates.io: build.rs compiles the vendored
+// constantitus/tree-sitter-jai sources (MIT-0) under `vendor/tree-sitter-jai`.
+#[cfg(feature = "lang-jai")]
+unsafe extern "C" {
+    fn tree_sitter_jai() -> *const ();
+}
+
+#[cfg(feature = "lang-jai")]
+const JAI_LANGUAGE: tree_sitter_language::LanguageFn =
+    unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_jai) };
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Symbol {
     pub name: String,
@@ -55,6 +66,8 @@ pub enum Lang {
     Cpp,
     #[cfg(feature = "lang-odin")]
     Odin,
+    #[cfg(feature = "lang-jai")]
+    Jai,
     #[cfg(feature = "lang-gdscript")]
     GdScript,
     #[cfg(feature = "lang-markdown")]
@@ -105,6 +118,8 @@ impl Lang {
             }
             #[cfg(feature = "lang-odin")]
             "odin" => Some(Self::Odin),
+            #[cfg(feature = "lang-jai")]
+            "jai" => Some(Self::Jai),
             #[cfg(feature = "lang-gdscript")]
             "gd" => Some(Self::GdScript),
             #[cfg(feature = "lang-markdown")]
@@ -158,6 +173,8 @@ impl Lang {
             Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
             #[cfg(feature = "lang-odin")]
             Self::Odin => tree_sitter_odin::LANGUAGE.into(),
+            #[cfg(feature = "lang-jai")]
+            Self::Jai => JAI_LANGUAGE.into(),
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => tree_sitter_gdscript::LANGUAGE.into(),
             #[cfg(feature = "lang-markdown")]
@@ -199,6 +216,8 @@ impl Lang {
             Self::Cpp => "cpp",
             #[cfg(feature = "lang-odin")]
             Self::Odin => "odin",
+            #[cfg(feature = "lang-jai")]
+            Self::Jai => "jai",
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => "gdscript",
             #[cfg(feature = "lang-markdown")]
@@ -437,6 +456,32 @@ impl Lang {
                 (var_declaration (identifier) @variable.name)
             "#
             }
+            #[cfg(feature = "lang-jai")]
+            Self::Jai => {
+                // Every Jai declaration is `name :: value`, so the value's node
+                // decides the kind. `struct` and `union` share one node told
+                // apart by keyword, and `enum_flags` is an `enum_declaration`.
+                // Only file-scope and struct-member constants and variables are
+                // symbols: a procedure's locals would shadow its call edges. A
+                // `#type` constant is an alias; `Handle :: u32` stays a const
+                // because it parses exactly like `MAX :: OTHER_MAX`. The grammar
+                // tags only `x` in `x, y: float` as `name` (and tags a bare
+                // value identifier too), so constants and variables match every
+                // direct identifier and `jai_is_declared_name` drops the values.
+                r#"
+                (procedure_declaration name: (identifier) @function.name)
+                (struct_declaration name: (identifier) @struct.name (struct_or_union "struct"))
+                (struct_declaration name: (identifier) @union.name (struct_or_union "union"))
+                (enum_declaration name: (identifier) @enum.name)
+                (enum_field . (identifier) @enum_member.name)
+                (import name: (identifier) @mod.name)
+                (source_file (statement (declarations_that_require_a_semicolon (const_declaration (identifier) @type_alias.name (types (type_literal))))))
+                (source_file (statement (declarations_that_require_a_semicolon (const_declaration (identifier) @const.name))))
+                (source_file (statement (declarations_that_require_a_semicolon (variable_declaration (identifier) @variable.name))))
+                (struct_or_union_block (const_declaration (identifier) @const.name))
+                (struct_or_union_block (variable_declaration (identifier) @field.name))
+            "#
+            }
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => {
                 // `class_name Foo` declares the script's own type and is the
@@ -556,6 +601,15 @@ impl Lang {
 (call_expression function: (identifier) @call.name)
 "#,
             ),
+            #[cfg(feature = "lang-jai")]
+            Self::Jai => Some(
+                // `Module.proc()` and `value.method()` are `member_expression`s;
+                // the callee is the last identifier in the chain.
+                r#"
+(call_expression function: (identifier) @call.name)
+(call_expression function: (member_expression (identifier) @call.name .))
+"#,
+            ),
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => Some(
                 // A bare `foo()` is `(call (identifier) ...)`, while `a.foo()`
@@ -625,6 +679,10 @@ impl Lang {
             for capture in m.captures {
                 let capture_name = &capture_names[capture.index as usize];
                 if let Some(kind_str) = capture_name.strip_suffix(".name") {
+                    #[cfg(feature = "lang-jai")]
+                    if *self == Self::Jai && !jai_is_declared_name(capture.node) {
+                        continue;
+                    }
                     let name = capture
                         .node
                         .utf8_text(source)
@@ -771,6 +829,8 @@ impl Lang {
             Self::Cpp,
             #[cfg(feature = "lang-odin")]
             Self::Odin,
+            #[cfg(feature = "lang-jai")]
+            Self::Jai,
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript,
             #[cfg(feature = "lang-markdown")]
@@ -951,6 +1011,22 @@ fn odin_body_span(node: tree_sitter::Node<'_>) -> Option<(usize, usize)> {
     Some((block.start_byte(), block.end_byte()))
 }
 
+/// The Jai grammar tags a bare identifier value with the declaration's `name`
+/// field too, so `Handle :: u32` would also declare `u32`. A declared name is
+/// one with no `:`, `::`, `=`, or `:=` before it -- only the `,` separating
+/// `a, b :: 1, 2`.
+#[cfg(feature = "lang-jai")]
+fn jai_is_declared_name(name: tree_sitter::Node<'_>) -> bool {
+    let mut sibling = name.prev_sibling();
+    while let Some(node) = sibling {
+        if !node.is_named() && node.kind() != "," {
+            return false;
+        }
+        sibling = node.prev_sibling();
+    }
+    true
+}
+
 fn symbol_body_span(node: tree_sitter::Node<'_>) -> Option<(usize, usize)> {
     if let Some(body) = node.child_by_field_name("body") {
         return Some((body.start_byte(), body.end_byte()));
@@ -1030,6 +1106,7 @@ mod tests {
             ("h", "cpp"),
             ("hpp", "cpp"),
             ("odin", "odin"),
+            ("jai", "jai"),
             ("gd", "gdscript"),
             ("md", "markdown"),
             ("mdx", "markdown"),
@@ -1830,6 +1907,114 @@ run :: proc(o: ^Obj) -> int {
                 "selector and package-qualified calls must expose {callee}: {call_sites:?}"
             );
         }
+    }
+
+    // #jaiindex: Jai declares everything as `name :: value`, so the value's
+    // node decides the kind, and a procedure's locals must not become symbols.
+    #[cfg(feature = "lang-jai")]
+    #[test]
+    fn test_extract_jai_symbols() {
+        let source = br#"#import "Basic";
+#load "util.jai";
+Math :: #import "Math";
+
+MAX_COUNT :: 64;
+Handle :: u32;
+lo, hi :: 1, 2;
+Callback :: #type (x: int) -> int;
+counter := 0;
+
+Vector2 :: struct {
+    x, y: float;
+    ORIGIN :: 0;
+}
+
+Shape :: union {
+    radius: float;
+    side: int;
+}
+
+Color :: enum u8 {
+    RED;
+    GREEN :: 5;
+}
+
+Flags :: enum_flags { VISIBLE; }
+
+length :: (v: Vector2) -> float {
+    local_total := v.x + v.y;
+    LOCAL_LIMIT :: 10;
+    return sqrt(local_total);
+}
+"#;
+        let symbols = Lang::Jai.extract_symbols(source).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        for expected in [
+            "Math", "MAX_COUNT", "Handle", "lo", "hi", "Callback", "counter", "Vector2", "x",
+            "y", "ORIGIN", "Shape", "radius", "side", "Color", "RED", "GREEN", "Flags",
+            "VISIBLE", "length",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}, got {names:?}");
+        }
+        for value in ["u32", "local_total", "LOCAL_LIMIT", "Basic"] {
+            assert!(
+                !names.contains(&value),
+                "{value} is a value, a local, or an unnamed import, not a symbol: {names:?}"
+            );
+        }
+        let kind_of = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .kind
+                .clone()
+        };
+        assert_eq!(kind_of("Math"), "mod");
+        assert_eq!(kind_of("MAX_COUNT"), "const");
+        assert_eq!(kind_of("Callback"), "type_alias");
+        assert_eq!(kind_of("counter"), "variable");
+        assert_eq!(kind_of("Vector2"), "struct");
+        assert_eq!(kind_of("y"), "field");
+        assert_eq!(kind_of("ORIGIN"), "const");
+        assert_eq!(kind_of("Shape"), "union");
+        assert_eq!(kind_of("Color"), "enum");
+        assert_eq!(kind_of("Flags"), "enum");
+        assert_eq!(kind_of("GREEN"), "enum_member");
+        assert_eq!(kind_of("length"), "function");
+    }
+
+    #[cfg(feature = "lang-jai")]
+    #[test]
+    fn test_extract_jai_call_edges() {
+        let source = br#"helper :: (v: int) -> int {
+    return v * 2;
+}
+
+run :: () {
+    n := helper(3);
+    Math.floor(1.5);
+    inner :: (a: int) { helper(a); }
+    inner(n);
+}
+"#;
+        let symbols = Lang::Jai.extract_symbols(source).unwrap();
+        let call_sites = crate::extract_call_sites(Lang::Jai, source).unwrap();
+        let edges = crate::resolve_edges(&symbols, &call_sites);
+        let pairs: Vec<String> = edges
+            .iter()
+            .map(|edge| format!("{} -> {}", edge.caller, edge.callee))
+            .collect();
+        for expected in ["run -> helper", "run -> inner", "inner -> helper"] {
+            assert!(
+                pairs.contains(&expected.to_string()),
+                "expected a {expected} call edge, got {pairs:?}"
+            );
+        }
+        assert!(
+            call_sites.iter().any(|site| site.callee == "floor"),
+            "a module-qualified call must expose its procedure name: {call_sites:?}"
+        );
     }
 
     #[cfg(feature = "lang-gdscript")]

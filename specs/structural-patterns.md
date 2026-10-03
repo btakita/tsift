@@ -66,7 +66,7 @@ reaches is what it can actually do:
 | Fans out to | Meaning | Languages |
 |---|---|---|
 | `tsift-astgrep` + `tsift-graph` + `tsift-search` | Indexable **and** structural. Searchable, graphable, and eligible for the symbol-resolved edit kinds | rust, python, typescript, javascript, kotlin, bash, go, csharp, c, cpp, markdown, json, yaml |
-| `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig, odin, gdscript — `ast-grep-language` ships no Zig, Odin, or GDScript grammar |
+| `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig, odin, gdscript, jai — `ast-grep-language` ships no Zig, Odin, GDScript, or Jai grammar |
 | `tsift-astgrep` only | **Structural-only**: `ast-grep search`/`rewrite` and the `structural_rewrite` edit intent work; the language is not indexed, not searchable, and not graphable | css, dart, elixir, haskell, hcl, html, java, lua, nix, php, ruby, scala, solidity, swift |
 
 Structural-only is a deliberate tier, not an oversight. A tree-sitter grammar is
@@ -136,6 +136,23 @@ inside a top-level `when` or `foreign` block. Every Odin call is a
 `call_expression` with an identifier callee (`pkg.f()` and `obj->f()` nest it),
 so one call pattern covers bare, package-qualified, and selector calls. Like
 C++, `rename_symbol` is not promoted: Odin has no semantic-edit contract.
+
+Jai followed under `#jaiindex`, as the first grammar tsift builds itself. Jai is
+in closed beta and has no grammar crate on crates.io, so `tsift-graph` vendors
+the generated `parser.c` and external `scanner.c` from
+[constantitus/tree-sitter-jai](https://github.com/constantitus/tree-sitter-jai)
+(MIT-0) under `packages/tsift-graph/vendor/tree-sitter-jai/` and compiles them
+in `build.rs` only when `lang-jai` is enabled. `.jai` files contribute
+procedure (`function`), struct, union, enum and `enum_flags` (`enum`),
+enum-member, named-import (`mod`, for `Name :: #import "Name"`), `#type` alias
+(`type_alias`), constant, variable, and struct-field symbols. Constants and
+variables are symbols only at file scope and inside a struct or union; a
+procedure's locals are not, so they never become the caller of an edge. A bare
+`Handle :: u32` is a `const`, because it parses exactly like `MAX :: OTHER_MAX`.
+Call edges come from `f()` and the last name of `Module.f()` / `value.f()`.
+Unnamed `#import "Basic"` and `#load "file.jai"` are not symbols, but `impact`
+reads them as import lines. Jai has no ast-grep grammar and no semantic-edit
+executor, so `rename_symbol` and `structural_rewrite` do not apply.
 
 JSON and YAML followed under `#sdktsiftcontracts`, as data rather than code.
 `.json`, `.yaml`, and `.yml` are indexed, but symbols come only from API
