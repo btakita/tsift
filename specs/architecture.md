@@ -344,6 +344,14 @@ CREATE INDEX idx_route_nodes_path ON route_nodes(route_path);
 CREATE INDEX idx_route_nodes_handler ON route_nodes(handler_name);
 CREATE INDEX idx_route_nodes_file ON route_nodes(file);
 
+CREATE TABLE file_state (
+    path TEXT PRIMARY KEY,
+    mtime_secs INTEGER NOT NULL,
+    mtime_nanos INTEGER NOT NULL,
+    language TEXT NOT NULL,
+    extractor_version TEXT  -- "<schema>.<language>"; NULL on indexes from before it existed
+);
+
 CREATE TABLE dir_state (
     path TEXT PRIMARY KEY,
     mtime_secs INTEGER NOT NULL,
@@ -362,6 +370,18 @@ CREATE TABLE dir_state (
 Chunking is a durability requirement, not an optimization. `wal_autocheckpoint` (256 pages) only fires when a write transaction commits, so a single transaction spanning an entire index build pins every dirty page in the WAL. Once the WAL outgrows its index hash blocks, SQLite's `walFindFrame` degrades into a backwards scan of those blocks on *every* page read and the build goes quadratic. A 2026-09-20 `$HOME`-rooted build demonstrated the failure mode: 11 hours at 97% CPU, an 8 GB WAL against a 4 KB database, 101 TB of `rchar` across 24.7 billion read syscalls, 89% of cycles in `walFindFrame`, and **zero rows ever committed**. Bounded chunks let the autocheckpoint reclaim the WAL and keep the apply linear in changed files.
 
 Within a chunk, `file_state` is written **last** for each file. It is the "fully indexed at this mtime" marker, so it must never precede the symbol, zone-map, FTS, call-edge, and route rows it vouches for: a marker that outran its rows would make the next apply skip the file as unchanged forever.
+
+### Extractor Versions (`#tsiftindexesinvalidate`)
+
+`file_state` vouches for a file's rows at an mtime **and** an extractor version. A file is `modified` when its mtime differs *or* its stored `extractor_version` differs from the running binary's, so a plain `tsift index` after an extractor change re-extracts exactly the files that change touches. Before this, an unchanged file kept its old rows until `tsift index --rebuild`: after `daac4fe` taught the extractors TypeScript class methods, C# `using` aliases, and C++ namespace-scope variables, incremental indexes never showed them.
+
+The version string is `"<EXTRACTOR_SCHEMA_VERSION>.<language version>"`, from `packages/tsift-graph/src/extractor_version.rs`:
+
+- **A change to one language's symbol, call-site, or route extraction** bumps that language's entry in `LANGUAGE_EXTRACTOR_VERSIONS`. Only that language's files re-extract. Languages that share an extractor (`typescript`/`tsx`, `javascript`/`jsx`) are bumped together, which a unit test pins.
+- **A change every language goes through** (shared edge resolution, zone-map or FTS rows, stored columns) bumps `EXTRACTOR_SCHEMA_VERSION`, and every file re-extracts.
+- **A new language** needs nothing: its files are new to the index. Languages without an entry get `DEFAULT_LANGUAGE_EXTRACTOR_VERSION`.
+
+Indexes written before the column existed store NULL, which never matches, so they re-extract once on the first `tsift index` with this binary; a read-only `index --check` / `status` on such an index reports those files as modified instead of failing on the missing column. A stale version also disables subtree pruning for that run, so a future `--prune` that skips directories cannot leave a stale file behind. `tsift index --check` reports version-stale files as modified, so `status` recommends the incremental index rather than a rebuild.
 
 ### Ambient State Roots
 

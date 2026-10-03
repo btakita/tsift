@@ -446,6 +446,48 @@ pub struct SymbolHit {
     pub tagpath_handle: Option<String>,
 }
 
+/// One `file_state` row: the "fully indexed at this mtime, by this extractor"
+/// marker (`#tsiftindexesinvalidate`).
+struct StoredFile {
+    mtime_secs: i64,
+    mtime_nanos: u32,
+    language: String,
+    extractor_version: Option<String>,
+}
+
+impl StoredFile {
+    fn extractor_is_stale(&self) -> bool {
+        self.extractor_version.as_deref()
+            != Some(current_extractor_version(&self.language).as_str())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override: `(language, version)` pairs that replace the
+    /// compiled-in extractor version, standing in for a binary whose extractor
+    /// for that language changed.
+    static EXTRACTOR_VERSION_OVERRIDES: std::cell::RefCell<Vec<(String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn current_extractor_version(language: &str) -> String {
+    #[cfg(test)]
+    {
+        let overridden = EXTRACTOR_VERSION_OVERRIDES.with(|overrides| {
+            overrides
+                .borrow()
+                .iter()
+                .find(|(name, _)| name == language)
+                .map(|(_, version)| version.clone())
+        });
+        if let Some(version) = overridden {
+            return version;
+        }
+    }
+    graph::extractor_version(language)
+}
+
 fn system_time_to_pair(t: SystemTime) -> (i64, u32) {
     let d = t.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
     (d.as_secs() as i64, d.subsec_nanos())
@@ -618,6 +660,13 @@ impl IndexDb {
             );",
         )?;
         let _ = conn.execute("ALTER TABLE symbols ADD COLUMN tags TEXT", []);
+        // Extractor version that produced this file's rows
+        // (`#tsiftindexesinvalidate`). Rows from before the column existed read
+        // NULL, which never matches, so they re-extract once.
+        let _ = conn.execute(
+            "ALTER TABLE file_state ADD COLUMN extractor_version TEXT",
+            [],
+        );
         let _ = conn.execute("ALTER TABLE symbols ADD COLUMN node_kind TEXT", []);
         let _ = conn.execute("ALTER TABLE symbols ADD COLUMN start_byte INTEGER", []);
         let _ = conn.execute("ALTER TABLE symbols ADD COLUMN end_byte INTEGER", []);
@@ -850,29 +899,55 @@ impl IndexDb {
         Ok(())
     }
 
-    fn load_stored_files(&self) -> Result<HashMap<PathBuf, (i64, u32, String)>> {
+    fn file_state_has_extractor_version(&self) -> Result<bool> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(file_state)")?;
+        let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for column in columns {
+            if column? == "extractor_version" {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn load_stored_files(&self) -> Result<HashMap<PathBuf, StoredFile>> {
+        // A read-only open of an index written before `extractor_version`
+        // existed has no such column; its rows are all stale.
+        let query = if self.file_state_has_extractor_version()? {
+            "SELECT path, mtime_secs, mtime_nanos, language, extractor_version FROM file_state"
+        } else {
+            "SELECT path, mtime_secs, mtime_nanos, language, NULL FROM file_state"
+        };
         let mut stored = HashMap::new();
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path, mtime_secs, mtime_nanos, language FROM file_state")?;
+        let mut stmt = self.conn.prepare(query)?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 PathBuf::from(row.get::<_, String>(0)?),
-                row.get::<_, i64>(1)?,
-                row.get::<_, u32>(2)?,
-                row.get::<_, String>(3)?,
+                StoredFile {
+                    mtime_secs: row.get::<_, i64>(1)?,
+                    mtime_nanos: row.get::<_, u32>(2)?,
+                    language: row.get::<_, String>(3)?,
+                    extractor_version: row.get::<_, Option<String>>(4)?,
+                },
             ))
         })?;
         for row in rows {
-            let (path, secs, nanos, lang) = row?;
-            stored.insert(path, (secs, nanos, lang));
+            let (path, file) = row?;
+            stored.insert(path, file);
         }
         Ok(stored)
     }
 
+    /// Whether any stored file was extracted by a different extractor version
+    /// than this binary's. Pruned walks skip whole directories, so a stale file
+    /// inside one would never be revisited; callers fall back to a full walk.
+    fn has_stale_extractor_rows(stored: &HashMap<PathBuf, StoredFile>) -> bool {
+        stored.values().any(StoredFile::extractor_is_stale)
+    }
+
     fn diff_entries(
         entries: &[FileEntry],
-        stored: &HashMap<PathBuf, (i64, u32, String)>,
+        stored: &HashMap<PathBuf, StoredFile>,
         pruned_dirs: &HashSet<PathBuf>,
     ) -> (Vec<FileChange>, usize) {
         let disk_files: HashSet<&PathBuf> = entries.iter().map(|e| &e.path).collect();
@@ -881,11 +956,16 @@ impl IndexDb {
 
         for entry in entries {
             match stored.get(&entry.path) {
-                Some((secs, nanos, lang)) => {
-                    let stored_mtime = pair_to_system_time(*secs, *nanos);
+                Some(file) => {
+                    let stored_mtime = pair_to_system_time(file.mtime_secs, file.mtime_nanos);
+                    let current_version = current_extractor_version(entry.lang.name());
                     // A language change with an unchanged mtime (a project's
-                    // `[languages]` opt-in flipped) still needs a re-extract.
-                    if entry.mtime != stored_mtime || lang != entry.lang.name() {
+                    // `[languages]` opt-in flipped) still needs a re-extract, as
+                    // does a file whose rows an older extractor wrote.
+                    if entry.mtime != stored_mtime
+                        || file.language != entry.lang.name()
+                        || file.extractor_version.as_deref() != Some(current_version.as_str())
+                    {
                         changes.push(FileChange {
                             path: entry.path.clone(),
                             kind: ChangeKind::Modified,
@@ -955,6 +1035,7 @@ impl IndexDb {
         excluded_roots: &[PathBuf],
     ) -> Result<IndexSummary> {
         let stored = self.load_stored_files()?;
+        let prune = prune && !Self::has_stale_extractor_rows(&stored);
 
         let (entries, pruned_dirs, prune_stats, skipped) = if prune {
             let stored_dirs = self.load_dir_state().unwrap_or_default();
@@ -1034,6 +1115,7 @@ impl IndexDb {
         crate::roots::ensure_indexable_root(root)?;
         let languages = crate::config::LanguageMap::for_root(root)?;
         let stored = self.load_stored_files()?;
+        let prune = prune && !Self::has_stale_extractor_rows(&stored);
 
         let (entries, pruned_dirs, dir_mtimes, prune_stats, skipped) = if prune {
             let stored_dirs = self.load_dir_state().unwrap_or_default();
@@ -1083,7 +1165,7 @@ impl IndexDb {
         self.conn.execute_batch("SAVEPOINT sp_apply")?;
         let apply_result: Result<Vec<IndexWarning>> = (|| {
             let mut insert_file = self.conn.prepare(
-                "INSERT OR REPLACE INTO file_state (path, mtime_secs, mtime_nanos, language) VALUES (?1, ?2, ?3, ?4)"
+                "INSERT OR REPLACE INTO file_state (path, mtime_secs, mtime_nanos, language, extractor_version) VALUES (?1, ?2, ?3, ?4, ?5)"
             )?;
             let mut delete_file = self
                 .conn
@@ -1272,11 +1354,13 @@ impl IndexDb {
                         // chunk size: a committed chunk can never claim a file is
                         // indexed while its symbols/zonemap/FTS/edges are missing
                         // (which the next apply would skip as unchanged forever).
+                        let language = change.language.as_deref().unwrap_or("unknown");
                         insert_file.execute(rusqlite::params![
                             &path_str,
                             secs,
                             nanos,
-                            change.language.as_deref().unwrap_or("unknown"),
+                            language,
+                            current_extractor_version(language),
                         ])?;
                     }
                     ChangeKind::Deleted => {
@@ -2294,6 +2378,182 @@ mod tests {
         assert_eq!(summary.deleted, 0);
         assert_eq!(summary.unchanged, 0);
         assert_eq!(summary.total_tracked, 3);
+    }
+
+    // #tsiftindexesinvalidate: after `daac4fe` taught the TypeScript extractor
+    // class methods, a plain `tsift index` skipped every unchanged `.ts` file,
+    // so the methods appeared only after `--rebuild`. These tests stand in for
+    // "rows written by an older extractor" by deleting the rows the new
+    // extractor adds and stamping an older version on `file_state`.
+
+    fn setup_ts_method_tree() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("client.ts"),
+            "export class Client {\n  send(body: string) { return body; }\n}\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("lib.py"), "def hello(): pass\n").unwrap();
+        dir
+    }
+
+    fn method_names(db: &IndexDb, file: &Path) -> Vec<String> {
+        db.symbols_for_file(&file.to_string_lossy())
+            .unwrap()
+            .into_iter()
+            .filter(|sym| sym.kind == "method")
+            .map(|sym| sym.name)
+            .collect()
+    }
+
+    /// Leave `client.ts` as an index written before the extractor learned
+    /// class methods: no method rows, and an older extractor version.
+    fn forget_methods_as_old_extractor(db: &IndexDb, file: &Path) {
+        db.conn
+            .execute(
+                "DELETE FROM symbols WHERE file = ?1 AND kind = 'method'",
+                rusqlite::params![file.to_string_lossy()],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE file_state SET extractor_version = '0.0' WHERE path = ?1",
+                rusqlite::params![file.to_string_lossy()],
+            )
+            .unwrap();
+        assert!(method_names(db, file).is_empty());
+    }
+
+    struct ExtractorVersionOverride;
+
+    impl ExtractorVersionOverride {
+        fn set(language: &str, version: &str) -> Self {
+            EXTRACTOR_VERSION_OVERRIDES.with(|overrides| {
+                overrides
+                    .borrow_mut()
+                    .push((language.to_string(), version.to_string()))
+            });
+            Self
+        }
+    }
+
+    impl Drop for ExtractorVersionOverride {
+        fn drop(&mut self) {
+            EXTRACTOR_VERSION_OVERRIDES.with(|overrides| overrides.borrow_mut().clear());
+        }
+    }
+
+    #[test]
+    fn plain_index_reextracts_files_from_an_older_extractor_version() {
+        let dir = setup_ts_method_tree();
+        let client = dir.path().join("client.ts");
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+        assert_eq!(method_names(&db, &client), vec!["send".to_string()]);
+
+        forget_methods_as_old_extractor(&db, &client);
+
+        // No file changed on disk, but client.ts was extracted by an older
+        // extractor: a plain incremental index must re-extract it.
+        let check = db.compute_changes(dir.path()).unwrap();
+        assert_eq!((check.modified, check.unchanged), (1, 1));
+        let summary = db.apply_changes(dir.path()).unwrap();
+        assert_eq!(
+            summary.modified, 1,
+            "stale extractor version must re-extract"
+        );
+        assert_eq!(summary.unchanged, 1);
+        assert_eq!(method_names(&db, &client), vec!["send".to_string()]);
+
+        // Re-stamped with the current version: the next run is a no-op.
+        let again = db.apply_changes(dir.path()).unwrap();
+        assert_eq!((again.modified, again.unchanged), (0, 2));
+    }
+
+    #[test]
+    fn extractor_version_bump_reextracts_only_that_language() {
+        let dir = setup_ts_method_tree();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        let _bump = ExtractorVersionOverride::set("python", "1.999");
+        let summary = db.apply_changes(dir.path()).unwrap();
+        assert_eq!((summary.modified, summary.unchanged), (1, 1));
+        let modified: Vec<_> = summary
+            .changes
+            .iter()
+            .map(|change| {
+                change
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(modified, vec!["lib.py".to_string()]);
+        let stored: String = db
+            .conn
+            .query_row(
+                "SELECT extractor_version FROM file_state WHERE path LIKE '%lib.py'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, "1.999");
+    }
+
+    #[test]
+    fn pruned_index_reextracts_stale_files_in_unchanged_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+        let client = src.join("client.ts");
+        fs::write(
+            &client,
+            "export class Client {\n  send(body: string) { return body; }\n}\n",
+        )
+        .unwrap();
+        let db = db_in(dir.path());
+        db.apply_changes_pruned(dir.path()).unwrap();
+        db.apply_changes_pruned(dir.path()).unwrap();
+        forget_methods_as_old_extractor(&db, &client);
+
+        // `src/`'s mtime is unchanged. The walk behind `--prune` currently
+        // revisits every directory, but if it ever skips one by mtime, a stale
+        // extractor version must still force the full walk.
+        let summary = db.apply_changes_pruned(dir.path()).unwrap();
+        assert_eq!(summary.modified, 1);
+        assert_eq!(method_names(&db, &client), vec!["send".to_string()]);
+        let again = db.apply_changes_pruned(dir.path()).unwrap();
+        assert_eq!(again.modified, 0);
+    }
+
+    #[test]
+    fn index_from_before_extractor_versions_reextracts_once() {
+        let dir = setup_ts_method_tree();
+        let db_path = dir.path().join(".tsift/index.db");
+        {
+            let db = IndexDb::open(&db_path).unwrap();
+            db.apply_changes(dir.path()).unwrap();
+            db.conn
+                .execute("ALTER TABLE file_state DROP COLUMN extractor_version", [])
+                .unwrap();
+        }
+
+        // A read-only inspect of the legacy schema reports every file stale
+        // instead of failing on the missing column.
+        let inspect = IndexDb::open_read_only(&db_path)
+            .unwrap()
+            .compute_changes(dir.path())
+            .unwrap();
+        assert_eq!((inspect.modified, inspect.unchanged), (2, 0));
+
+        let db = IndexDb::open(&db_path).unwrap();
+        let summary = db.apply_changes(dir.path()).unwrap();
+        assert_eq!((summary.modified, summary.unchanged), (2, 0));
+        let again = db.apply_changes(dir.path()).unwrap();
+        assert_eq!((again.modified, again.unchanged), (0, 2));
     }
 
     #[test]
@@ -3658,7 +3918,8 @@ def list_items():
                  path TEXT PRIMARY KEY,
                  mtime_secs INTEGER NOT NULL,
                  mtime_nanos INTEGER NOT NULL,
-                 language TEXT NOT NULL
+                 language TEXT NOT NULL,
+                 extractor_version TEXT
              );
              CREATE TABLE dir_state (
                  path TEXT PRIMARY KEY,
@@ -3668,8 +3929,14 @@ def list_items():
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO file_state (path, mtime_secs, mtime_nanos, language) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![source.to_string_lossy(), secs, nanos, "rust"],
+            "INSERT INTO file_state (path, mtime_secs, mtime_nanos, language, extractor_version) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                source.to_string_lossy(),
+                secs,
+                nanos,
+                "rust",
+                current_extractor_version("rust")
+            ],
         )
         .unwrap();
         conn.execute_batch("BEGIN EXCLUSIVE;").unwrap();

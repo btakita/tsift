@@ -16,6 +16,9 @@ mod xml;
 mod xml_contract;
 pub use lang::{Lang, Symbol};
 
+pub mod extractor_version;
+pub use extractor_version::extractor_version;
+
 pub mod complexity;
 pub use complexity::{ComplexityMetrics, LanguageExtractor, LanguageRegistry};
 
