@@ -288,9 +288,11 @@ impl Language {
 |----------|-------------|
 | Rust | `fn`, `struct`, `enum`, `trait`, `impl`, `mod`, `type`, `const`, `static` |
 | Python | `def`, `async def`, `class`, decorators, module-level assignments |
-| TypeScript | `function`, `class`, `interface`, `type`, `enum`, arrow exports |
+| TypeScript | `function`, `class`, `interface`, `type`, `enum`, arrow exports, class methods (incl. `#private` and `abstract` signatures) |
 | TSX | TypeScript symbols + React component detection (JSX elements) |
-| JavaScript | `function`, `class`, arrow exports, `module.exports` |
+| JavaScript | `function`, `class`, arrow exports, `module.exports`, class methods |
+| C# | `class`, `struct`, `interface`, `enum` (+ members), `record`, `delegate`, methods, local functions, properties, `using Alias = Type;` aliases |
+| C++ | `class`/`struct`/`union`/`enum` definitions (+ enumerators), namespaces, `using`/`typedef` aliases, functions and methods (definitions and prototypes), fields, file/namespace-scope variables (not function locals) |
 | Kotlin | `fun`, `class`, `interface`, `object`, `data class`, `sealed class`, `enum class`, `companion object` |
 | Zig | `fn`, `struct`, `enum`, `union`, `const` |
 | Bash | `function`, alias definitions |

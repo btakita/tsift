@@ -1282,16 +1282,24 @@ pub(crate) fn lower_haiven_trace(trace: &Value, model: Option<&Value>) -> Result
             payloads.push((contract.to_string(), format!("ws_event:{event}")));
         }
     }
-    for request in model_ws
-        .and_then(|ws| ws.get("requests"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        if let (Some(operation), Some(contract)) = (
-            request.get("operation").and_then(Value::as_str),
-            request.get("payload").and_then(Value::as_str),
-        ) {
+    // `ws.requests` is an object keyed by operation in model.json; an array of
+    // requests (each naming its `operation`) is accepted too.
+    let requests: Vec<(Option<&str>, &Value)> = match model_ws.and_then(|ws| ws.get("requests")) {
+        Some(Value::Object(requests)) => requests
+            .iter()
+            .map(|(operation, request)| (Some(operation.as_str()), request))
+            .collect(),
+        Some(Value::Array(requests)) => requests.iter().map(|request| (None, request)).collect(),
+        _ => Vec::new(),
+    };
+    for (key, request) in requests {
+        let operation = request
+            .get("operation")
+            .and_then(Value::as_str)
+            .or(key);
+        if let (Some(operation), Some(contract)) =
+            (operation, request.get("payload").and_then(Value::as_str))
+        {
             payloads.push((contract.to_string(), format!("ws_request:{operation}")));
         }
     }
@@ -1453,6 +1461,45 @@ mod tests {
         )
         .unwrap();
         assert!(parse_edge_file(&path, ImportFormat::Auto, None, "bad").is_err());
+    }
+
+    #[test]
+    fn model_ws_requests_keyed_by_operation_add_carried_by() {
+        // model.json keys `ws.requests` by operation; both that and an array of
+        // requests link the payload contract to the request frame (#sdktraceroot).
+        let trace = serde_json::json!({
+            "vocabularies": {},
+            "contracts": {"ChatSendV0": {"declared": {}}, "ChatEditV0": {"declared": {}}},
+            "rest": {},
+            "ws": {"requests": {"chat.send": {"declared": {}}, "chat.edit": {"declared": {}}}, "events": {}},
+            "conformance": {"suites": [], "operations": 0, "exercised": 0}
+        });
+        let carried = |model: serde_json::Value| -> BTreeSet<(String, String)> {
+            lower_haiven_trace(&trace, Some(&model))
+                .unwrap()
+                .edges
+                .into_iter()
+                .filter(|edge| edge.kind == "carried_by")
+                .map(|edge| (edge.from, edge.to))
+                .collect()
+        };
+        let expected: BTreeSet<(String, String)> = [
+            ("contract:ChatEditV0", "ws_request:chat.edit"),
+            ("contract:ChatSendV0", "ws_request:chat.send"),
+        ]
+        .into_iter()
+        .map(|(from, to)| (from.to_string(), to.to_string()))
+        .collect();
+        let keyed = serde_json::json!({"ws": {"requests": {
+            "chat.send": {"operation": "chat.send", "payload": "ChatSendV0"},
+            "chat.edit": {"payload": "ChatEditV0"}
+        }, "events": {}}});
+        assert_eq!(carried(keyed), expected);
+        let listed = serde_json::json!({"ws": {"requests": [
+            {"operation": "chat.send", "payload": "ChatSendV0"},
+            {"operation": "chat.edit", "payload": "ChatEditV0"}
+        ], "events": {}}});
+        assert_eq!(carried(listed), expected);
     }
 
     #[test]

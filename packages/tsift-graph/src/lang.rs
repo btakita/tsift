@@ -277,6 +277,8 @@ impl Lang {
                 (type_alias_declaration name: (type_identifier) @type_alias.name)
                 (enum_declaration name: (identifier) @enum.name)
                 (variable_declarator name: (identifier) @function.name value: (arrow_function))
+                (method_definition name: [(property_identifier) (private_property_identifier)] @method.name)
+                (abstract_method_signature name: [(property_identifier) (private_property_identifier)] @method.name)
             "#
             }
             #[cfg(feature = "lang-javascript")]
@@ -285,6 +287,7 @@ impl Lang {
                 (function_declaration name: (identifier) @function.name)
                 (class_declaration name: (identifier) @class.name)
                 (variable_declarator name: (identifier) @function.name value: (arrow_function))
+                (method_definition name: [(property_identifier) (private_property_identifier)] @method.name)
             "#
             }
             #[cfg(feature = "lang-kotlin")]
@@ -346,6 +349,7 @@ impl Lang {
                 (local_function_statement name: (identifier) @function.name)
                 (property_declaration name: (identifier) @property.name)
                 (enum_member_declaration name: (identifier) @enum_member.name)
+                (using_directive name: (identifier) @type_alias.name)
             "#
             }
             #[cfg(feature = "lang-c")]
@@ -424,6 +428,10 @@ impl Lang {
                 // elaborated `struct Foo* p` reuse the specifier node without one.
                 // A header declares most of its API as prototypes and member
                 // declarations, so those are symbols too, not only definitions.
+                // A variable is a symbol only at file or namespace scope (a
+                // `declaration_list` is a namespace or `extern "C"` body, also
+                // under `#if`/`#ifdef`), e.g. `inline constexpr const char* X`
+                // in a header; function locals stay out.
                 r#"
                 (class_specifier name: (type_identifier) @class.name body: (field_declaration_list))
                 (struct_specifier name: (type_identifier) @struct.name body: (field_declaration_list))
@@ -444,6 +452,60 @@ impl Lang {
                 (declaration declarator: (function_declarator declarator: (identifier) @function.name))
                 (field_declaration declarator: (function_declarator declarator: (field_identifier) @method.name))
                 (field_declaration declarator: (field_identifier) @field.name)
+                (translation_unit (declaration declarator: [
+                    (identifier) @variable.name
+                    (init_declarator declarator: (identifier) @variable.name)
+                    (init_declarator declarator: (pointer_declarator declarator: (identifier) @variable.name))
+                    (init_declarator declarator: (reference_declarator (identifier) @variable.name))
+                    (init_declarator declarator: (array_declarator declarator: (identifier) @variable.name))
+                    (pointer_declarator declarator: (identifier) @variable.name)
+                    (array_declarator declarator: (identifier) @variable.name)
+                  ]))
+                (declaration_list (declaration declarator: [
+                    (identifier) @variable.name
+                    (init_declarator declarator: (identifier) @variable.name)
+                    (init_declarator declarator: (pointer_declarator declarator: (identifier) @variable.name))
+                    (init_declarator declarator: (reference_declarator (identifier) @variable.name))
+                    (init_declarator declarator: (array_declarator declarator: (identifier) @variable.name))
+                    (pointer_declarator declarator: (identifier) @variable.name)
+                    (array_declarator declarator: (identifier) @variable.name)
+                  ]))
+                (preproc_if (declaration declarator: [
+                    (identifier) @variable.name
+                    (init_declarator declarator: (identifier) @variable.name)
+                    (init_declarator declarator: (pointer_declarator declarator: (identifier) @variable.name))
+                    (init_declarator declarator: (reference_declarator (identifier) @variable.name))
+                    (init_declarator declarator: (array_declarator declarator: (identifier) @variable.name))
+                    (pointer_declarator declarator: (identifier) @variable.name)
+                    (array_declarator declarator: (identifier) @variable.name)
+                  ]))
+                (preproc_ifdef (declaration declarator: [
+                    (identifier) @variable.name
+                    (init_declarator declarator: (identifier) @variable.name)
+                    (init_declarator declarator: (pointer_declarator declarator: (identifier) @variable.name))
+                    (init_declarator declarator: (reference_declarator (identifier) @variable.name))
+                    (init_declarator declarator: (array_declarator declarator: (identifier) @variable.name))
+                    (pointer_declarator declarator: (identifier) @variable.name)
+                    (array_declarator declarator: (identifier) @variable.name)
+                  ]))
+                (preproc_else (declaration declarator: [
+                    (identifier) @variable.name
+                    (init_declarator declarator: (identifier) @variable.name)
+                    (init_declarator declarator: (pointer_declarator declarator: (identifier) @variable.name))
+                    (init_declarator declarator: (reference_declarator (identifier) @variable.name))
+                    (init_declarator declarator: (array_declarator declarator: (identifier) @variable.name))
+                    (pointer_declarator declarator: (identifier) @variable.name)
+                    (array_declarator declarator: (identifier) @variable.name)
+                  ]))
+                (preproc_elif (declaration declarator: [
+                    (identifier) @variable.name
+                    (init_declarator declarator: (identifier) @variable.name)
+                    (init_declarator declarator: (pointer_declarator declarator: (identifier) @variable.name))
+                    (init_declarator declarator: (reference_declarator (identifier) @variable.name))
+                    (init_declarator declarator: (array_declarator declarator: (identifier) @variable.name))
+                    (pointer_declarator declarator: (identifier) @variable.name)
+                    (array_declarator declarator: (identifier) @variable.name)
+                  ]))
             "#
             }
             #[cfg(feature = "lang-odin")]
@@ -1533,6 +1595,26 @@ mod tests {
         assert!(names.contains(&"Color"), "missing Color, got {:?}", names);
     }
 
+    #[cfg(feature = "lang-typescript")]
+    #[test]
+    fn test_typescript_class_methods_are_symbols_at_their_line() {
+        // haiven-sdk's codegen trace points a REST operation at the generated
+        // client method's line, so a class method must be a symbol (#sdktraceroot).
+        let source = b"export class RestApi {\n\t/** Delete a group */\n\tdeleteGroup(input: string): Promise<null> {\n\t\treturn this.send(input)\n\t}\n\t#secret(): void {}\n}\nexport abstract class Base {\n\tabstract run(): void\n}\n";
+        let symbols = Lang::TypeScript.extract_symbols(source).unwrap();
+        let find = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing {name}, got {symbols:?}"))
+        };
+        assert_eq!(find("deleteGroup").kind, "method");
+        assert_eq!(find("deleteGroup").line, 2, "0-based line of the method");
+        assert_eq!(find("#secret").kind, "method");
+        assert_eq!(find("run").kind, "method");
+        assert_eq!(find("RestApi").kind, "class");
+    }
+
     #[cfg(feature = "lang-javascript")]
     #[test]
     fn test_extract_javascript_symbols() {
@@ -1768,6 +1850,21 @@ public struct Clipboard {
 
     #[cfg(feature = "lang-csharp")]
     #[test]
+    fn test_csharp_using_alias_is_a_type_alias() {
+        // A generated contract that is only an alias (`using X = System.String;`)
+        // is still that contract's C# declaration (#sdktraceroot).
+        let source = b"using System;\n\nnamespace Haiven.Sdk.Contracts\n{\n\tusing ChatActiveChannelV0 = System.String;\n\tusing static System.Math;\n}\n";
+        let symbols = Lang::CSharp.extract_symbols(source).unwrap();
+        let aliases: Vec<(&str, &str, usize)> = symbols
+            .iter()
+            .filter(|s| s.kind == "type_alias")
+            .map(|s| (s.name.as_str(), s.kind.as_str(), s.line))
+            .collect();
+        assert_eq!(aliases, vec![("ChatActiveChannelV0", "type_alias", 4)]);
+    }
+
+    #[cfg(feature = "lang-csharp")]
+    #[test]
     fn test_extract_csharp_call_edges() {
         let source = br#"class Program {
     static int Helper() => 1;
@@ -1974,6 +2071,37 @@ int Haiven::Rest::FClient::Connect(const std::string& Url) { return 0; }
         assert_eq!(kind_of("GetChannel"), "function");
         assert_eq!(kind_of("Send"), "method");
         assert_eq!(kind_of("Path"), "field");
+    }
+
+    #[cfg(feature = "lang-cpp")]
+    #[test]
+    fn test_cpp_namespace_scope_variables_are_symbols() {
+        // haiven-sdk's Unreal header declares each WebSocket event's wire name
+        // as a namespace constant, and the codegen trace points at it (#sdktraceroot).
+        let source = br#"namespace Haiven::Ws
+{
+	namespace Types
+	{
+		inline constexpr const char* ChatMessage = "chat.message";
+		inline constexpr int Version = 1;
+	}
+}
+extern "C" { int Exported; }
+static const char* const Root = "/";
+int Local() { int Hidden = 2; return Hidden; }
+"#;
+        let symbols = Lang::Cpp.extract_symbols(source).unwrap();
+        let variable = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name == name && s.kind == "variable")
+                .map(|s| s.line)
+        };
+        assert_eq!(variable("ChatMessage"), Some(4));
+        assert_eq!(variable("Version"), Some(5));
+        assert_eq!(variable("Exported"), Some(8));
+        assert_eq!(variable("Root"), Some(9));
+        assert_eq!(variable("Hidden"), None, "function locals are not symbols");
     }
 
     #[cfg(feature = "lang-cpp")]
