@@ -47,7 +47,7 @@ tsift-tokensave = { path = "packages/tsift-tokensave", version = "0.1.101" }
 tsift-libsql = { path = "packages/tsift-libsql", version = "0.1.101", optional = true }
 
 [features]
-default = ["cli", "lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-csharp", "lang-gdscript", "lang-markdown"]
+default = ["cli", "lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-csharp", "lang-cpp", "lang-gdscript", "lang-markdown"]
 backend-libsql = ["dep:tsift-libsql"]
 backend-surrealdb = ["cli", "tsift-cli/backend-surrealdb"]
 cli = ["dep:tsift-cli"]
@@ -60,6 +60,7 @@ lang-zig = ["tsift-graph/lang-zig", "tsift-search/lang-zig"]
 lang-bash = ["tsift-astgrep/lang-bash", "tsift-graph/lang-bash", "tsift-search/lang-bash"]
 lang-go = ["tsift-astgrep/lang-go", "tsift-graph/lang-go", "tsift-search/lang-go"]
 lang-csharp = ["tsift-astgrep/lang-csharp", "tsift-graph/lang-csharp", "tsift-search/lang-csharp"]
+lang-cpp = ["tsift-astgrep/lang-cpp", "tsift-graph/lang-cpp", "tsift-search/lang-cpp"]
 lang-gdscript = ["tsift-graph/lang-gdscript", "tsift-search/lang-gdscript"]
 lang-markdown = ["tsift-astgrep/lang-markdown", "tsift-graph/lang-markdown", "tsift-search/lang-markdown"]
 # Structural-only languages. These fan out to `tsift-astgrep` ONLY: ast-grep can
@@ -69,7 +70,6 @@ lang-markdown = ["tsift-astgrep/lang-markdown", "tsift-graph/lang-markdown", "ts
 # first. (`lang-zig` and `lang-gdscript` are the mirror image: indexable, but no
 # ast-grep grammar.)
 lang-c = ["tsift-astgrep/lang-c"]
-lang-cpp = ["tsift-astgrep/lang-cpp"]
 lang-css = ["tsift-astgrep/lang-css"]
 lang-dart = ["tsift-astgrep/lang-dart"]
 lang-elixir = ["tsift-astgrep/lang-elixir"]

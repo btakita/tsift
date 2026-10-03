@@ -39,6 +39,8 @@ pub enum Lang {
     Go,
     #[cfg(feature = "lang-csharp")]
     CSharp,
+    #[cfg(feature = "lang-cpp")]
+    Cpp,
     #[cfg(feature = "lang-gdscript")]
     GdScript,
     #[cfg(feature = "lang-markdown")]
@@ -71,6 +73,12 @@ impl Lang {
             "go" => Some(Self::Go),
             #[cfg(feature = "lang-csharp")]
             "cs" => Some(Self::CSharp),
+            // `.h` is read as C++: the tree-sitter C++ grammar parses C headers
+            // too, and C has no indexed grammar of its own here.
+            #[cfg(feature = "lang-cpp")]
+            "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h" | "inl" | "ipp" => {
+                Some(Self::Cpp)
+            }
             #[cfg(feature = "lang-gdscript")]
             "gd" => Some(Self::GdScript),
             #[cfg(feature = "lang-markdown")]
@@ -103,6 +111,8 @@ impl Lang {
             Self::Go => tree_sitter_go::LANGUAGE.into(),
             #[cfg(feature = "lang-csharp")]
             Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+            #[cfg(feature = "lang-cpp")]
+            Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => tree_sitter_gdscript::LANGUAGE.into(),
             #[cfg(feature = "lang-markdown")]
@@ -134,6 +144,8 @@ impl Lang {
             Self::Go => "go",
             #[cfg(feature = "lang-csharp")]
             Self::CSharp => "csharp",
+            #[cfg(feature = "lang-cpp")]
+            Self::Cpp => "cpp",
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => "gdscript",
             #[cfg(feature = "lang-markdown")]
@@ -244,6 +256,34 @@ impl Lang {
                 (enum_member_declaration name: (identifier) @enum_member.name)
             "#
             }
+            #[cfg(feature = "lang-cpp")]
+            Self::Cpp => {
+                // Only definitions with a body name a type: `class Foo;` and an
+                // elaborated `struct Foo* p` reuse the specifier node without one.
+                // A header declares most of its API as prototypes and member
+                // declarations, so those are symbols too, not only definitions.
+                r#"
+                (class_specifier name: (type_identifier) @class.name body: (field_declaration_list))
+                (struct_specifier name: (type_identifier) @struct.name body: (field_declaration_list))
+                (union_specifier name: (type_identifier) @union.name body: (field_declaration_list))
+                (enum_specifier name: (type_identifier) @enum.name body: (enumerator_list))
+                (enumerator name: (identifier) @enum_member.name)
+                (namespace_definition name: (namespace_identifier) @namespace.name)
+                (namespace_definition name: (nested_namespace_specifier (namespace_identifier) @namespace.name))
+                (alias_declaration name: (type_identifier) @type_alias.name)
+                (type_definition declarator: (type_identifier) @type_alias.name)
+                (function_definition declarator: (function_declarator declarator: (identifier) @function.name))
+                (function_definition declarator: (function_declarator declarator: (field_identifier) @method.name))
+                (function_definition declarator: (function_declarator declarator: (qualified_identifier name: (identifier) @method.name)))
+                (function_definition declarator: (function_declarator declarator: (qualified_identifier name: (qualified_identifier name: (identifier) @method.name))))
+                (function_definition declarator: (function_declarator declarator: (qualified_identifier name: (qualified_identifier name: (qualified_identifier name: (identifier) @method.name)))))
+                (function_definition declarator: (pointer_declarator declarator: (function_declarator declarator: (identifier) @function.name)))
+                (function_definition declarator: (reference_declarator (function_declarator declarator: (identifier) @function.name)))
+                (declaration declarator: (function_declarator declarator: (identifier) @function.name))
+                (field_declaration declarator: (function_declarator declarator: (field_identifier) @method.name))
+                (field_declaration declarator: (field_identifier) @field.name)
+            "#
+            }
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => {
                 // `class_name Foo` declares the script's own type and is the
@@ -326,6 +366,18 @@ impl Lang {
 (invocation_expression function: (member_access_expression name: (generic_name (identifier) @call.name)))
 "#,
             ),
+            #[cfg(feature = "lang-cpp")]
+            Self::Cpp => Some(
+                // `obj.f()` / `ptr->f()` are `field_expression`s, `ns::f()` and
+                // `Type::f()` are `qualified_identifier`s, and `f<T>()` wraps the
+                // name in a `template_function`.
+                r#"
+(call_expression function: (identifier) @call.name)
+(call_expression function: (field_expression field: (field_identifier) @call.name))
+(call_expression function: (qualified_identifier name: (identifier) @call.name))
+(call_expression function: (template_function name: (identifier) @call.name))
+"#,
+            ),
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => Some(
                 // A bare `foo()` is `(call (identifier) ...)`, while `a.foo()`
@@ -392,7 +444,12 @@ impl Lang {
                         .utf8_text(source)
                         .unwrap_or("<invalid utf8>")
                         .to_string();
-                    let node = symbol_node_for_capture(kind_str, capture.node);
+                    #[allow(unused_mut)]
+                    let mut node = symbol_node_for_capture(kind_str, capture.node);
+                    #[cfg(feature = "lang-cpp")]
+                    if *self == Self::Cpp {
+                        node = cpp_declaration_for(node);
+                    }
                     let body_span = symbol_body_span(node);
                     symbols.push(Symbol {
                         name,
@@ -501,6 +558,8 @@ impl Lang {
             Self::Go,
             #[cfg(feature = "lang-csharp")]
             Self::CSharp,
+            #[cfg(feature = "lang-cpp")]
+            Self::Cpp,
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript,
             #[cfg(feature = "lang-markdown")]
@@ -535,6 +594,29 @@ fn symbol_node_for_capture<'tree>(
                 break;
             }
         }
+    }
+    node
+}
+
+/// A C++ name sits inside declarators -- `Ns::Type::f` in a
+/// `qualified_identifier` in a `function_declarator`, possibly under a
+/// `pointer_declarator` -- so its parent spans only the signature. The symbol's
+/// extent is the declaration that owns them, or a caller's body would fall
+/// outside it and the file would have no call edges.
+#[cfg(feature = "lang-cpp")]
+fn cpp_declaration_for(mut node: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+    while matches!(
+        node.kind(),
+        "function_declarator"
+            | "qualified_identifier"
+            | "pointer_declarator"
+            | "reference_declarator"
+            | "nested_namespace_specifier"
+    ) {
+        let Some(parent) = node.parent() else {
+            break;
+        };
+        node = parent;
     }
     node
 }
@@ -613,6 +695,9 @@ mod tests {
             ("zsh", "bash"),
             ("go", "go"),
             ("cs", "csharp"),
+            ("cpp", "cpp"),
+            ("h", "cpp"),
+            ("hpp", "cpp"),
             ("gd", "gdscript"),
             ("md", "markdown"),
             ("mdx", "markdown"),
@@ -1071,6 +1156,100 @@ public struct Clipboard {
             call_sites.iter().any(|site| site.callee == "WriteLine"),
             "member invocations must expose their method name: {call_sites:?}"
         );
+    }
+
+    // #cppindex: C++ is a fully indexed language, not only an ast-grep grammar.
+    // The fixture is shaped like an Unreal plugin header -- types, a namespace,
+    // inline functions, prototypes, member declarations, and an out-of-line
+    // definition -- because headers declare most of a C++ API without bodies.
+    #[cfg(feature = "lang-cpp")]
+    #[test]
+    fn test_extract_cpp_symbols() {
+        let source = br#"#pragma once
+#include <string>
+
+class FForward;
+
+namespace Haiven::Rest
+{
+	using ChannelId = std::string;
+	typedef int Count;
+	enum class EState : uint8 { Ready, Closed };
+	struct FRequest
+	{
+		std::string Path;
+		void Send() const;
+	};
+	class FClient
+	{
+	public:
+		int Connect(const std::string& Url);
+	};
+	inline FRequest GetChannel(const std::string& Id)
+	{
+		return FRequest{Id};
+	}
+	FRequest Build(int Count);
+}
+
+int Haiven::Rest::FClient::Connect(const std::string& Url) { return 0; }
+"#;
+        let symbols = Lang::Cpp.extract_symbols(source).unwrap();
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        for expected in [
+            "Rest", "ChannelId", "Count", "EState", "Ready", "FRequest", "Path", "Send",
+            "FClient", "Connect", "GetChannel", "Build",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}, got {names:?}");
+        }
+        assert!(
+            !names.contains(&"FForward"),
+            "a forward declaration is not a type definition: {names:?}"
+        );
+        let kind_of = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .kind
+                .clone()
+        };
+        assert_eq!(kind_of("FRequest"), "struct");
+        assert_eq!(kind_of("FClient"), "class");
+        assert_eq!(kind_of("EState"), "enum");
+        assert_eq!(kind_of("ChannelId"), "type_alias");
+        assert_eq!(kind_of("GetChannel"), "function");
+        assert_eq!(kind_of("Send"), "method");
+        assert_eq!(kind_of("Path"), "field");
+    }
+
+    #[cfg(feature = "lang-cpp")]
+    #[test]
+    fn test_extract_cpp_call_edges() {
+        let source = br#"static int Helper() { return 1; }
+int Run(Client* client) {
+    client->Send();
+    Haiven::Log("hi");
+    return Helper();
+}
+"#;
+        let symbols = Lang::Cpp.extract_symbols(source).unwrap();
+        let call_sites = crate::extract_call_sites(Lang::Cpp, source).unwrap();
+        let edges = crate::resolve_edges(&symbols, &call_sites);
+        let pairs: Vec<String> = edges
+            .iter()
+            .map(|edge| format!("{} -> {}", edge.caller, edge.callee))
+            .collect();
+        assert!(
+            pairs.contains(&"Run -> Helper".to_string()),
+            "expected a Run -> Helper call edge, got {pairs:?}"
+        );
+        for callee in ["Send", "Log"] {
+            assert!(
+                call_sites.iter().any(|site| site.callee == callee),
+                "member and qualified calls must expose {callee}: {call_sites:?}"
+            );
+        }
     }
 
     #[cfg(feature = "lang-gdscript")]

@@ -62,7 +62,9 @@ impl RenameTarget {
             "struct" | "enum" | "enum_class" | "trait" | "class" | "data_class"
             | "sealed_class" | "interface" | "type_alias" | "union" | "object"
             | "companion_object" | "impl" | "record" | "delegate" => Self::Type,
-            "const" | "static" | "variable" | "property" | "enum_member" => Self::Value,
+            "const" | "static" | "variable" | "property" | "enum_member" | "field" => {
+                Self::Value
+            }
             _ => Self::Unresolved,
         }
     }
@@ -132,6 +134,15 @@ pub fn identifier_node_kinds(lang: Lang) -> &'static [&'static str] {
         Lang::Go => &["identifier", "type_identifier", "field_identifier"],
         #[cfg(feature = "lang-csharp")]
         Lang::CSharp => &["identifier"],
+        // C++ splits names by position like Go: members are `field_identifier`,
+        // types `type_identifier`, namespaces `namespace_identifier`.
+        #[cfg(feature = "lang-cpp")]
+        Lang::Cpp => &[
+            "identifier",
+            "type_identifier",
+            "field_identifier",
+            "namespace_identifier",
+        ],
         // GDScript splits the two: `name` is the declared name of a statement
         // or block, `identifier` is every reference to one.
         #[cfg(feature = "lang-gdscript")]

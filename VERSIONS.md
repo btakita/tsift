@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **Promote C++ to indexed navigation support (`#cppindex`).** `.cpp`, `.cc`, `.cxx`, `.hpp`, `.hh`, `.hxx`, `.inl`, and `.h` files (`.h` is parsed as C++) now provide symbols and call edges to search and graph commands. Symbols are types, enumerators, namespaces, aliases, functions, methods, and fields, including header prototypes and member declarations. A symbol's extent climbs from its name through C++'s nested declarators to the owning declaration, so call edges resolve inside out-of-line and pointer-returning definitions. Before this, an Unreal plugin's 54 headers and 12 sources were skipped entirely and could not be searched or explained.
+
 ## 0.1.101
 
 - **Fail fast before a root graph refresh can enter swap thrash.** Federated graph materialization now checks its aggregate work budget before loading any graph rows and refuses projections above 64 scopes or 250,000 indexed symbols with a scoped-refresh remedy. This turns the observed 336-scope, ~1.02-million-symbol runaway from hours of CPU and swap pressure into an immediate actionable error, while leaving explicit per-scope refreshes available.

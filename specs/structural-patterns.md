@@ -65,9 +65,9 @@ reaches is what it can actually do:
 
 | Fans out to | Meaning | Languages |
 |---|---|---|
-| `tsift-astgrep` + `tsift-graph` + `tsift-search` | Indexable **and** structural. Searchable, graphable, and eligible for the symbol-resolved edit kinds | rust, python, typescript, javascript, kotlin, bash, go, csharp, markdown |
+| `tsift-astgrep` + `tsift-graph` + `tsift-search` | Indexable **and** structural. Searchable, graphable, and eligible for the symbol-resolved edit kinds | rust, python, typescript, javascript, kotlin, bash, go, csharp, cpp, markdown |
 | `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig, gdscript — `ast-grep-language` ships no Zig or GDScript grammar |
-| `tsift-astgrep` only | **Structural-only**: `ast-grep search`/`rewrite` and the `structural_rewrite` edit intent work; the language is not indexed, not searchable, and not graphable | c, cpp, css, dart, elixir, haskell, hcl, html, java, json, lua, nix, php, ruby, scala, solidity, swift, yaml |
+| `tsift-astgrep` only | **Structural-only**: `ast-grep search`/`rewrite` and the `structural_rewrite` edit intent work; the language is not indexed, not searchable, and not graphable | c, css, dart, elixir, haskell, hcl, html, java, json, lua, nix, php, ruby, scala, solidity, swift, yaml |
 
 Structural-only is a deliberate tier, not an oversight. A tree-sitter grammar is
 enough to match and rewrite a shape, but indexing additionally needs per-language
@@ -93,6 +93,17 @@ C# followed the same path under `#csharpindex`: `.cs` files now contribute type,
 method, property, enum-member, and local-function symbols plus invocation call
 edges. Its identifier-aware rename edits declarations and calls while leaving
 comments, strings, and same-named property reads untouched.
+
+C++ followed under `#cppindex`. `.cpp`/`.cc`/`.cxx`/`.hpp`/`.hh`/`.hxx`/`.inl`
+and `.h` (parsed as C++, which also covers C headers) contribute class, struct,
+union, enum, enumerator, namespace, alias, function, method, and field symbols.
+Header prototypes and member declarations count as symbols, because a header
+declares most of a C++ API without bodies. A symbol's extent climbs from its
+name through the declarators (`function_declarator`, `qualified_identifier`,
+pointer and reference declarators) to the declaration that owns them, so a
+caller's body is inside it and call edges resolve. `.c` stays structural-only.
+C++ is indexed for search and graph, but `rename_symbol` is not promoted: its
+semantic-edit contract stays structural until a C++ target matcher exists.
 
 Promoting a structural-only language therefore means adding the graph/search
 side. That unlocks `rename_symbol` immediately — it reads occurrences out of the
