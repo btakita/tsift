@@ -39,12 +39,13 @@ tree-sitter-language = { version = "0.1", optional = true }
 tree-sitter-json = { version = "0.24", optional = true }
 tree-sitter-yaml = { version = "0.7", optional = true }
 serde_json = { version = "1", optional = true }
+tree-sitter-xml = { version = "0.7", optional = true }
 
 [build-dependencies]
 cc = { version = "1.1", optional = true }
 
 [features]
-default = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-csharp", "lang-c", "lang-cpp", "lang-odin", "lang-jai", "lang-gdscript", "lang-markdown", "lang-json", "lang-yaml"]
+default = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-csharp", "lang-c", "lang-cpp", "lang-odin", "lang-jai", "lang-gdscript", "lang-markdown", "lang-json", "lang-yaml", "lang-xsd"]
 lang-rust = ["dep:tree-sitter-rust"]
 lang-python = ["dep:tree-sitter-python"]
 lang-typescript = ["dep:tree-sitter-typescript"]
@@ -62,4 +63,5 @@ lang-jai = ["dep:cc", "dep:tree-sitter-language"]
 lang-markdown = ["dep:tsift-md-ast"]
 lang-json = ["dep:tree-sitter-json", "dep:serde_json"]
 lang-yaml = ["dep:tree-sitter-yaml", "dep:serde_json"]
-all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-csharp", "lang-c", "lang-cpp", "lang-odin", "lang-jai", "lang-gdscript", "lang-markdown", "lang-json", "lang-yaml"]
+lang-xsd = ["dep:tree-sitter-xml"]
+all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript", "lang-kotlin", "lang-zig", "lang-bash", "lang-go", "lang-csharp", "lang-c", "lang-cpp", "lang-odin", "lang-jai", "lang-gdscript", "lang-markdown", "lang-json", "lang-yaml", "lang-xsd"]

@@ -10,6 +10,10 @@ use tsift_core::{GraphEdge, GraphNode, GraphProjection, GraphProvenance};
 pub mod lang;
 #[cfg(any(feature = "lang-json", feature = "lang-yaml"))]
 mod contract;
+#[cfg(feature = "lang-xsd")]
+mod xml;
+#[cfg(feature = "lang-xsd")]
+mod xml_contract;
 pub use lang::{Lang, Symbol};
 
 pub mod complexity;
@@ -150,6 +154,19 @@ struct PendingRoute {
 }
 
 pub fn extract_call_sites(lang: Lang, source: &[u8]) -> Result<Vec<CallSite>> {
+    // An XML contract's QName references (`type=`, `ref=`, ...) are its call
+    // sites.
+    #[cfg(feature = "lang-xsd")]
+    if lang.is_xml_contract() {
+        let mut parser = Parser::new();
+        parser.set_language(&lang.tree_sitter_language())?;
+        let tree = parser
+            .parse(source, None)
+            .ok_or_else(|| anyhow::anyhow!("parse failed"))?;
+        return Ok(xml_contract::project(lang, &tree, source)
+            .map(|projection| projection.sites)
+            .unwrap_or_default());
+    }
     // A contract document's `$ref` pointers are its call sites.
     #[cfg(any(feature = "lang-json", feature = "lang-yaml"))]
     if lang.is_contract_format() {

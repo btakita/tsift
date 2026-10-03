@@ -66,7 +66,7 @@ reaches is what it can actually do:
 | Fans out to | Meaning | Languages |
 |---|---|---|
 | `tsift-astgrep` + `tsift-graph` + `tsift-search` | Indexable **and** structural. Searchable, graphable, and eligible for the symbol-resolved edit kinds | rust, python, typescript, javascript, kotlin, bash, go, csharp, c, cpp, markdown, json, yaml |
-| `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig, odin, gdscript, jai — `ast-grep-language` ships no Zig, Odin, GDScript, or Jai grammar |
+| `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig, odin, gdscript, jai, xsd — `ast-grep-language` ships no Zig, Odin, GDScript, Jai, or XML grammar |
 | `tsift-astgrep` only | **Structural-only**: `ast-grep search`/`rewrite` and the `structural_rewrite` edit intent work; the language is not indexed, not searchable, and not graphable | css, dart, elixir, haskell, hcl, html, java, lua, nix, php, ruby, scala, solidity, swift |
 
 Structural-only is a deliberate tier, not an oversight. A tree-sitter grammar is
@@ -181,6 +181,42 @@ full-text indexed. Package-manager lockfiles (`package-lock.json`,
 `pnpm-lock.yaml`, ...) are excluded by `Lang::from_path`, because they are
 large, generated, and never navigated. Contract keys are not identifiers, so
 `rename_symbol` does not apply to either format.
+
+XML Schema followed under `#xsdcontract`, through the same contract idea over
+XML. `.xsd` is indexed with `tree-sitter-xml`: every indexed `Lang` needs a
+grammar anyway (chunking, complexity, the conformance suite), and its node
+spans are the symbol extents, so a separate streaming parser would add a second
+view of the same bytes. The tree is lowered by `tsift-graph::xml` into
+namespace-resolved elements, and `tsift-graph::xml_contract` projects them. The
+XML Schema vocabulary is matched by namespace URI
+(`http://www.w3.org/2001/XMLSchema`), never by prefix, so `xs:`, `xsd:`, and a
+default-namespace schema read alike; a document whose root is not that
+namespace's `schema` element yields nothing. It then yields:
+
+- **Components:** each named top-level `complexType`, `simpleType`, `element`,
+  `attribute`, `group`, and `attributeGroup` (including those inside
+  `redefine`/`override`) as a `schema`, with the XSD element name as the
+  symbol's `node_kind`.
+- **Properties:** the elements and attributes a component declares, as
+  `Owner.child` `property` symbols, found through `sequence`/`choice`/`all`,
+  anonymous types, and `complexContent`/`simpleContent` derivations. A
+  `ref=` particle is a property named by its target's local part. A local
+  element's own anonymous type nests further (`Order.items.item`).
+
+Every QName in `type=`, `ref=`, `base=`, `substitutionGroup=`, `itemType=`, and
+each member of `memberTypes=` is a call site naming the local part, its prefix
+resolved through the in-scope namespace bindings. A QName in the XML Schema
+namespace is a built-in type (`xs:string`) and yields no site; a QName whose
+prefix is unbound yields none either. As with JSON, a property is not a
+caller, so `graph Address --callers` lists the component whose element is
+`type="tns:Address"` and the type whose `extension base="tns:Address"`.
+
+Plain `.xml` is **not** indexed. Unlike `.json`, where a contract and a config
+share one extension and only the root's keys tell them apart, XML contracts
+carry their own extensions, while `.xml` in a typical tree is IDE state,
+build descriptors, test reports, and generated resources: large, rarely
+navigated, and with no symbols to project. Adding it would grow the index for
+full-text hits that `rg` already serves.
 
 Promoting a structural-only language therefore means adding the graph/search
 side. That unlocks `rename_symbol` immediately — it reads occurrences out of the

@@ -76,6 +76,8 @@ pub enum Lang {
     Json,
     #[cfg(feature = "lang-yaml")]
     Yaml,
+    #[cfg(feature = "lang-xsd")]
+    Xsd,
 }
 
 #[allow(dead_code)]
@@ -128,6 +130,8 @@ impl Lang {
             "json" => Some(Self::Json),
             #[cfg(feature = "lang-yaml")]
             "yaml" | "yml" => Some(Self::Yaml),
+            #[cfg(feature = "lang-xsd")]
+            "xsd" => Some(Self::Xsd),
             _ => None,
         }
     }
@@ -183,6 +187,8 @@ impl Lang {
             Self::Json => tree_sitter_json::LANGUAGE.into(),
             #[cfg(feature = "lang-yaml")]
             Self::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+            #[cfg(feature = "lang-xsd")]
+            Self::Xsd => tree_sitter_xml::LANGUAGE_XML.into(),
         }
     }
 
@@ -226,6 +232,8 @@ impl Lang {
             Self::Json => "json",
             #[cfg(feature = "lang-yaml")]
             Self::Yaml => "yaml",
+            #[cfg(feature = "lang-xsd")]
+            Self::Xsd => "xsd",
         }
     }
 
@@ -517,6 +525,9 @@ impl Lang {
             Self::Json => "(pair key: (string) @key.name)",
             #[cfg(feature = "lang-yaml")]
             Self::Yaml => "(block_mapping_pair key: (_) @key.name)",
+            // Projected by `crate::xml_contract`.
+            #[cfg(feature = "lang-xsd")]
+            Self::Xsd => "(STag (Name) @tag.name)",
         }
     }
 
@@ -656,6 +667,10 @@ impl Lang {
                 .into_iter()
                 .map(md_symbol_to_symbol)
                 .collect());
+        }
+        #[cfg(feature = "lang-xsd")]
+        if let Some(projection) = crate::xml_contract::project(*self, &tree, source) {
+            return Ok(projection.symbols);
         }
         #[cfg(any(feature = "lang-json", feature = "lang-yaml"))]
         if let Some(root) = self.lower_contract(&tree, source) {
@@ -839,18 +854,34 @@ impl Lang {
             Self::Json,
             #[cfg(feature = "lang-yaml")]
             Self::Yaml,
+            #[cfg(feature = "lang-xsd")]
+            Self::Xsd,
         ]
     }
 
-    /// Whether this is a data format whose symbols come from the contract
-    /// projection (JSON Schema / OpenAPI / AsyncAPI) rather than a query.
+    /// Whether this is a data format whose symbols come from a contract
+    /// projection (JSON Schema / OpenAPI / AsyncAPI, XML Schema) rather than a
+    /// query.
     pub fn is_contract_format(&self) -> bool {
+        if self.is_xml_contract() {
+            return true;
+        }
         #[cfg(feature = "lang-json")]
         if *self == Self::Json {
             return true;
         }
         #[cfg(feature = "lang-yaml")]
         if *self == Self::Yaml {
+            return true;
+        }
+        false
+    }
+
+    /// Whether this is an XML contract format, projected by
+    /// `crate::xml_contract` rather than `crate::contract`.
+    pub fn is_xml_contract(&self) -> bool {
+        #[cfg(feature = "lang-xsd")]
+        if *self == Self::Xsd {
             return true;
         }
         false
@@ -1127,6 +1158,14 @@ mod tests {
             assert_eq!(Lang::from_path(Path::new("a/schema.json")), Some(Lang::Json));
             assert_eq!(Lang::from_path(Path::new("a/package-lock.json")), None);
             assert_eq!(Lang::from_path(Path::new("Makefile")), None);
+        }
+        #[cfg(feature = "lang-xsd")]
+        {
+            use std::path::Path;
+            assert_eq!(Lang::from_path(Path::new("a/order.xsd")), Some(Lang::Xsd));
+            // Only contract extensions are XML languages; plain `.xml` is not
+            // indexed.
+            assert_eq!(Lang::from_path(Path::new("a/pom.xml")), None);
         }
         assert!(Lang::from_extension("").is_none());
         assert!(Lang::from_extension("txt").is_none());

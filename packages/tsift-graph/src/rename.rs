@@ -165,6 +165,8 @@ pub fn identifier_node_kinds(lang: Lang) -> &'static [&'static str] {
         Lang::Json => &[],
         #[cfg(feature = "lang-yaml")]
         Lang::Yaml => &[],
+        #[cfg(feature = "lang-xsd")]
+        Lang::Xsd => &[],
     }
 }
 

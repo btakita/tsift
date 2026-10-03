@@ -194,6 +194,15 @@ const CASES: &[Case] = &[
         expect_kind: "channel",
         truncated: "openapi: 3.0.0\npaths:\n  /x:\n    get: {operationId: [",
     },
+    #[cfg(feature = "lang-xsd")]
+    Case {
+        lang: Lang::Xsd,
+        extensions: &["xsd"],
+        source: "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">\n  <xs:complexType name=\"Order\"/>\n</xs:schema>\n",
+        expect_name: "Order",
+        expect_kind: "schema",
+        truncated: "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\">\n  <xs:complexType name=\"Order\"><xs:sequence>",
+    },
 ];
 
 /// Invariants that must hold for every extracted symbol, in every language.
