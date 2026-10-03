@@ -158,6 +158,15 @@ const CASES: &[Case] = &[
         expect_kind: "function",
         truncated: "main :: ( {\n    print(",
     },
+    #[cfg(feature = "lang-luau")]
+    Case {
+        lang: Lang::Luau,
+        extensions: &["luau"],
+        source: "local function main()\n    print(\"hi\")\nend\n",
+        expect_name: "main",
+        expect_kind: "function",
+        truncated: "local function main(\n    print(",
+    },
     #[cfg(feature = "lang-gdscript")]
     Case {
         lang: Lang::GdScript,

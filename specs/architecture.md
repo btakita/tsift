@@ -232,6 +232,7 @@ all-languages = ["lang-rust", "lang-python", "lang-typescript", "lang-javascript
 | Zig | `tree-sitter-zig` | 1.1.2 | `LANGUAGE` | `.zig` |
 | Bash | `tree-sitter-bash` | 0.25.1 | `LANGUAGE` | `.sh`, `.bash`, `.zsh` |
 | GDScript | `tree-sitter-gdscript` | 6.1.0 | `LANGUAGE` | `.gd` |
+| Luau | `tree-sitter-luau` | 1.2.0 | `LANGUAGE` | `.luau` |
 | Markdown | `tree-sitter-md` | 0.5.3 | `LANGUAGE` + `LANGUAGE_INLINE` | `.md`, `.mdx` |
 | Jai (opt-in `lang-jai`) | `tsift-tree-sitter-jai` (renamed `tree-sitter-jai`) | workspace crate | `LANGUAGE` | `.jai` |
 

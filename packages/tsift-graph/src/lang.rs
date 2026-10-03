@@ -57,6 +57,8 @@ pub enum Lang {
     Odin,
     #[cfg(feature = "lang-jai")]
     Jai,
+    #[cfg(feature = "lang-luau")]
+    Luau,
     #[cfg(feature = "lang-gdscript")]
     GdScript,
     #[cfg(feature = "lang-markdown")]
@@ -113,6 +115,11 @@ impl Lang {
             "odin" => Some(Self::Odin),
             #[cfg(feature = "lang-jai")]
             "jai" => Some(Self::Jai),
+            // Only `.luau`: plain `.lua` (5.2+ goto, bitwise operators,
+            // `<const>` attributes) is not Luau, and stays structural-only
+            // under ast-grep's Lua grammar.
+            #[cfg(feature = "lang-luau")]
+            "luau" => Some(Self::Luau),
             #[cfg(feature = "lang-gdscript")]
             "gd" => Some(Self::GdScript),
             #[cfg(feature = "lang-markdown")]
@@ -172,6 +179,8 @@ impl Lang {
             Self::Odin => tree_sitter_odin::LANGUAGE.into(),
             #[cfg(feature = "lang-jai")]
             Self::Jai => tree_sitter_jai::LANGUAGE.into(),
+            #[cfg(feature = "lang-luau")]
+            Self::Luau => tree_sitter_luau::LANGUAGE.into(),
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => tree_sitter_gdscript::LANGUAGE.into(),
             #[cfg(feature = "lang-markdown")]
@@ -219,6 +228,8 @@ impl Lang {
             Self::Odin => "odin",
             #[cfg(feature = "lang-jai")]
             Self::Jai => "jai",
+            #[cfg(feature = "lang-luau")]
+            Self::Luau => "luau",
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => "gdscript",
             #[cfg(feature = "lang-markdown")]
@@ -504,6 +515,32 @@ impl Lang {
                 (onready_variable_statement name: (name) @variable.name)
             "#
             }
+            #[cfg(feature = "lang-luau")]
+            Self::Luau => {
+                // A function's declared name is the trailing identifier of
+                // `f`, `M.f`, or `M:f`; a `:` declaration is a method. Values
+                // bound to a `function` literal (`local f = function`,
+                // `M.f = function`, `{ f = function }`) are functions too.
+                // Chunk-level locals are variables, a chunk-level
+                // `local X = require(...)` an import, and a chunk-level
+                // `local X = {...}` a table that `luau_refine_tables` turns
+                // into a `class` or a `mod`; locals inside a function body
+                // stay out so they cannot shadow its call edges.
+                r#"
+                (function_declaration name: (identifier) @function.name)
+                (function_declaration name: (dot_index_expression field: (identifier) @function.name))
+                (function_declaration name: (method_index_expression method: (identifier) @method.name))
+                (type_definition name: (identifier) @type_alias.name)
+                (type_definition name: (generic_type . (identifier) @type_alias.name))
+                (variable_declaration (assignment_statement (variable_list name: (identifier) @function.name) (expression_list value: (function_definition))))
+                (assignment_statement (variable_list name: (dot_index_expression field: (identifier) @function.name)) (expression_list value: (function_definition)))
+                (field name: (identifier) @function.name value: (function_definition))
+                (chunk (variable_declaration (assignment_statement (variable_list name: (identifier) @import.name) (expression_list value: (function_call name: (identifier) @_require (#eq? @_require "require"))))))
+                (chunk (variable_declaration (assignment_statement (variable_list name: (identifier) @table.name) (expression_list value: (table_constructor)))))
+                (chunk (variable_declaration (assignment_statement (variable_list name: (identifier) @variable.name))))
+                (chunk (variable_declaration (variable_list name: (identifier) @variable.name)))
+            "#
+            }
             #[cfg(feature = "lang-markdown")]
             Self::Markdown => {
                 r#"
@@ -620,6 +657,16 @@ impl Lang {
 (call_expression function: (member_expression (identifier) @call.name .))
 "#,
             ),
+            #[cfg(feature = "lang-luau")]
+            Self::Luau => Some(
+                // `M.f()` is a `dot_index_expression` callee and `obj:f()` a
+                // `method_index_expression`; the callee is the trailing name.
+                r#"
+(function_call name: (identifier) @call.name)
+(function_call name: (dot_index_expression field: (identifier) @call.name))
+(function_call name: (method_index_expression method: (identifier) @call.name))
+"#,
+            ),
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript => Some(
                 // A bare `foo()` is `(call (identifier) ...)`, while `a.foo()`
@@ -730,6 +777,11 @@ impl Lang {
                         }
                         body_span = odin_body_span(node).or(body_span);
                     }
+                    #[cfg(feature = "lang-luau")]
+                    if *self == Self::Luau {
+                        node = luau_symbol_node(capture.node);
+                        body_span = luau_body_span(node);
+                    }
                     symbols.push(Symbol {
                         name,
                         kind: kind_str.to_string(),
@@ -748,6 +800,10 @@ impl Lang {
         #[cfg(feature = "lang-bash")]
         if *self == Self::Bash {
             Self::extract_bash_aliases(&tree, source, &mut symbols);
+        }
+        #[cfg(feature = "lang-luau")]
+        if *self == Self::Luau {
+            luau_refine_tables(&tree, source, &mut symbols);
         }
         symbols.sort_by(|a, b| a.line.cmp(&b.line).then(a.name.cmp(&b.name)));
         symbols.dedup_by(|b, a| {
@@ -845,6 +901,8 @@ impl Lang {
             Self::Odin,
             #[cfg(feature = "lang-jai")]
             Self::Jai,
+            #[cfg(feature = "lang-luau")]
+            Self::Luau,
             #[cfg(feature = "lang-gdscript")]
             Self::GdScript,
             #[cfg(feature = "lang-markdown")]
@@ -1045,6 +1103,118 @@ fn odin_body_span(node: tree_sitter::Node<'_>) -> Option<(usize, usize)> {
         .named_children(&mut cursor)
         .find(|child| child.kind() == "block")?;
     Some((block.start_byte(), block.end_byte()))
+}
+
+/// A Luau name sits inside a `variable_list`, a `dot_index_expression`, or a
+/// `method_index_expression`, so its parent spans only the name. The symbol's
+/// extent is the statement that binds it -- a `function_declaration`, a
+/// `local` declaration, an assignment, a table `field`, or a `type` alias --
+/// or a function's body would fall outside it and it would have no call edges.
+#[cfg(feature = "lang-luau")]
+fn luau_symbol_node(name: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+    let mut node = name;
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "function_declaration" | "type_definition" | "field" | "variable_declaration" => {
+                return parent;
+            }
+            "assignment_statement"
+                if parent
+                    .parent()
+                    .is_none_or(|grand| grand.kind() != "variable_declaration") =>
+            {
+                return parent;
+            }
+            "chunk" | "block" => break,
+            _ => node = parent,
+        }
+    }
+    name.parent().unwrap_or(name)
+}
+
+/// A `function_declaration` keeps its body in the `body` field; a binding to a
+/// `function` literal keeps it in the literal's.
+#[cfg(feature = "lang-luau")]
+fn luau_body_span(node: tree_sitter::Node<'_>) -> Option<(usize, usize)> {
+    if let Some(body) = node.child_by_field_name("body") {
+        return Some((body.start_byte(), body.end_byte()));
+    }
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "function_definition" {
+            let body = current.child_by_field_name("body")?;
+            return Some((body.start_byte(), body.end_byte()));
+        }
+        // Only a bound `function` literal counts, not one nested in a table
+        // constructor, a call's arguments, or a body.
+        if matches!(current.kind(), "block" | "table_constructor" | "arguments") {
+            continue;
+        }
+        let mut cursor = current.walk();
+        let children: Vec<_> = current.named_children(&mut cursor).collect();
+        stack.extend(children.into_iter().rev());
+    }
+    None
+}
+
+/// Name a chunk-level `local X = {...}` table by how the module uses it. A
+/// table with `X.__index = X` is the Luau class idiom, and the table a
+/// ModuleScript ends with `return X` is the module; any other table is a plain
+/// variable.
+#[cfg(feature = "lang-luau")]
+fn luau_refine_tables(tree: &tree_sitter::Tree, source: &[u8], symbols: &mut [Symbol]) {
+    let root = tree.root_node();
+    let text = |node: tree_sitter::Node<'_>| node.utf8_text(source).unwrap_or("");
+    let mut classes = std::collections::HashSet::new();
+    let mut returned = None;
+    let mut cursor = root.walk();
+    for statement in root.named_children(&mut cursor) {
+        match statement.kind() {
+            "assignment_statement" => {
+                let (Some(targets), Some(values)) =
+                    (statement.named_child(0), statement.named_child(1))
+                else {
+                    continue;
+                };
+                if targets.named_child_count() != 1 || values.named_child_count() != 1 {
+                    continue;
+                }
+                let (Some(target), Some(value)) = (targets.named_child(0), values.named_child(0))
+                else {
+                    continue;
+                };
+                if target.kind() == "dot_index_expression"
+                    && target
+                        .child_by_field_name("field")
+                        .is_some_and(|field| text(field) == "__index")
+                    && target
+                        .child_by_field_name("table")
+                        .is_some_and(|table| text(table) == text(value))
+                {
+                    classes.insert(text(value).to_string());
+                }
+            }
+            "return_statement" => {
+                returned = statement
+                    .named_child(0)
+                    .filter(|values| values.named_child_count() == 1)
+                    .and_then(|values| values.named_child(0))
+                    .filter(|value| value.kind() == "identifier")
+                    .map(|value| text(value).to_string());
+            }
+            _ => {}
+        }
+    }
+    for symbol in symbols.iter_mut().filter(|symbol| symbol.kind == "table") {
+        symbol.kind = if classes.contains(&symbol.name) {
+            "class"
+        } else if returned.as_deref() == Some(symbol.name.as_str()) {
+            "mod"
+        } else {
+            "variable"
+        }
+        .to_string();
+    }
 }
 
 /// The Jai grammar tags a bare identifier value with the declaration's `name`
@@ -2065,6 +2235,173 @@ run :: () {
             call_sites.iter().any(|site| site.callee == "floor"),
             "a module-qualified call must expose its procedure name: {call_sites:?}"
         );
+    }
+
+    // #luauindex: Luau (Roblox's typed Lua) names a function by the trailing
+    // identifier of `f`, `M.f`, or `M:f`, binds functions as values, and
+    // shapes a ModuleScript as a table it returns. Locals inside a function
+    // body must not become symbols.
+    #[cfg(feature = "lang-luau")]
+    #[test]
+    fn test_extract_luau_symbols() {
+        let source = br#"--!strict
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Signal = require(script.Parent.Signal)
+local Util = require("./util")
+
+export type Point = { x: number, y: number }
+type Id = string
+type Map<K, V> = { [K]: V }
+
+local MAX_SPEED = 16
+local DEFAULTS = { speed = 1 }
+
+local Counter = {}
+Counter.__index = Counter
+
+function Counter.new(start: number): Counter
+    local self = setmetatable({ value = start }, Counter)
+    return self
+end
+
+function Counter:increment(by: number?)
+    local step = by or 1
+    self.value += step
+end
+
+local function clamp(n: number): number
+    return math.clamp(n, 0, MAX_SPEED)
+end
+
+local lerp = function(a: number, b: number, t: number): number
+    return a + (b - a) * t
+end
+
+Counter.reset = function(self)
+    self.value = 0
+end
+
+local Handlers = {
+    onStart = function() end,
+}
+
+return Counter
+"#;
+        let symbols = Lang::Luau.extract_symbols(source).unwrap();
+        let kind_of = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing {name}, got {symbols:?}"))
+                .kind
+                .clone()
+        };
+        assert_eq!(kind_of("ReplicatedStorage"), "variable");
+        assert_eq!(kind_of("Signal"), "import");
+        assert_eq!(kind_of("Util"), "import");
+        assert_eq!(kind_of("Point"), "type_alias");
+        assert_eq!(kind_of("Id"), "type_alias");
+        assert_eq!(kind_of("Map"), "type_alias");
+        assert_eq!(kind_of("MAX_SPEED"), "variable");
+        assert_eq!(kind_of("DEFAULTS"), "variable");
+        assert_eq!(kind_of("Counter"), "class");
+        assert_eq!(kind_of("new"), "function");
+        assert_eq!(kind_of("increment"), "method");
+        assert_eq!(kind_of("clamp"), "function");
+        assert_eq!(kind_of("lerp"), "function");
+        assert_eq!(kind_of("reset"), "function");
+        assert_eq!(kind_of("onStart"), "function");
+        assert_eq!(kind_of("Handlers"), "variable");
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        for absent in ["self", "step", "start", "by", "value", "speed"] {
+            assert!(
+                !names.contains(&absent),
+                "locals, parameters, and table fields are not symbols: {names:?}"
+            );
+        }
+        let increment = symbols.iter().find(|s| s.name == "increment").unwrap();
+        assert_eq!(increment.node_kind, "function_declaration");
+        assert!(increment.end_line > increment.line && increment.body_start_byte.is_some());
+        let lerp = symbols.iter().find(|s| s.name == "lerp").unwrap();
+        assert!(
+            lerp.end_line > lerp.line && lerp.body_start_byte.is_some(),
+            "a function bound to a local spans its literal: {lerp:?}"
+        );
+        let handlers = symbols.iter().find(|s| s.name == "Handlers").unwrap();
+        assert_eq!(
+            handlers.body_start_byte, None,
+            "a table's nested function is not the table's body"
+        );
+    }
+
+    #[cfg(feature = "lang-luau")]
+    #[test]
+    fn test_luau_returned_table_is_a_module() {
+        let source = br#"local Config = {}
+
+function Config.load(path: string)
+    return Config.parse(path)
+end
+
+return Config
+"#;
+        let symbols = Lang::Luau.extract_symbols(source).unwrap();
+        let config = symbols.iter().find(|s| s.name == "Config").unwrap();
+        assert_eq!(config.kind, "mod");
+    }
+
+    #[cfg(feature = "lang-luau")]
+    #[test]
+    fn test_extract_luau_call_edges() {
+        let source = br#"local Signal = require(script.Parent.Signal)
+
+local function helper(): number
+    return 1
+end
+
+local Service = {}
+
+function Service:start()
+    helper()
+    Signal.fire(self)
+    self:tick()
+end
+
+Service.stop = function()
+    return helper()
+end
+
+return Service
+"#;
+        let symbols = Lang::Luau.extract_symbols(source).unwrap();
+        let call_sites = crate::extract_call_sites(Lang::Luau, source).unwrap();
+        let edges = crate::resolve_edges(&symbols, &call_sites);
+        let pairs: Vec<String> = edges
+            .iter()
+            .map(|edge| format!("{} -> {}", edge.caller, edge.callee))
+            .collect();
+        for expected in [
+            "start -> helper",
+            "start -> fire",
+            "start -> tick",
+            "stop -> helper",
+        ] {
+            assert!(
+                pairs.contains(&expected.to_string()),
+                "expected a {expected} call edge, got {pairs:?}"
+            );
+        }
+        assert!(
+            call_sites.iter().any(|site| site.callee == "require"),
+            "require is an ordinary call: {call_sites:?}"
+        );
+    }
+
+    #[cfg(feature = "lang-luau")]
+    #[test]
+    fn test_lua_extension_is_not_luau() {
+        assert_eq!(Lang::from_extension("luau"), Some(Lang::Luau));
+        assert_eq!(Lang::from_extension("lua"), None);
     }
 
     #[cfg(feature = "lang-gdscript")]

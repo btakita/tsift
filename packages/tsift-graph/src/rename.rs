@@ -152,6 +152,10 @@ pub fn identifier_node_kinds(lang: Lang) -> &'static [&'static str] {
         // Jai names every declaration, reference, and member with `identifier`.
         #[cfg(feature = "lang-jai")]
         Lang::Jai => &["identifier"],
+        // Luau names variables, fields, methods, and type aliases with
+        // `identifier`; a type reference is a `name` inside a type node.
+        #[cfg(feature = "lang-luau")]
+        Lang::Luau => &["identifier"],
         // GDScript splits the two: `name` is the declared name of a statement
         // or block, `identifier` is every reference to one.
         #[cfg(feature = "lang-gdscript")]

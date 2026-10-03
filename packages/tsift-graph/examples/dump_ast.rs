@@ -63,6 +63,33 @@ length :: (v: Vector2) -> float { return sqrt(v.x * v.x + v.y * v.y); }
         4,
     );
 
+    #[cfg(feature = "lang-luau")]
+    dump(
+        "Luau",
+        Lang::Luau,
+        r#"
+local Signal = require(script.Parent.Signal)
+local Util = require("./util")
+export type Point = { x: number, y: number }
+type Id = string
+type Map<K, V> = { [K]: V }
+local Counter = {}
+Counter.__index = Counter
+function Counter.new(start: number): Counter
+    return setmetatable({ value = start }, Counter)
+end
+function Counter:increment(by: number?)
+    self.value += by or 1
+    Signal.fire(self)
+end
+local function helper() return Util.clamp(1) end
+local M = { run = function() helper() end }
+return Counter
+"#
+        .trim(),
+        4,
+    );
+
     #[cfg(feature = "lang-bash")]
     dump(
         "Bash",

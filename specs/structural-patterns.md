@@ -97,7 +97,7 @@ reaches is what it can actually do:
 | Fans out to | Meaning | Languages |
 |---|---|---|
 | `tsift-astgrep` + `tsift-graph` + `tsift-search` | Indexable **and** structural. Searchable, graphable, and eligible for the symbol-resolved edit kinds | rust, python, typescript, javascript, kotlin, bash, go, csharp, c, cpp, markdown, json, yaml |
-| `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig, odin, gdscript, jai (opt-in), xsd, wsdl — `ast-grep-language` ships no Zig, Odin, GDScript, Jai, or XML grammar |
+| `tsift-graph` + `tsift-search` only | Indexable, **not** structurally matchable | zig, odin, luau, gdscript, jai (opt-in), xsd, wsdl — `ast-grep-language` ships no Zig, Odin, Luau, GDScript, Jai, or XML grammar |
 | `tsift-astgrep` only | **Structural-only**: `ast-grep search`/`rewrite` and the `structural_rewrite` edit intent work; the language is not indexed, not searchable, and not graphable | css, dart, elixir, haskell, hcl, html, java, lua, nix, php, ruby, scala, solidity, swift |
 
 Structural-only is a deliberate tier, not an oversight. A tree-sitter grammar is
@@ -194,6 +194,30 @@ Call edges come from `f()` and the last name of `Module.f()` / `value.f()`.
 Unnamed `#import "Basic"` and `#load "file.jai"` are not symbols, but `impact`
 reads them as import lines. Jai has no ast-grep grammar and no semantic-edit
 executor, so `rename_symbol` and `structural_rewrite` do not apply.
+
+Luau (Roblox's typed Lua dialect) joined the indexed-only tier under
+`#luauindex`, through the `tree-sitter-luau` grammar (tree-sitter-grammars,
+1.2, ABI 14). It is in `default`; its `parser.c` is 0.7 MB. Only `.luau` maps
+to it: `.lua` stays with `lang-lua`, the structural-only ast-grep Lua grammar,
+because Lua 5.2+ syntax (`goto`, bitwise operators, `<const>`) is not Luau and
+would parse with errors. The grammar exports `tree_sitter_luau`, distinct from
+ast-grep's `tree_sitter_lua`, so both link into one binary. `.luau` files
+contribute `function` symbols for `function f`, `local function f`,
+`function M.f`, and a `function` literal bound by `local f =`, `M.f =`, or a
+table field `f = function`; `method` symbols for `function M:f`; `type_alias`
+symbols for `type` and `export type` (including generic `type Map<K, V>`); and,
+at chunk level only, `import` symbols for `local X = require(...)` and
+`variable` symbols for other locals. A chunk-level `local X = {...}` table is a
+`class` when the chunk assigns `X.__index = X` (the metatable class idiom), a
+`mod` when the chunk ends with `return X` (the ModuleScript shape), and
+otherwise a `variable`. A function's name is the trailing identifier, matching
+the callee a call site exposes, and its extent climbs from the name to the
+binding statement so calls inside a bound literal resolve. Locals and
+parameters inside a function body are not symbols. Call edges come from
+`f()`, `M.f()`, and `obj:f()`. `impact` reads any `require(...)` line as an
+import, including a Roblox instance path such as
+`require(script.Parent.Signal)`, whose last segment is the module name.
+`rename_symbol` is not promoted: Luau has no semantic-edit contract.
 
 JSON and YAML followed under `#sdktsiftcontracts`, as data rather than code.
 `.json`, `.yaml`, and `.yml` are indexed, but symbols come only from API

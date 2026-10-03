@@ -448,6 +448,11 @@ fn is_import_line(lang: Lang, line: &str) -> bool {
                 || trimmed.starts_with("#load ")
                 || trimmed.contains(":: #import ")
         }
+        // Luau pulls in a module with `require(...)`: a path string
+        // (`require("./util")`) or a Roblox instance path
+        // (`require(script.Parent.Foo)`), whose last segment is the module name.
+        #[cfg(feature = "lang-luau")]
+        Lang::Luau => trimmed.contains("require(") || trimmed.contains("require \""),
         // GDScript has no `import`: a script pulls in another script by
         // extending it or by `preload`/`load`ing a `res://` path.
         #[cfg(feature = "lang-gdscript")]
@@ -606,6 +611,29 @@ mod tests {
         assert!(is_import_line(Lang::Jai, "#load \"util.jai\";"));
         assert!(is_import_line(Lang::Jai, "Math :: #import \"Math\";"));
         assert!(!is_import_line(Lang::Jai, "main :: () {"));
+    }
+
+    #[cfg(feature = "lang-luau")]
+    #[test]
+    fn luau_import_lines_are_require_calls() {
+        assert!(is_import_line(Lang::Luau, "local Util = require(\"./util\")"));
+        assert!(is_import_line(
+            Lang::Luau,
+            "local Signal = require(script.Parent.Signal)"
+        ));
+        assert!(is_import_line(
+            Lang::Luau,
+            "local Net = require(ReplicatedStorage.Packages.Net)"
+        ));
+        assert!(!is_import_line(Lang::Luau, "local speed = 16"));
+        // A Roblox instance path names the module by its last segment.
+        let tokens = BTreeSet::from(["signal".to_string()]);
+        let matched = import_tokens_for_file(
+            Lang::Luau,
+            "local Signal = require(script.Parent.Signal)\nSignal.fire()\n",
+            &tokens,
+        );
+        assert_eq!(matched.into_iter().collect::<Vec<_>>(), vec!["signal"]);
     }
 
     #[cfg(feature = "lang-gdscript")]
