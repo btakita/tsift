@@ -1101,9 +1101,14 @@ fn has_remote_named(dir: &Path, repository_name: &str) -> bool {
 }
 
 /// The indexed contracts checkout a trace's joins land on: the trace
-/// directory's `../<repository>` sibling (haiven-sdk's submodule), otherwise
-/// an indexed repository (the root or a workspace scope) whose git remote
-/// names the contracts repository.
+/// directory's `../<repository>` sibling (haiven-sdk's submodule) when it lies
+/// under `root`, otherwise an indexed repository (the root or a workspace
+/// scope) whose git remote names the contracts repository.
+///
+/// A sibling outside `root` is never indexed there, so its HEAD says nothing
+/// about the declarations the joins land on: a trace imported from another
+/// checkout (a worktree of a newer haiven-sdk) must be checked against the
+/// root's own contracts scope, not the worktree's submodule.
 pub(crate) fn find_contracts_checkout(
     root: &Path,
     trace_dir: &Path,
@@ -1111,7 +1116,11 @@ pub(crate) fn find_contracts_checkout(
 ) -> Option<PathBuf> {
     let sibling = trace_dir.join("..").join(repository_name);
     if sibling.is_dir() && is_git_toplevel(&sibling) {
-        return Some(fs::canonicalize(&sibling).unwrap_or(sibling));
+        let sibling = fs::canonicalize(&sibling).unwrap_or(sibling);
+        let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        if sibling.starts_with(&canonical_root) {
+            return Some(sibling);
+        }
     }
     let mut candidates = vec![root.to_path_buf()];
     if let Ok(scopes) = crate::config::Config::submodule_dirs(root) {
@@ -1939,6 +1948,59 @@ mod tests {
             ],
         );
         assert!(find_contracts_checkout(other.path(), other.path(), "haiven-contracts").is_none());
+    }
+
+    #[test]
+    fn contracts_pin_checks_the_root_scope_not_an_outside_traces_sibling() {
+        // The trace comes from another haiven-sdk checkout whose own
+        // haiven-contracts submodule sits at the pin; the root's indexed
+        // contracts checkout is elsewhere. The pin must be checked against
+        // the root's checkout (the one the joins land on), so it warns.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let root_head = contracts_repo(&root);
+        git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/haiven-dev/haiven-contracts",
+            ],
+        );
+        let outside = dir.path().join("worktree-sdk");
+        let codegen = outside.join("codegen");
+        fs::create_dir_all(&codegen).unwrap();
+        let sibling = outside.join("haiven-contracts");
+        contracts_repo(&sibling);
+        fs::write(sibling.join("newer.json"), "{}\n").unwrap();
+        git(&sibling, &["add", "."]);
+        git(&sibling, &["commit", "-q", "-m", "newer"]);
+        let pin = git(&sibling, &["rev-parse", "HEAD"]);
+        assert_ne!(pin, root_head);
+        fs::write(
+            codegen.join("contracts.lock"),
+            format!(r#"{{"repository": "haiven-dev/haiven-contracts", "commit": "{pin}"}}"#),
+        )
+        .unwrap();
+
+        let found = find_contracts_checkout(&root, &codegen, "haiven-contracts").unwrap();
+        assert_eq!(found, fs::canonicalize(&root).unwrap());
+        let warning = contracts_lock_warning(&root, &codegen.join("trace.json")).unwrap();
+        assert!(
+            warning.contains(&pin[..7]) && warning.contains(&format!("is at {}", &root_head[..7])),
+            "{warning}"
+        );
+
+        // The same sibling under the root is the indexed checkout: no warning.
+        assert_eq!(
+            find_contracts_checkout(&outside, &codegen, "haiven-contracts").unwrap(),
+            fs::canonicalize(&sibling).unwrap()
+        );
+        assert_eq!(
+            contracts_lock_warning(&outside, &codegen.join("trace.json")),
+            None
+        );
     }
 
     #[test]
