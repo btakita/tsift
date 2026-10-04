@@ -284,6 +284,17 @@ tsift init --harness all                              # every supported harness
 tsift init --instructions off --harness all           # remove the tsift-owned links too
 ```
 
+Personal-mode `--harness` links go into each harness's own user skills directory, honouring the harness's home override (ignored when `TSIFT_USER_SKILLS_DIR` sandboxes the personal install):
+
+| Harness | Personal link directory | Source |
+|---------|-------------------------|--------|
+| Claude Code | `~/.claude/skills` | Claude Code skills docs |
+| Codex | `$CODEX_HOME/skills` (default `~/.codex/skills`) | Codex skill roots (`$CODEX_HOME/skills`, `~/.agents/skills`) |
+| OpenCode | `$OPENCODE_CONFIG_DIR/skills`, else `$XDG_CONFIG_HOME/opencode/skills` (default `~/.config/opencode/skills`) | opencode.ai/docs/skills |
+| Grok | `$GROK_HOME/skills` (default `~/.grok/skills`) | Grok user guide, Skills |
+
+Shared mode links the project-relative `.claude/skills`, `.codex/skills`, `.opencode/skills`, and `.grok/skills`. Claude Code is the only harness that needs the link: Codex, OpenCode, and Grok already discover `.agents/skills/` and `~/.agents/skills/` on their own, so their links are optional and only add an entry the harness deduplicates by name. An older personal link at `~/<project skills dir>/tsift` (for example `~/.opencode/skills/tsift`) is migrated away.
+
 ### Path Resolution
 
 `tsift init` resolves the target directory before operating:
