@@ -1,6 +1,6 @@
 [package]
 name = "tsift-sim-world"
-version = "0.1.102"
+version = "0.1.103"
 edition = "2024"
 description = "Deterministic SimWorld test harness for tsift — seeded corpus + named-edge traces over the session/rewrite/status surfaces"
 license = "MIT"
@@ -15,7 +15,7 @@ publish = true
 
 [dev-dependencies]
 tempfile = "3"
-tsift = { path = "../..", version = "0.1.102" }
-tsift-cli = { path = "../tsift-cli", version = "0.1.102" }
+tsift = { path = "../..", version = "0.1.103" }
+tsift-cli = { path = "../tsift-cli", version = "0.1.103" }
 # test-support exposes session_digest::extract_prompt_targets_from_text_block as pub.
-tsift-session = { path = "../tsift-session", version = "0.1.102", features = ["test-support"] }
+tsift-session = { path = "../tsift-session", version = "0.1.103", features = ["test-support"] }

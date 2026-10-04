@@ -6,7 +6,7 @@ Canonical binary version source: `Cargo.toml` `package.version`. The CLI exposes
 
 Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
-## Unreleased
+## 0.1.103
 
 - **haiven trace joins use the contract names and check the contracts pin (`#tracelockjoin`).** haiven-sdk 57dd11c added the names haiven-contracts knows each trace node by. `graph-db import --format haiven-trace` now joins a vocabulary on its contract `title` (`ErrorCode` → `RestErrorCodeV0`) and a WebSocket event on its AsyncAPI `operation`, else its channel `message` key (`chat.message` → `chat.send.event`), storing `title`/`id` and `message`/`operation` as node properties; event `chat.typing`, which no operation sends, no longer lands on the client's `chat.typing` request operation. Traces without these fields keep the name joins. The adapter reads the sibling `contracts.lock` and stores its `commit` on the import's `graph_import` summary node as `contracts_commit`; after the refresh, `import` compares it with the HEAD of the indexed contracts checkout (`<trace dir>/../haiven-contracts`, else an indexed repository whose git remote ends in `haiven-contracts`) and warns on a mismatch. A missing lock or checkout gets a quiet note, and the import never fails on it. The `model.json` `ws.requests` reader no longer documents the object as keyed by operation: it is keyed by wire type (`transport.ping` is keyed `ping`), so each request's own `operation` names its frame.
 

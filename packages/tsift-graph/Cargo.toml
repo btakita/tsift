@@ -1,6 +1,6 @@
 [package]
 name = "tsift-graph"
-version = "0.1.102"
+version = "0.1.103"
 edition = "2024"
 description = "Language-aware graph extraction — call sites, routes, community detection, and path finding for tsift"
 license = "MIT"
@@ -16,8 +16,8 @@ anyhow = "1"
 blake3 = "1"
 lazily = "0.49.0"
 serde = { version = "1", features = ["derive"] }
-tsift-core = { path = "../tsift-core", version = "0.1.102" }
-tsift-md-ast = { path = "../tsift-md-ast", version = "0.1.102", optional = true }
+tsift-core = { path = "../tsift-core", version = "0.1.103" }
+tsift-md-ast = { path = "../tsift-md-ast", version = "0.1.103", optional = true }
 tree-sitter = "0.26"
 
 tree-sitter-rust = { version = "0.24", optional = true }
@@ -37,7 +37,7 @@ tree-sitter-luau = { version = "1.2", optional = true }
 # Jai has no grammar on crates.io; `tsift-tree-sitter-jai` packages
 # constantitus/tree-sitter-jai (MIT-0) under the standard grammar-crate API.
 # Renamed to `tree-sitter-jai` so an upstream crate is a one-line swap.
-tree-sitter-jai = { package = "tsift-tree-sitter-jai", path = "../tsift-tree-sitter-jai", version = "0.1.102", optional = true }
+tree-sitter-jai = { package = "tsift-tree-sitter-jai", path = "../tsift-tree-sitter-jai", version = "0.1.103", optional = true }
 tree-sitter-json = { version = "0.24", optional = true }
 tree-sitter-yaml = { version = "0.7", optional = true }
 serde_json = { version = "1", optional = true }

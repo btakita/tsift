@@ -1,4 +1,4 @@
-<!-- tsift:opencode-command v=0.1.102 name=tsift-status -->
+<!-- tsift:opencode-command v=0.1.103 name=tsift-status -->
 ---
 description: Refresh and summarize tsift index status
 ---
