@@ -709,6 +709,15 @@ pub enum Commands {
         #[arg(long, value_enum, action = clap::ArgAction::Append)]
         harness: Vec<HarnessSkillArg>,
     },
+    /// Print the current skill or reference bundled with this tsift binary
+    Skill {
+        /// Path used to detect repository-specific verification guidance
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Print the detailed code-navigation reference instead of SKILL.md
+        #[arg(long)]
+        reference: bool,
+    },
     /// Cached LLM analysis — pre-computed summaries, entities, relationships
     Summarize {
         /// Symbol name to look up

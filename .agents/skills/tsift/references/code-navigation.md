@@ -3,7 +3,9 @@
 
 Managed by `tsift init` (versioned markers) — do not hand-edit between the markers; re-run `tsift init` to refresh. Text outside the markers is preserved.
 
-This reference is the detail behind the repository-local tsift skill. `SKILL.md` carries the hot path; everything below is the full command surface.
+This generated reference is a complete fallback. Prefer `tsift skill --reference`, which reads the current reference bundled with the installed binary and therefore updates with the package.
+
+This reference is the detail behind the tsift skill. `SKILL.md` carries the hot path; everything below is the full command surface.
 
 ## Session start
 
@@ -22,7 +24,7 @@ Codex projects can install a prompt-time auto-reindex hook with `tsift init --co
 - **Editing** — `edit` (atomic JSON batch), `edit-intents` (semantic AST intents with `--verify`/`--apply`), `ast-grep` (structural search and rewrite)
 - **Digests and session context** — `diff-digest`, `test-digest`, `log-digest`, `metric-digest`, `digest-runner`, `session-digest`, `session-cost`, `session-review`, `context-pack`
 - **Cached analysis and drift checks** — `summarize`, `lint`, `audit`, `audit-tagpath`, `token-savings`, `token-gate`
-- **Tooling** — `route` (task to model tier), `rewrite`, `sql`, `memory`, `local-model`, `kg`, `init`, `workflow`
+- **Tooling** — `route` (task to model tier), `rewrite`, `sql`, `memory`, `local-model`, `kg`, `skill`, `init`, `workflow`
 
 Global flags: `--envelope`, `--compact`, `--terse`, `--ultra-terse`, `--schema`, `--tabular`, `--absolute`, `--pretty`. Subcommand flags move between releases faster than this file does, so read `tsift <subcommand> --help` for the live contract.
 
