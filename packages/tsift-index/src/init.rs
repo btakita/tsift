@@ -259,11 +259,38 @@ pub enum InstructionStatus {
     Stale {
         found: Option<String>,
         expected: String,
+        reason: InstructionStaleReason,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<PathBuf>,
     },
     #[serde(rename = "missing")]
     Missing,
     #[serde(rename = "disabled")]
     Disabled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InstructionStaleReason {
+    LegacySurface,
+    SkillVersionMismatch,
+    SkillPreVersioned,
+    ReferenceMissing,
+    ReferenceStale,
+    RouterStale,
+}
+
+impl InstructionStaleReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacySurface => "legacy_surface",
+            Self::SkillVersionMismatch => "skill_version_mismatch",
+            Self::SkillPreVersioned => "skill_pre_versioned",
+            Self::ReferenceMissing => "reference_missing",
+            Self::ReferenceStale => "reference_stale",
+            Self::RouterStale => "router_stale",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1841,16 +1868,6 @@ pub fn extract_runbook_version(content: &str) -> Option<String> {
     tag_content.strip_prefix("v=").map(|v| v.to_string())
 }
 
-/// The skill points at the generated reference, so a missing or out-of-date
-/// reference makes the instruction surface stale even when `SKILL.md` itself
-/// is current.
-fn runbook_path_is_current(path: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    extract_runbook_version(&content).is_some_and(|v| v == TSIFT_VERSION)
-}
-
 pub fn check_instruction_version(dir: &Path) -> InstructionStatus {
     // A user-scoped skill may exist for other repositories. Until this
     // repository has either persisted a mode or carries a managed shared
@@ -1887,26 +1904,25 @@ pub fn check_instruction_version(dir: &Path) -> InstructionStatus {
             if !shared {
                 return InstructionStatus::Missing;
             }
-            let mut legacy_found = false;
-            let mut legacy_version = None;
-            for content in ["AGENTS.md", "AGENTS.override.md", "CLAUDE.md"]
+            for (path, content) in ["AGENTS.md", "AGENTS.override.md", "CLAUDE.md"]
                 .into_iter()
-                .filter_map(|name| std::fs::read_to_string(dir.join(name)).ok())
+                .filter_map(|name| {
+                    let path = dir.join(name);
+                    std::fs::read_to_string(&path)
+                        .ok()
+                        .map(|content| (path, content))
+                })
             {
                 if content.contains(SECTION_MARKER_PREFIX) {
-                    legacy_found = true;
-                    legacy_version = extract_legacy_instruction_version(&content);
-                    break;
+                    return InstructionStatus::Stale {
+                        found: extract_legacy_instruction_version(&content),
+                        expected: TSIFT_VERSION.to_string(),
+                        reason: InstructionStaleReason::LegacySurface,
+                        path: Some(path),
+                    };
                 }
             }
-            return if legacy_found {
-                InstructionStatus::Stale {
-                    found: legacy_version,
-                    expected: TSIFT_VERSION.to_string(),
-                }
-            } else {
-                InstructionStatus::Missing
-            };
+            return InstructionStatus::Missing;
         }
     };
     if !content.contains(SKILL_MARKER_PREFIX) {
@@ -1914,27 +1930,55 @@ pub fn check_instruction_version(dir: &Path) -> InstructionStatus {
     }
     match extract_instruction_version(&content) {
         Some(v) if v == TSIFT_VERSION => {
-            let router_current = !shared
-                || std::fs::read_to_string(dir.join("AGENTS.md"))
-                    .ok()
-                    .and_then(|content| extract_legacy_instruction_version(&content))
-                    .is_some_and(|version| version == TSIFT_VERSION);
-            if runbook_path_is_current(&runbook) && router_current {
-                InstructionStatus::Current { version: v }
-            } else {
-                InstructionStatus::Stale {
-                    found: Some(v),
+            let runbook_content = match std::fs::read_to_string(&runbook) {
+                Ok(content) => content,
+                Err(_) => {
+                    return InstructionStatus::Stale {
+                        found: None,
+                        expected: TSIFT_VERSION.to_string(),
+                        reason: InstructionStaleReason::ReferenceMissing,
+                        path: Some(runbook),
+                    };
+                }
+            };
+            let runbook_version = extract_runbook_version(&runbook_content);
+            if runbook_version.as_deref() != Some(TSIFT_VERSION) {
+                return InstructionStatus::Stale {
+                    found: runbook_version,
                     expected: TSIFT_VERSION.to_string(),
+                    reason: InstructionStaleReason::ReferenceStale,
+                    path: Some(runbook),
+                };
+            }
+
+            if shared {
+                let router = dir.join("AGENTS.md");
+                let router_version = std::fs::read_to_string(&router)
+                    .ok()
+                    .and_then(|content| extract_legacy_instruction_version(&content));
+                if router_version.as_deref() != Some(TSIFT_VERSION) {
+                    return InstructionStatus::Stale {
+                        found: router_version,
+                        expected: TSIFT_VERSION.to_string(),
+                        reason: InstructionStaleReason::RouterStale,
+                        path: Some(router),
+                    };
                 }
             }
+
+            InstructionStatus::Current { version: v }
         }
         Some(v) => InstructionStatus::Stale {
             found: Some(v),
             expected: TSIFT_VERSION.to_string(),
+            reason: InstructionStaleReason::SkillVersionMismatch,
+            path: Some(skill),
         },
         None => InstructionStatus::Stale {
             found: None,
             expected: TSIFT_VERSION.to_string(),
+            reason: InstructionStaleReason::SkillPreVersioned,
+            path: Some(skill),
         },
     }
 }
@@ -3747,6 +3791,8 @@ mod tests {
             InstructionStatus::Stale {
                 found: Some("0.0.1".to_string()),
                 expected: TSIFT_VERSION.to_string(),
+                reason: InstructionStaleReason::LegacySurface,
+                path: Some(agents),
             }
         );
     }
@@ -3766,6 +3812,8 @@ mod tests {
             InstructionStatus::Stale {
                 found: None,
                 expected: TSIFT_VERSION.to_string(),
+                reason: InstructionStaleReason::LegacySurface,
+                path: Some(agents),
             }
         );
     }

@@ -438,6 +438,10 @@ not rescanned merely because another scope needs repair.
 ### Output
 
 Four sections: index state, instruction version, summary cache state, recommendations.
+When instructions are stale, structured output includes a `reason` naming the
+failed check and a `path` when the check applies to a specific instruction
+surface. Human output likewise names that surface; it only compares installed
+and available versions when version drift is the failing check.
 
 When everything is available:
 ```
