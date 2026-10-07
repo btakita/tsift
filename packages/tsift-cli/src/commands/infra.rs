@@ -3025,8 +3025,8 @@ fn print_init_updates(result: &init::InitResult) {
 /// Harness integrations (`--codex`, `--opencode`) stay at the root the operator
 /// invoked them from; only the tsift skill and its reference fan out,
 /// because that is what `status` reports on and what a submodule-local harness
-/// actually loads. A scope opts out with `instructions = false` under its
-/// `.tsift/config.toml` override.
+/// actually loads. A scope's persisted instruction mode takes precedence; the
+/// root config may also opt it out with `instructions = false`.
 fn init_workspace_scopes(root: &std::path::Path) -> Result<()> {
     let cfg = config::Config::load(root)?;
     for scope in config::Config::submodule_dirs(root)? {
@@ -3041,7 +3041,15 @@ fn init_workspace_scopes(root: &std::path::Path) -> Result<()> {
             continue;
         }
         println!("scope {}: {}", scope.id, scope.source_root.display());
-        let result = init::init_with_integrations(&scope.source_root, false, false, false)?;
+        let instruction_mode = init::resolve_workspace_scope_instruction_mode(&scope.source_root)?;
+        let result = init::init_with_mode(
+            &scope.source_root,
+            false,
+            false,
+            false,
+            instruction_mode,
+            None,
+        )?;
         print_init_updates(&result);
     }
     Ok(())

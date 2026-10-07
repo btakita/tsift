@@ -323,7 +323,7 @@ promoting the target to the outer superproject.
 10. The skill tells harnesses to switch to the owning repo or submodule root before running tsift/build/test commands and steers them toward envelope-backed artifacts instead of raw high-volume output.
 11. Verification guidance is capability-based. It names only repository and host commands that can be proven available.
 12. `SKILL.md` is a hot-path router and defers detailed workflows to `references/code-navigation.md`.
-13. With `--workspace`, shared skill surfaces are refreshed in every enabled workspace scope. Personal/off modes do not fan out tracked instruction changes.
+13. With `--workspace`, shared skill surfaces are refreshed in every enabled workspace scope. A scope's persisted `.tsift/instruction-mode` takes precedence, so `personal` and `off` scopes do not receive tracked instruction changes; scopes without a persisted policy remain part of the shared sweep.
 14. `--harness <claude|codex|opencode|grok|all>` links the canonical skill into that harness's own skill directory (`#harnessskilllink`). It is repeatable, and `all` expands to every supported harness.
 
 ### Harness Skill Links (`--harness`)
