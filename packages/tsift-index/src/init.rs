@@ -610,6 +610,19 @@ pub fn resolve_instruction_mode(dir: &Path, requested: InstructionMode) -> Resul
     })
 }
 
+/// Resolve the instruction mode for one scope in a shared workspace sweep.
+///
+/// An explicit scope-local policy wins, just as it does for a direct `init`.
+/// Scopes that have never selected a policy remain part of the shared sweep so
+/// `init --workspace --instructions shared` keeps refreshing their surfaces.
+pub fn resolve_workspace_scope_instruction_mode(dir: &Path) -> Result<InstructionMode> {
+    if dir.join(INSTRUCTION_MODE_RELATIVE_PATH).exists() {
+        resolve_instruction_mode(dir, InstructionMode::Auto)
+    } else {
+        Ok(InstructionMode::Shared)
+    }
+}
+
 fn persist_instruction_mode(dir: &Path, mode: InstructionMode) -> Result<()> {
     let state = dir.join(INSTRUCTION_MODE_RELATIVE_PATH);
     if let Some(parent) = state.parent() {

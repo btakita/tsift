@@ -7722,6 +7722,51 @@ fn init_workspace_skips_scopes_that_opt_out_of_instructions() {
     );
 }
 
+// #wsinitmode regression: the workspace sweep used the shared-only init
+// helper, overwriting each scope's persisted personal/off policy.
+#[test]
+fn init_workspace_honors_each_scopes_persisted_instruction_mode() {
+    let dir = indexed_workspace_cli_fixture();
+    let root = dir.path().to_str().unwrap();
+    let alpha = dir.path().join("src/alpha");
+    let beta = dir.path().join("src/beta");
+    let user_skills = dir.path().join("user-skills");
+    let unmanaged_agents = "# Alpha instructions\n\nTeam-owned.\n";
+
+    for (scope, mode) in [(&alpha, "off\n"), (&beta, "personal\n")] {
+        fs::create_dir_all(scope.join(".tsift")).unwrap();
+        fs::write(scope.join(".tsift/instruction-mode"), mode).unwrap();
+    }
+    fs::write(alpha.join("AGENTS.md"), unmanaged_agents).unwrap();
+
+    let output = tsift_bin()
+        .env("TSIFT_USER_SKILLS_DIR", &user_skills)
+        .args(["init", "--instructions", "shared", "--workspace", root])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "init --workspace stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        fs::read_to_string(alpha.join(".tsift/instruction-mode")).unwrap(),
+        "off\n"
+    );
+    assert_eq!(
+        fs::read_to_string(beta.join(".tsift/instruction-mode")).unwrap(),
+        "personal\n"
+    );
+    assert_eq!(
+        fs::read_to_string(alpha.join("AGENTS.md")).unwrap(),
+        unmanaged_agents
+    );
+    assert!(!alpha.join(".agents/skills/tsift/SKILL.md").exists());
+    assert!(!beta.join(".agents/skills/tsift/SKILL.md").exists());
+    assert!(user_skills.join("tsift/SKILL.md").exists());
+}
+
 // #graphfed regression: `search` had `--federated`, `explain` and `graph` did
 // not, so at a workspace root the two graph commands could not run at all
 // unless the caller already knew which scope held the symbol — the thing they
