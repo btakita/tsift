@@ -356,9 +356,9 @@ name: tsift
 description: "Use tsift for token-efficient repository navigation... TRIGGER: ... SKIP: ... VERSION CHECK: ..."
 user-invocable: true
 argument-hint: "[query or symbol]"
-tsift-version: "0.1.103"
+tsift-version: "0.1.104"
 ---
-<!-- tsift:skill v=0.1.103 -->
+<!-- tsift:skill v=0.1.104 -->
 # tsift
 
 **Check the version first.** (compare `tsift --version` against `tsift-version`)
@@ -384,7 +384,7 @@ The body keeps a compact command surface so a turn can see what exists without e
 `.agents/skills/tsift/references/code-navigation.md` holds the detail the skill defers to, under its own marker pair so generated content can be refreshed while preserving hand-written text outside the markers:
 
 ```markdown
-<!-- tsift:code-navigation-runbook v=0.1.103 -->
+<!-- tsift:code-navigation-runbook v=0.1.104 -->
 # Code Navigation
 
 Managed by `tsift init` (versioned markers) — do not hand-edit between the markers; re-run `tsift init` to refresh. Text outside the markers is preserved.
