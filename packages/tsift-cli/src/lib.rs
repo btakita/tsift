@@ -21877,7 +21877,9 @@ pub(crate) fn apply_status_instruction_fixes(
         return Ok(false);
     }
     let (found, expected) = match &report.instructions {
-        init::InstructionStatus::Stale { found, expected } => (found.clone(), expected.clone()),
+        init::InstructionStatus::Stale {
+            found, expected, ..
+        } => (found.clone(), expected.clone()),
         _ => (None, init::TSIFT_VERSION.to_string()),
     };
     eprintln!("status fix: refreshing tsift instructions");

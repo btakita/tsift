@@ -9,7 +9,7 @@ use tsift_index::config;
 use tsift_index::index::{
     IndexDb, ReadOnlyInspectResult, WriterLockProbe, probe_writer_lock, writer_lock_path,
 };
-use tsift_index::init::{self, InstructionStatus};
+use tsift_index::init::{self, InstructionStaleReason, InstructionStatus};
 use tsift_sqlite::{
     ReadOnlyRecovery, rollback_journal_path, shared_memory_sidecar_path, wal_sidecar_path,
 };
@@ -362,11 +362,68 @@ fn scope_instruction_label(status: &InstructionStatus) -> String {
     match status {
         InstructionStatus::Current { version } => format!("current (v{version})"),
         InstructionStatus::Stale {
-            found: Some(found), ..
-        } => format!("stale (v{found})"),
-        InstructionStatus::Stale { found: None, .. } => "stale (pre-versioned)".to_string(),
+            found,
+            reason,
+            path,
+            ..
+        } => match reason {
+            InstructionStaleReason::ReferenceMissing => format!(
+                "stale (skill reference missing: {})",
+                path.as_deref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "unknown path".to_string())
+            ),
+            InstructionStaleReason::ReferenceStale => "stale (skill reference stale)".to_string(),
+            InstructionStaleReason::RouterStale => "stale (instruction router stale)".to_string(),
+            _ => found.as_deref().map_or_else(
+                || "stale (pre-versioned)".to_string(),
+                |found| format!("stale (v{found})"),
+            ),
+        },
         InstructionStatus::Missing => "missing".to_string(),
         InstructionStatus::Disabled => "off".to_string(),
+    }
+}
+
+fn format_stale_instruction(
+    found: Option<&str>,
+    expected: &str,
+    reason: InstructionStaleReason,
+    path: Option<&Path>,
+    compact: bool,
+) -> String {
+    let path = path
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "unknown path".to_string());
+    match (reason, compact, found) {
+        (InstructionStaleReason::ReferenceMissing, false, _) => format!(
+            "instructions: stale (skill reference missing: {path} — run tsift init)\n"
+        ),
+        (InstructionStaleReason::ReferenceStale, false, _) => format!(
+            "instructions: stale (skill reference stale: {path} — run tsift init)\n"
+        ),
+        (InstructionStaleReason::RouterStale, false, _) => format!(
+            "instructions: stale (instruction router stale: {path} — run tsift init)\n"
+        ),
+        (InstructionStaleReason::ReferenceMissing, true, _)
+        | (InstructionStaleReason::ReferenceStale, true, _)
+        | (InstructionStaleReason::RouterStale, true, _) => format!(
+            "instructions: stale reason={} path={path}\n",
+            reason.as_str()
+        ),
+        (_, true, Some(found)) => {
+            format!("instructions: stale v={found} expected={expected}\n")
+        }
+        (_, true, None) => {
+            format!("instructions: stale pre-versioned expected={expected}\n")
+        }
+        (_, false, Some(found)) => format!(
+            "instructions: stale (v{} installed, v{} available — run tsift init)\n",
+            found, expected
+        ),
+        (_, false, None) => format!(
+            "instructions: stale (pre-versioned, v{expected} available — run tsift init)\n"
+        ),
     }
 }
 
@@ -1391,36 +1448,18 @@ pub fn format_human(report: &StatusReport, compact: bool) -> String {
             }
         }
         InstructionStatus::Stale {
-            found: Some(v),
+            found,
             expected,
+            reason,
+            path,
         } => {
-            if compact {
-                out.push_str(&format!(
-                    "instructions: stale v={} expected={}\n",
-                    v, expected
-                ));
-            } else {
-                out.push_str(&format!(
-                    "instructions: stale (v{} installed, v{} available — run tsift init)\n",
-                    v, expected
-                ));
-            }
-        }
-        InstructionStatus::Stale {
-            found: None,
-            expected,
-        } => {
-            if compact {
-                out.push_str(&format!(
-                    "instructions: stale pre-versioned expected={}\n",
-                    expected
-                ));
-            } else {
-                out.push_str(&format!(
-                    "instructions: stale (pre-versioned, v{} available — run tsift init)\n",
-                    expected
-                ));
-            }
+            out.push_str(&format_stale_instruction(
+                found.as_deref(),
+                expected,
+                *reason,
+                path.as_deref(),
+                compact,
+            ));
         }
         InstructionStatus::Missing => {
             out.push_str("instructions: missing (run tsift init)\n");
@@ -2614,6 +2653,8 @@ mod tests {
             instructions: InstructionStatus::Stale {
                 found: Some("0.0.9".to_string()),
                 expected: "0.1.0".to_string(),
+                reason: InstructionStaleReason::SkillVersionMismatch,
+                path: Some(PathBuf::from(".agents/skills/tsift/SKILL.md")),
             },
             scope_instructions: Vec::new(),
             recommendations: Recommendations {

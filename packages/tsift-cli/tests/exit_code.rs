@@ -6810,6 +6810,67 @@ fn init_defaults_new_repositories_to_personal_without_tracked_changes() {
 }
 
 #[test]
+fn status_names_a_missing_current_skill_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let user_skills = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("README.md"), "# fixture\n").unwrap();
+    init_git_repo(dir.path());
+
+    let init = tsift_bin()
+        .args(["init", dir.path().to_str().unwrap()])
+        .env("TSIFT_USER_SKILLS_DIR", user_skills.path())
+        .output()
+        .unwrap();
+    assert!(
+        init.status.success(),
+        "init stderr: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let reference = user_skills
+        .path()
+        .join("tsift/references/code-navigation.md");
+    fs::remove_file(&reference).unwrap();
+
+    let human = tsift_bin()
+        .args(["status", "--no-fix", dir.path().to_str().unwrap()])
+        .env("TSIFT_USER_SKILLS_DIR", user_skills.path())
+        .output()
+        .unwrap();
+    assert!(human.status.success());
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "instructions: stale (skill reference missing: {} — run tsift init)",
+            reference.display()
+        )),
+        "stdout was: {stdout}"
+    );
+    assert!(
+        !stdout.contains(" installed, v"),
+        "equal skill versions must not be presented as the cause; stdout was: {stdout}"
+    );
+
+    let schema = tsift_bin()
+        .args([
+            "status",
+            "--no-fix",
+            "--schema",
+            dir.path().to_str().unwrap(),
+        ])
+        .env("TSIFT_USER_SKILLS_DIR", user_skills.path())
+        .output()
+        .unwrap();
+    assert!(schema.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&schema.stdout).unwrap();
+    assert_eq!(value["instructions"]["reason"], "reference_missing");
+    assert_eq!(
+        value["instructions"]["path"],
+        reference.display().to_string()
+    );
+}
+
+#[test]
 fn status_json_auto_fixes_stale_index_without_fix_flag() {
     let dir = indexed_cli_fixture();
     std::thread::sleep(Duration::from_millis(50));
