@@ -7767,6 +7767,102 @@ fn init_workspace_honors_each_scopes_persisted_instruction_mode() {
     assert!(user_skills.join("tsift/SKILL.md").exists());
 }
 
+// #wsinit regression: `status` recommends `tsift init --workspace` for stale
+// scopes, but the command used to sweep scopes only when the root resolved to
+// shared mode. A personal root therefore kept reporting the same stale scopes.
+#[test]
+fn init_workspace_personal_clears_legacy_scope_instruction_drift() {
+    let dir = indexed_workspace_cli_fixture();
+    let user_skills = tempfile::tempdir().unwrap();
+    let root = dir.path().to_str().unwrap();
+    let legacy = "# Scope\n\n<!-- tsift:code-navigation v=0.1.97 -->\n## Code Navigation\n\nlegacy managed text\n<!-- /tsift:code-navigation -->\n\n## Scope notes\n\nkeep me\n";
+    for scope in ["alpha", "beta"] {
+        fs::write(dir.path().join(format!("src/{scope}/AGENTS.md")), legacy).unwrap();
+    }
+
+    let output = tsift_bin()
+        .args(["init", "--workspace", root])
+        .env("TSIFT_USER_SKILLS_DIR", user_skills.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "init --workspace stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("instructions: personal"), "{stdout}");
+    assert!(stdout.contains("scope alpha:"), "{stdout}");
+    assert!(stdout.contains("scope beta:"), "{stdout}");
+
+    for scope in ["alpha", "beta"] {
+        let agents = fs::read_to_string(dir.path().join(format!("src/{scope}/AGENTS.md"))).unwrap();
+        assert!(!agents.contains("tsift:code-navigation"), "{agents}");
+        assert!(agents.contains("## Scope notes\n\nkeep me"), "{agents}");
+    }
+
+    let status = tsift_bin()
+        .args(["status", "--no-fix", "--json", root])
+        .env("TSIFT_USER_SKILLS_DIR", user_skills.path())
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(
+        json["scope_instructions"]
+            .as_array()
+            .is_some_and(|scopes| scopes
+                .iter()
+                .all(|scope| { scope["instructions"]["state"] == "current" })),
+        "{json}"
+    );
+}
+
+#[test]
+fn init_workspace_off_removes_legacy_scope_instruction_surfaces() {
+    let dir = indexed_workspace_cli_fixture();
+    let root = dir.path().to_str().unwrap();
+    let legacy = "# Scope\n\n<!-- tsift:code-navigation v=0.1.97 -->\n## Code Navigation\n\nlegacy managed text\n<!-- /tsift:code-navigation -->\n\n## Scope notes\n\nkeep me\n";
+    for scope in ["alpha", "beta"] {
+        fs::write(dir.path().join(format!("src/{scope}/AGENTS.md")), legacy).unwrap();
+    }
+
+    let output = tsift_bin()
+        .args(["init", "--workspace", "--instructions", "off", root])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "init --workspace --instructions off stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("instructions: off"), "{stdout}");
+    assert!(stdout.contains("scope alpha:"), "{stdout}");
+    assert!(stdout.contains("scope beta:"), "{stdout}");
+
+    for scope in ["alpha", "beta"] {
+        let agents = fs::read_to_string(dir.path().join(format!("src/{scope}/AGENTS.md"))).unwrap();
+        assert!(!agents.contains("tsift:code-navigation"), "{agents}");
+        assert!(agents.contains("## Scope notes\n\nkeep me"), "{agents}");
+    }
+
+    let status = tsift_bin()
+        .args(["status", "--no-fix", "--json", root])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(
+        json["scope_instructions"]
+            .as_array()
+            .is_some_and(|scopes| scopes
+                .iter()
+                .all(|scope| { scope["instructions"]["state"] == "disabled" })),
+        "{json}"
+    );
+}
+
 // #graphfed regression: `search` had `--federated`, `explain` and `graph` did
 // not, so at a workspace root the two graph commands could not run at all
 // unless the caller already knew which scope held the symbol — the thing they

@@ -2962,8 +2962,8 @@ pub(crate) fn cmd_init(
     // at the superproject, so submodules stayed on releases-old text — and
     // the repository-local skill tells an agent to work from the submodule
     // root, which is exactly the surface that never got refreshed.
-    if workspace && result.instruction_mode == init::InstructionMode::Shared {
-        init_workspace_scopes(&resolved)?;
+    if workspace {
+        init_workspace_scopes(&resolved, result.instruction_mode)?;
     }
     Ok(())
 }
@@ -3019,15 +3019,19 @@ fn print_init_updates(result: &init::InitResult) {
     }
 }
 
-/// Refresh the repository-local skill in every workspace scope
-/// (`#wsinit`).
+/// Apply the root's resolved instruction mode in every workspace scope
+/// (`#wsinit`). Shared refreshes repository-local skills; personal and off
+/// remove stale managed project surfaces so `status` converges.
 ///
 /// Harness integrations (`--codex`, `--opencode`) stay at the root the operator
 /// invoked them from; only the tsift skill and its reference fan out,
 /// because that is what `status` reports on and what a submodule-local harness
 /// actually loads. A scope's persisted instruction mode takes precedence; the
 /// root config may also opt it out with `instructions = false`.
-fn init_workspace_scopes(root: &std::path::Path) -> Result<()> {
+fn init_workspace_scopes(
+    root: &std::path::Path,
+    root_instruction_mode: init::InstructionMode,
+) -> Result<()> {
     let cfg = config::Config::load(root)?;
     for scope in config::Config::submodule_dirs(root)? {
         if !scope.source_root.exists() {
@@ -3041,7 +3045,10 @@ fn init_workspace_scopes(root: &std::path::Path) -> Result<()> {
             continue;
         }
         println!("scope {}: {}", scope.id, scope.source_root.display());
-        let instruction_mode = init::resolve_workspace_scope_instruction_mode(&scope.source_root)?;
+        let instruction_mode = init::resolve_workspace_scope_instruction_mode(
+            &scope.source_root,
+            root_instruction_mode,
+        )?;
         let result = init::init_with_mode(
             &scope.source_root,
             false,
