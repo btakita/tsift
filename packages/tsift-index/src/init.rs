@@ -22,14 +22,35 @@ const OLDEST_RUNBOOK_RELATIVE_PATH: &str = "runbooks/code-navigation.md";
 pub const TSIFT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn versioned_skill(dir: &Path) -> String {
-    versioned_skill_with_verification(verification_paragraph(dir))
+    versioned_skill_with_verification(verification_paragraph(dir), SkillDelivery::Cached)
 }
 
 fn versioned_personal_skill() -> String {
-    versioned_skill_with_verification(String::new())
+    versioned_skill_with_verification(String::new(), SkillDelivery::Cached)
 }
 
-fn versioned_skill_with_verification(verification: String) -> String {
+/// Render the authoritative skill bundled into the running tsift binary.
+///
+/// Harness skill files call this through `tsift skill`, which means installing a
+/// newer binary immediately exposes its current instructions even before the
+/// cached file is refreshed with `tsift init`.
+pub fn package_skill(dir: &Path) -> String {
+    versioned_skill_with_verification(verification_paragraph(dir), SkillDelivery::Live)
+}
+
+#[derive(Clone, Copy)]
+enum SkillDelivery {
+    Cached,
+    Live,
+}
+
+fn versioned_skill_with_verification(verification: String, delivery: SkillDelivery) -> String {
+    let source_guidance = match delivery {
+        SkillDelivery::Cached => "**Load the current package instructions first.** Run `tsift skill` once per session from the owning repo root and follow its output. That command reads the skill bundled with the installed binary, so a package upgrade takes effect without waiting for this harness file to be regenerated. If the command is unavailable, this versioned copy is a complete fallback; compare `tsift --version` with `tsift-version` below before trusting it.".to_string(),
+        SkillDelivery::Live => format!(
+            "This is the authoritative skill bundled with the installed `tsift {TSIFT_VERSION}` binary. Follow it for this session; do not run `tsift skill` again."
+        ),
+    };
     format!(
         r#"---
 name: tsift
@@ -41,11 +62,11 @@ tsift-version: "{version}"
 <!-- tsift:skill v={version} -->
 # tsift
 
-**Check the version first.** Run `tsift --version` and compare it to `tsift-version` in the frontmatter above. If the binary is newer, this file is stale: treat its command text as a hint, not a contract, and read the live surface from `tsift --help` / `<subcommand> --help`. `tsift init` refreshes this file and stamps both values from the installed binary, so a mismatch means the skill was never refreshed after an upgrade. `tsift audit` reports the same drift as an issue.
+{source_guidance}
 
 ## Command surface
 
-`search`, `symbol-read`, `source-read`, `explain`, `graph`, `communities`, `path`, `index`, `status`, `locks` — search and navigation. `traverse`, `graph-db`, `convex-sync`, `conflict-matrix`, `dispatch-trace`, `dependency-dag` — graph substrate. `edit`, `edit-intents`, `ast-grep` — batch and semantic editing. `diff-digest`, `test-digest`, `log-digest`, `metric-digest`, `session-digest`, `session-cost`, `session-review`, `context-pack`, `digest-runner` — bounded digests and session context. `summarize`, `semantic`, `lint`, `audit`, `audit-tagpath` — cached analysis and drift checks. `route`, `rewrite`, `sql`, `memory`, `init`, `workflow` — tooling. Global flags: `--envelope`, `--compact`, `--terse`, `--ultra-terse`, `--schema`, `--tabular`, `--absolute`, `--pretty`.
+`search`, `symbol-read`, `source-read`, `explain`, `graph`, `communities`, `path`, `index`, `status`, `locks` — search and navigation. `traverse`, `graph-db`, `convex-sync`, `conflict-matrix`, `dispatch-trace`, `dependency-dag` — graph substrate. `edit`, `edit-intents`, `ast-grep` — batch and semantic editing. `diff-digest`, `test-digest`, `log-digest`, `metric-digest`, `session-digest`, `session-cost`, `session-review`, `context-pack`, `digest-runner` — bounded digests and session context. `summarize`, `semantic`, `lint`, `audit`, `audit-tagpath` — cached analysis and drift checks. `route`, `rewrite`, `sql`, `memory`, `skill`, `init`, `workflow` — tooling. Global flags: `--envelope`, `--compact`, `--terse`, `--ultra-terse`, `--schema`, `--tabular`, `--absolute`, `--pretty`.
 
 ## Session start
 
@@ -62,32 +83,52 @@ Prefer tsift envelopes over raw reads:
 
 **No rewrite hook? Drive the list above yourself.** Only a `PreToolUse`-equipped harness redirects `cat`/`grep`/`git diff` for you. Everywhere else nothing intercepts them, so issue these commands directly instead of waiting for a rewrite; the reference below names the one-shot equivalent and the per-harness setup, `--harness` included.
 
-Command detail lives in [`references/code-navigation.md`](references/code-navigation.md) — budgets, `tsift workflow search`, `report.scale_guard` handling, the harness rewrite path for `PreToolUse`-less harnesses, and Codex/OpenCode integration. `tsift init` writes and versions that reference alongside this skill, so it is present in every initialized checkout; read it before broad exploration instead of expanding this file.
+Current command detail is available from `tsift skill --reference`; [`references/code-navigation.md`](references/code-navigation.md) is its cached fallback. It covers budgets, `tsift workflow search`, `report.scale_guard` handling, the harness rewrite path for `PreToolUse`-less harnesses, and Codex/OpenCode integration. Read the live reference before broad exploration.
 
 {verification}
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:skill -->"#,
         version = TSIFT_VERSION,
+        source_guidance = source_guidance,
         verification = verification,
     )
 }
 
 fn versioned_runbook_section(dir: &Path) -> String {
-    versioned_runbook_with_verification(verification_runbook_section(dir))
+    versioned_runbook_with_verification(verification_runbook_section(dir), SkillDelivery::Cached)
 }
 
 fn versioned_personal_runbook() -> String {
-    versioned_runbook_with_verification(String::new())
+    versioned_runbook_with_verification(String::new(), SkillDelivery::Cached)
 }
 
-fn versioned_runbook_with_verification(verification: String) -> String {
+/// Render the authoritative code-navigation reference bundled into the running
+/// tsift binary. See [`package_skill`] for why the generated files delegate to
+/// this live surface.
+pub fn package_runbook(dir: &Path) -> String {
+    versioned_runbook_with_verification(
+        verification_runbook_section(dir),
+        SkillDelivery::Live,
+    )
+}
+
+fn versioned_runbook_with_verification(
+    verification: String,
+    delivery: SkillDelivery,
+) -> String {
+    let source_guidance = match delivery {
+        SkillDelivery::Cached => "This generated reference is a complete fallback. Prefer `tsift skill --reference`, which reads the current reference bundled with the installed binary and therefore updates with the package.",
+        SkillDelivery::Live => "This is the authoritative reference bundled with the installed binary. Follow it for this session.",
+    };
     format!(
         r#"<!-- tsift:code-navigation-runbook v={version} -->
 # Code Navigation
 
 Managed by `tsift init` (versioned markers) — do not hand-edit between the markers; re-run `tsift init` to refresh. Text outside the markers is preserved.
 
-This reference is the detail behind the repository-local tsift skill. `SKILL.md` carries the hot path; everything below is the full command surface.
+{source_guidance}
+
+This reference is the detail behind the tsift skill. `SKILL.md` carries the hot path; everything below is the full command surface.
 
 ## Session start
 
@@ -106,7 +147,7 @@ Codex projects can install a prompt-time auto-reindex hook with `tsift init --co
 - **Editing** — `edit` (atomic JSON batch), `edit-intents` (semantic AST intents with `--verify`/`--apply`), `ast-grep` (structural search and rewrite)
 - **Digests and session context** — `diff-digest`, `test-digest`, `log-digest`, `metric-digest`, `digest-runner`, `session-digest`, `session-cost`, `session-review`, `context-pack`
 - **Cached analysis and drift checks** — `summarize`, `lint`, `audit`, `audit-tagpath`, `token-savings`, `token-gate`
-- **Tooling** — `route` (task to model tier), `rewrite`, `sql`, `memory`, `local-model`, `kg`, `init`, `workflow`
+- **Tooling** — `route` (task to model tier), `rewrite`, `sql`, `memory`, `local-model`, `kg`, `skill`, `init`, `workflow`
 
 Global flags: `--envelope`, `--compact`, `--terse`, `--ultra-terse`, `--schema`, `--tabular`, `--absolute`, `--pretty`. Subcommand flags move between releases faster than this file does, so read `tsift <subcommand> --help` for the live contract.
 
@@ -142,6 +183,7 @@ Codex, OpenCode, and other harnesses without Claude-style `PreToolUse` hooks sho
 Only read full source files when tsift results are insufficient.
 <!-- /tsift:code-navigation-runbook -->"#,
         version = TSIFT_VERSION,
+        source_guidance = source_guidance,
         verification = verification,
     )
 }
@@ -2115,6 +2157,33 @@ mod tests {
         // (see `init_writes_the_code_navigation_runbook_with_the_detail_the_block_defers_to`).
         assert!(content.contains("PreToolUse"));
         assert!(content.contains("--harness"));
+        assert!(
+            content.contains("Run `tsift skill` once per session"),
+            "the harness skill must delegate to the instructions bundled with the binary"
+        );
+        assert!(content.contains("`tsift skill --reference`"));
+    }
+
+    #[test]
+    fn package_skill_is_live_and_does_not_recursively_bootstrap() {
+        let dir = TempDir::new().unwrap();
+        let content = package_skill(dir.path());
+        assert!(content.contains(&format!("installed `tsift {TSIFT_VERSION}` binary")));
+        assert!(content.contains("do not run `tsift skill` again"));
+        assert!(!content.contains("Run `tsift skill` once per session"));
+        assert!(content.contains("`tsift skill --reference`"));
+    }
+
+    #[test]
+    fn package_runbook_is_live_while_generated_reference_is_a_fallback() {
+        let dir = TempDir::new().unwrap();
+        let live = package_runbook(dir.path());
+        assert!(live.contains("authoritative reference bundled with the installed binary"));
+        assert!(!live.contains("Prefer `tsift skill --reference`"));
+
+        init(dir.path(), false, false).unwrap();
+        let cached = std::fs::read_to_string(dir.path().join(RUNBOOK_RELATIVE_PATH)).unwrap();
+        assert!(cached.contains("Prefer `tsift skill --reference`"));
     }
 
     /// The stale hand-written skill taught `tsift status --fix`. The generated

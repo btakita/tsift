@@ -325,6 +325,7 @@ promoting the target to the outer superproject.
 12. `SKILL.md` is a hot-path router and defers detailed workflows to `references/code-navigation.md`.
 13. With `--workspace`, shared skill surfaces are refreshed in every enabled workspace scope. A scope's persisted `.tsift/instruction-mode` takes precedence, so `personal` and `off` scopes do not receive tracked instruction changes; scopes without a persisted policy remain part of the shared sweep.
 14. `--harness <claude|codex|opencode|grok|all>` links the canonical skill into that harness's own skill directory (`#harnessskilllink`). It is repeatable, and `all` expands to every supported harness.
+15. The generated skill is an upgrade-safe bootstrap: it tells the harness to load the authoritative instructions from `tsift skill`, while retaining a complete versioned fallback for hosts where the command cannot run. `tsift skill --reference` exposes the package-owned detailed runbook the same way.
 
 ### Harness Skill Links (`--harness`)
 
@@ -333,7 +334,7 @@ The canonical skill lives under `.agents/skills/tsift/` (shared) or `~/.agents/s
 `--harness` closes that gap:
 
 1. Each requested harness gets `<root>/<harness skills dir>/tsift` pointing at the canonical skill directory. `root` is the project root in `shared` mode and the user's home directory in `personal` mode, so `personal` still writes nothing tracked.
-2. The link is a **symlink, never a copy**. A copy drifts silently: the harness keeps loading a release-old file while `tsift status` reports the canonical surface as current, because status only ever reads the canonical path. A symlink means one `tsift init` refresh updates every harness at once.
+2. The link is a **symlink, never a copy**. A copy can diverge silently from the canonical bootstrap, while a symlink keeps every harness on the same entrypoint. The entrypoint calls `tsift skill`, so installing a newer binary exposes its package-owned instructions on the next skill use; `tsift init` only needs to refresh the cached fallback and version markers.
 3. A project-scoped link uses a relative target (`../../.agents/skills/tsift`) so the checkout stays relocatable; a user-scoped link is absolute because its target is outside any project. The `..` climb is derived from the harness directory's own depth, so a harness added at a different depth cannot produce a dangling link.
 4. An existing path that is not a tsift-owned symlink fails closed and names the harness and path — a hand-maintained `~/.claude/skills/tsift/` is never overwritten. A symlink tsift does own but that points elsewhere is repointed, which is how an older layout migrates.
 5. `--instructions off --harness ...` removes the tsift-owned links instead of creating them, in both the project and the user root, so deleting the canonical skill cannot leave a dangling skill directory behind. Removal skips any path tsift does not own.
@@ -361,13 +362,13 @@ tsift-version: "0.1.104"
 <!-- tsift:skill v=0.1.104 -->
 # tsift
 
-**Check the version first.** (compare `tsift --version` against `tsift-version`)
+**Load the current package instructions first.** Run `tsift skill` once per session and follow its output. The rest of this file is a complete versioned fallback.
 
 ## Command surface
 ## Session start
 ## (envelope preference list)
 
-Command detail lives in [`references/code-navigation.md`](references/code-navigation.md).
+Current command detail is available from `tsift skill --reference`; [`references/code-navigation.md`](references/code-navigation.md) is its cached fallback.
 <!-- /tsift:skill -->
 ```
 
@@ -377,7 +378,9 @@ The frontmatter carries more than the minimum a skill needs (`#claudeskillmerge`
 - `TRIGGER:` / `SKIP:` in the description improve skill selection, and `VERSION CHECK:` tells a reading agent to compare before trusting copied text.
 - `tsift-version` duplicates the ownership marker's version in a field the agent actually reads, and is the field `tsift audit` compares for drift (`#skillversioneval`).
 
-The body keeps a compact command surface so a turn can see what exists without expanding the reference, but names topics rather than restating the reference's commands: the skill must stay the smaller of the two, and a template gate enforces both that ordering and the absence of any deprecated flag.
+The body starts with an explicit package delegation. `tsift skill [PATH]` prints the authoritative skill embedded in the running binary and marks it as live so an agent does not recursively invoke the command. This makes a normal package upgrade effective without rewriting harness directories or tracked repository files. The remainder stays a compact, complete fallback: a turn can still work when command execution is unavailable, and version markers let `status`/`audit` diagnose that fallback's freshness.
+
+The compact command surface names topics rather than restating the reference's commands: the skill must stay the smaller of the two, and a template gate enforces both that ordering and the absence of any deprecated flag.
 
 ### Generated Reference
 
@@ -388,6 +391,8 @@ The body keeps a compact command surface so a turn can see what exists without e
 # Code Navigation
 
 Managed by `tsift init` (versioned markers) — do not hand-edit between the markers; re-run `tsift init` to refresh. Text outside the markers is preserved.
+
+This generated reference is a complete fallback. Prefer `tsift skill --reference`, which reads the current reference bundled with the installed binary and therefore updates with the package.
 
 ## Session start
 ## Version drift
@@ -412,8 +417,27 @@ The opening marker embeds the tsift version (`v=X.Y.Z`) that generated it. When 
 - Pre-versioned markers (no `v=` attribute) are treated as stale
 - The generated reference carries its own `<!-- tsift:code-navigation-runbook v=X.Y.Z -->` marker and is checked the same way
 
-This ensures agent sessions always use instructions matching the installed binary.
+The bootstrap command ensures agent sessions can use instructions matching the installed binary immediately after an upgrade. Marker checks still keep the on-disk fallback current and provide an auditable migration path for older generated skills that predate package delegation.
 Release-bump regressions are covered through the compiled CLI path: a stale skill marker from the previous binary version must be rewritten by `tsift status --fix-instructions --json`, and the final JSON report must show `instructions.state=current` for the installed version.
+
+## Skill (Live Package Instructions)
+
+```
+tsift skill [PATH] [--reference]
+```
+
+Prints the instruction surface compiled into the running tsift binary. `PATH`
+defaults to the current directory and is promoted to its project root so the
+output can include capability-detected verification guidance. Without
+`--reference`, the command prints a valid `SKILL.md` document whose opening
+paragraph identifies it as authoritative live output and explicitly prevents a
+recursive reload. With `--reference`, it prints the detailed code-navigation
+runbook.
+
+This command is intentionally plain Markdown rather than JSON: its consumer is
+the agent that just loaded the generated bootstrap. The generated skill and
+reference remain complete fallbacks for environments that cannot execute the
+binary.
 
 ## Status (Session Health Check)
 

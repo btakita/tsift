@@ -1213,6 +1213,15 @@ pub fn run() -> Result<()> {
             instructions,
             harness,
         }) => cmd_init(&path, codex, opencode, workspace, instructions, &harness),
+        Some(Commands::Skill { path, reference }) => {
+            let root = init::resolve_project_dir(&path)?;
+            if reference {
+                print!("{}", init::package_runbook(&root));
+            } else {
+                print!("{}", init::package_skill(&root));
+            }
+            Ok(())
+        }
         Some(Commands::Lint {
             file,
             index,
@@ -23274,6 +23283,27 @@ mod tests {
         let cli = parse_cli(["tsift", "--compact", "status"]);
         assert!(cli.compact);
         assert!(matches!(cli.command, Some(Commands::Status { .. })));
+    }
+
+    #[test]
+    fn cli_parses_package_skill_and_reference_modes() {
+        let cli = parse_cli(["tsift", "skill"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Skill {
+                path,
+                reference: false,
+            }) if path == Path::new(".")
+        ));
+
+        let cli = parse_cli(["tsift", "skill", "repo", "--reference"]);
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Skill {
+                path,
+                reference: true,
+            }) if path == Path::new("repo")
+        ));
     }
 
     #[test]

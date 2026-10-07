@@ -14597,3 +14597,39 @@ fn edit_intents_rename_leaves_javascript_properties_alone() {
     );
     assert!(source.contains("keyed.beta"), "member read: {source}");
 }
+
+#[test]
+fn skill_prints_live_package_instructions_and_reference() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let skill = tsift_bin()
+        .args(["skill", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        skill.status.success(),
+        "skill stderr: {}",
+        String::from_utf8_lossy(&skill.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&skill.stdout);
+    assert!(stdout.contains("authoritative skill bundled with the installed"));
+    assert!(stdout.contains(env!("CARGO_PKG_VERSION")));
+    assert!(!stdout.contains("Run `tsift skill` once per session"));
+
+    let reference = tsift_bin()
+        .args([
+            "skill",
+            dir.path().to_str().unwrap(),
+            "--reference",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        reference.status.success(),
+        "reference stderr: {}",
+        String::from_utf8_lossy(&reference.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&reference.stdout);
+    assert!(stdout.contains("authoritative reference bundled with the installed binary"));
+    assert!(stdout.contains("## Search, read, and graph"));
+}
