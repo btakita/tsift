@@ -1,4 +1,4 @@
-<!-- tsift:opencode-command v=0.1.104 name=tsift-search -->
+<!-- tsift:opencode-command v=0.1.105 name=tsift-search -->
 ---
 description: AST-aware content search via tsift search
 ---

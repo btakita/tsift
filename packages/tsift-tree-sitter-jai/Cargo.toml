@@ -1,6 +1,6 @@
 [package]
 name = "tsift-tree-sitter-jai"
-version = "0.1.104"
+version = "0.1.105"
 edition = "2024"
 description = "Jai grammar for tree-sitter: tsift's packaging of constantitus/tree-sitter-jai (MIT-0), which has no crate on crates.io"
 license = "MIT-0"

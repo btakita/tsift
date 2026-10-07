@@ -3,9 +3,9 @@ name: tsift
 description: "Use tsift for token-efficient repository navigation, code search and reading, call graphs, diffs, logs, tests, session context, and workspace memory. TRIGGER: exploring or changing a codebase with tsift installed, or working on the tsift repo. SKIP: plain file-level glob, non-code web search. VERSION CHECK: compare `tsift --version` against tsift-version below before trusting any command text copied from this file."
 user-invocable: true
 argument-hint: "[query or symbol]"
-tsift-version: "0.1.104"
+tsift-version: "0.1.105"
 ---
-<!-- tsift:skill v=0.1.104 -->
+<!-- tsift:skill v=0.1.105 -->
 # tsift
 
 **Load the current package instructions first.** Run `tsift skill` once per session from the owning repo root and follow its output. That command reads the skill bundled with the installed binary, so a package upgrade takes effect without waiting for this harness file to be regenerated. If the command is unavailable, this versioned copy is a complete fallback; compare `tsift --version` with `tsift-version` below before trusting it.

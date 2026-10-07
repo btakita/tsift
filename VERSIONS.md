@@ -6,6 +6,10 @@ Canonical binary version source: `Cargo.toml` `package.version`. The CLI exposes
 
 Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
+## 0.1.105
+
+- **Load current skill instructions from the installed package.** `tsift skill` now prints the authoritative `SKILL.md` bundled with the running binary, while `tsift skill --reference` prints its detailed code-navigation runbook. Generated harness skills act as versioned bootstrap fallbacks and direct agents to the package-owned live instructions, so future binary upgrades expose current guidance without rewriting tracked repositories or harness directories.
+
 ## 0.1.104
 
 - **Explain why an instruction surface is stale ([#26](https://github.com/btakita/tsift/issues/26)).** Instruction status now reports a machine-readable reason and the failing path when the generated skill, reference, or repository router is missing or stale. Human output names a missing reference file directly and omits the misleading `installed, available` comparison when the versions already match.
