@@ -1871,14 +1871,33 @@ impl IndexDb {
     }
 
     pub fn symbol_search(&self, query: &str, limit: usize) -> Result<Vec<SymbolHit>> {
-        self.symbol_search_filtered(query, limit, true)
+        self.symbol_search_filtered(query, limit, true, None)
+    }
+
+    /// Search symbols defined in one indexed file (`file` is the stored file
+    /// key, i.e. the absolute path the indexer recorded).
+    ///
+    /// #fixsdkrun: `symbol-read <name> --file <path>` used to run the global
+    /// bounded `symbol_search` and filter the top hits by file afterwards. A
+    /// common name (`main` had 42 definitions in one repo) ranks every exact
+    /// match by `file ASC`, so the hinted file's definition fell outside the
+    /// `LIMIT` and the command reported "no indexed symbol matched" for a
+    /// symbol that was indexed. Filtering in SQL spends the limit on the
+    /// hinted file only, with the same ranking.
+    pub fn symbol_search_in_file(
+        &self,
+        query: &str,
+        file: &str,
+        limit: usize,
+    ) -> Result<Vec<SymbolHit>> {
+        self.symbol_search_filtered(query, limit, true, Some(file))
     }
 
     /// Search only code symbols. Markdown headings, list items, and fenced
     /// blocks remain indexed for source navigation and semantic editing, but
     /// they must not compete in `tsift search`'s high-confidence Symbol matches.
     pub fn code_symbol_search(&self, query: &str, limit: usize) -> Result<Vec<SymbolHit>> {
-        self.symbol_search_filtered(query, limit, false)
+        self.symbol_search_filtered(query, limit, false, None)
     }
 
     fn symbol_search_filtered(
@@ -1886,6 +1905,7 @@ impl IndexDb {
         query: &str,
         limit: usize,
         include_markdown: bool,
+        file: Option<&str>,
     ) -> Result<Vec<SymbolHit>> {
         if limit == 0 {
             return Ok(Vec::new());
@@ -1944,12 +1964,17 @@ impl IndexDb {
         };
         let tag_count_expr = "CASE WHEN tags IS NULL OR tags = '' THEN 0 ELSE LENGTH(tags) - LENGTH(REPLACE(tags, ',', '')) + 1 END";
         let ast_columns = self.ast_span_select_columns()?;
-        let limit_param_idx = params.len() + 1;
-        let language_filter = if include_markdown {
-            ""
+        let mut language_filter = if include_markdown {
+            String::new()
         } else {
-            " AND language <> 'markdown'"
+            " AND language <> 'markdown'".to_string()
         };
+        if let Some(file) = file {
+            let file_param_idx = params.len() + 1;
+            language_filter.push_str(&format!(" AND file = ?{file_param_idx}"));
+            params.push(rusqlite::types::Value::from(file.to_string()));
+        }
+        let limit_param_idx = params.len() + 1;
         let sql = format!(
             "SELECT name, kind, language, file, line, end_line, {ast_columns}, tags, {match_count_expr} AS match_count, {tag_count_expr} AS tag_count \
              FROM symbols \

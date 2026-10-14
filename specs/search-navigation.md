@@ -189,6 +189,14 @@ The default projection is outline-first: headings are surfaced before bounded li
 
 At a workspace root, `symbol-read` federates over `<root>` and eligible submodule indexes by default; `--federated` makes that choice explicit. An exact symbol owned by more than one scope fails closed with the ambiguous scope ids and asks for `--file` or `--scope`. A root-owned `--file` resolves against the filtered `<root>` index.
 
+With `--file`, resolution searches that file's indexed symbols directly (same exact > case-insensitive > tag ranking), and only falls back to the global bounded symbol search, filtered to the file, when the file-scoped search finds nothing. Filtering after a bounded global search is not sufficient: a common name defined in more files than the search limit (`main`, `new`, `run`) can rank the hinted file's definition out of the candidate set, producing a false `no indexed symbol matched` against a fresh index (`#fixsdkrun`).
+
+`symbol-read` resolves only names the index records as *definitions*. A `--file` miss fails closed with `no indexed symbol matched "<name>" in <file>; searched: <scopes>` followed by a budget-bounded diagnosis:
+
+- whether the name occurs in the file at all: either `does not occur in <file>`, or `is referenced in <file> at line(s) …` with the quoted call-site lines and a note that it may be a method/function of an imported or external library, or defined in another file (for example `parse_args` from `parser.parse_args()`)
+- `symbols defined in <file>: <kind> <name> (line N), …`, or a note that the index has no symbols for the file (unsupported language, excluded, or not yet indexed)
+- `next:` follow-ups: a `source-read --style window` around the first reference, a whole-file `source-read`, and a workspace `search` for the name
+
 - a stable `sread-*` handle for the selected symbol
 - the symbol signature/range metadata, optional AST `span` metadata, and a token-budgeted body preview capped by both a line-count budget (`preview_items × 16` lines) and a body token cap (default 1500 tokens for Normal, 500 for Small, 3000 for Deep); when the body exceeds the token cap it is truncated and an `expand.body` command is emitted for the remaining body lines
 - child `ssym-*` refs discovered inside the selected symbol's AST byte span when available, falling back to indexed lines for older indexes

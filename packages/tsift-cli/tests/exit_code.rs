@@ -7480,6 +7480,138 @@ fn workspace_symbol_read_supports_a_root_owned_file() {
     assert_eq!(json["report"]["symbol"]["file"], "root_owned.rs");
 }
 
+// #fixsdkrun cause 1: `symbol-read main --file scripts/check.py` failed with
+// "no indexed symbol matched" in a repo with 42 `main` definitions. The global
+// symbol search is bounded and orders exact matches by `file ASC`, so the
+// hinted file's `main` fell outside the limit before the `--file` filter ran.
+// The index was fresh; the miss was a ranking/limit bug, not staleness.
+#[test]
+fn symbol_read_with_file_finds_a_common_name_outranked_by_other_files() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("aaa")).unwrap();
+    fs::create_dir_all(dir.path().join("scripts")).unwrap();
+    // More same-named definitions than any budget's search limit, all
+    // sorting before `scripts/` by path.
+    for index in 0..40 {
+        fs::write(
+            dir.path().join(format!("aaa/tool_{index:02}.py")),
+            "def main():\n    return 0\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        dir.path().join("scripts/check.py"),
+        "import argparse\n\n\ndef helper():\n    return 1\n\n\ndef main():\n    marker_in_target_main = helper()\n    return marker_in_target_main\n",
+    )
+    .unwrap();
+    let indexed = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(indexed.status.success());
+
+    let output = tsift_bin()
+        .args([
+            "--envelope",
+            "symbol-read",
+            "main",
+            "--file",
+            "scripts/check.py",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--budget",
+            "normal",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "symbol-read stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["report"]["symbol"]["name"], "main");
+    assert_eq!(json["report"]["symbol"]["file"], "scripts/check.py");
+    assert_eq!(json["report"]["symbol"]["line"], 8);
+    let rendered = json["report"]["body"].to_string();
+    assert!(rendered.contains("marker_in_target_main"), "{rendered}");
+}
+
+// #fixsdkrun cause 2: an agent read `options = parser.parse_args()` and asked
+// for `parse_args` in that file. It is an argparse method, defined nowhere in
+// the repo. The miss must say the name is only referenced there, list what the
+// file does define, and offer bounded follow-ups instead of a bare refusal.
+#[test]
+fn symbol_read_miss_explains_a_call_site_only_name() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::create_dir_all(dir.path().join("scripts")).unwrap();
+    fs::write(
+        dir.path().join("scripts/check.py"),
+        "import argparse\n\n\ndef run_stage():\n    return 1\n\n\nif __name__ == \"__main__\":\n    parser = argparse.ArgumentParser()\n    options = parser.parse_args()\n    run_stage()\n",
+    )
+    .unwrap();
+    let indexed = tsift_bin()
+        .args(["index", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(indexed.status.success());
+
+    let output = tsift_bin()
+        .args([
+            "--envelope",
+            "symbol-read",
+            "parse_args",
+            "--file",
+            "scripts/check.py",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--budget",
+            "normal",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "parse_args is not defined here");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("no indexed symbol matched"), "{stderr}");
+    assert!(
+        stderr.contains("is referenced in scripts/check.py at line(s) 10")
+            && stderr.contains("imported/external library"),
+        "the miss must name the call site: {stderr}"
+    );
+    assert!(
+        stderr.contains("parser.parse_args()"),
+        "the call-site line should be quoted: {stderr}"
+    );
+    assert!(
+        stderr.contains("symbols defined in scripts/check.py:")
+            && stderr.contains("run_stage (line 4)"),
+        "the miss must list the file's own symbols: {stderr}"
+    );
+    assert!(
+        stderr.contains("--style window --start 5"),
+        "the miss must offer a window read around the call site: {stderr}"
+    );
+
+    let absent = tsift_bin()
+        .args([
+            "symbol-read",
+            "never_mentioned",
+            "--file",
+            "scripts/check.py",
+            "--path",
+            dir.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!absent.status.success());
+    let stderr = String::from_utf8_lossy(&absent.stderr);
+    assert!(
+        stderr.contains("does not occur in scripts/check.py"),
+        "an absent name must be distinguished from a referenced one: {stderr}"
+    );
+}
+
 #[test]
 fn workspace_symbol_read_refuses_cross_scope_ambiguity() {
     let dir = indexed_workspace_cli_fixture();

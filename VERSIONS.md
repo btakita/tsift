@@ -6,6 +6,8 @@ Canonical binary version source: `Cargo.toml` `package.version`. The CLI exposes
 
 Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
+- **`symbol-read --file` finds common names and explains misses (`#fixsdkrun`).** With `--file`, `symbol-read` now searches the hinted file's indexed symbols directly instead of filtering the global, limit-bounded symbol search afterwards. A name defined in many files (`main` had 42 definitions in one repository) used to rank the hinted file's definition past the search limit, so the command reported `no indexed symbol matched` for a symbol the fresh index contained. A genuine miss inside a file now explains itself: it says whether the name occurs in the file at all, quotes the lines where it is only referenced (for example `parser.parse_args()`, an imported library method that no file defines), lists the symbols the file does define, and offers bounded `source-read --style window`, whole-file `source-read`, and `search` follow-ups, all capped by the response budget.
+
 ## 0.1.105
 
 - **Load current skill instructions from the installed package.** `tsift skill` now prints the authoritative `SKILL.md` bundled with the running binary, while `tsift skill --reference` prints its detailed code-navigation runbook. Generated harness skills act as versioned bootstrap fallbacks and direct agents to the package-owned live instructions, so future binary upgrades expose current guidance without rewriting tracked repositories or harness directories.

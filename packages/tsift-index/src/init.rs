@@ -156,7 +156,7 @@ Global flags: `--envelope`, `--compact`, `--terse`, `--ultra-terse`, `--schema`,
 Use the commands listed in `tsift status`'s `use:` output:
 
 - `tsift --envelope source-read <file> --budget normal` — AST-symbol projection with span metadata and source-window expansion commands (prefer over raw cat/head/tail/sed/less reads for source files)
-- `tsift --envelope symbol-read <symbol> --budget normal` — token-budgeted symbol body, AST span metadata, child refs, and graph/source expansion commands
+- `tsift --envelope symbol-read <symbol> --budget normal` — token-budgeted symbol body, AST span metadata, child refs, and graph/source expansion commands; resolves only symbols the file *defines* — a miss with `--file` names call-site-only references (e.g. a library method like `parser.parse_args()`), lists the file's defined symbols, and prints `source-read`/`search` follow-ups, so read those instead of guessing another name
 - `tsift --envelope search <query> --budget normal` — AST-aware hybrid search preview (prefer over grep/rg)
 - `tsift --envelope explain <symbol> --budget normal` — callers, callees, community preview
 - `tsift graph <symbol> --callers` / `--callees` — call graph navigation

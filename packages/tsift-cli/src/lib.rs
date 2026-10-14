@@ -18710,6 +18710,140 @@ fn cmd_source_read(
     Ok(())
 }
 
+/// #fixsdkrun: explain a `symbol-read <name> --file <path>` miss so the caller
+/// stops guessing. An agent that reads `args = parser.parse_args()` and asks
+/// for `parse_args` in that file gets told the name is only *referenced* there
+/// (a method of an imported library), which symbols the file does define, and
+/// which bounded follow-up reads the file instead. Every list is capped by the
+/// response budget.
+fn symbol_read_file_miss_diagnosis(
+    root: &Path,
+    targets: &[SearchIndexTarget],
+    symbol: &str,
+    file_abs: &Path,
+    file_arg: &Path,
+    budget: ResponseBudget,
+) -> String {
+    let max_items = budget.follow_up_items().clamp(3, 12);
+    let max_bytes = budget.preview_bytes().clamp(60, 160);
+    let file_key = file_abs.to_string_lossy().to_string();
+    let mut defined: Option<Vec<index::StoredSymbol>> = None;
+    for target in targets {
+        if !target.db_path.exists() {
+            continue;
+        }
+        let Ok(db) = index::IndexDb::open_read_only_resilient(&target.db_path) else {
+            continue;
+        };
+        if let Ok(symbols) = db.symbols_for_file(&file_key)
+            && !symbols.is_empty()
+        {
+            defined = Some(symbols);
+            break;
+        }
+    }
+    let file_display = file_arg.to_string_lossy().to_string();
+    let mut out = String::new();
+    let text = fs::read(file_abs)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default();
+    let references = symbol_reference_lines(&text, symbol);
+    if references.is_empty() {
+        out.push_str(&format!(
+            "\nnote: {symbol:?} does not occur in {file_display}; it is not defined or referenced there."
+        ));
+    } else {
+        let shown = references
+            .iter()
+            .take(max_items)
+            .map(|(line, text)| {
+                format!("\n  {line}: {}", truncate_for_budget(text.trim(), max_bytes))
+            })
+            .collect::<String>();
+        let more = references.len().saturating_sub(max_items);
+        let more = if more > 0 {
+            format!("\n  ... {more} more")
+        } else {
+            String::new()
+        };
+        let lines = references
+            .iter()
+            .take(max_items)
+            .map(|(line, _)| line.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push_str(&format!(
+            "\nnote: {symbol:?} is referenced in {file_display} at line(s) {lines} but no indexed definition exists there; it may be a method or function of an imported/external library, or defined in another file:{shown}{more}"
+        ));
+    }
+    match defined {
+        Some(symbols) => {
+            let names = symbols
+                .iter()
+                .take(max_items)
+                .map(|candidate| {
+                    format!(
+                        "{} {} (line {})",
+                        candidate.kind,
+                        truncate_for_budget(&candidate.name, max_bytes),
+                        source_symbol_line(candidate)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let more = symbols.len().saturating_sub(max_items);
+            let more = if more > 0 {
+                format!(", ... {more} more")
+            } else {
+                String::new()
+            };
+            out.push_str(&format!(
+                "\nsymbols defined in {file_display}: {names}{more}"
+            ));
+        }
+        None => out.push_str(&format!(
+            "\nnote: the index has no symbols for {file_display} (unsupported language, excluded, or not yet indexed)."
+        )),
+    }
+    let window_start = references.first().map(|(line, _)| line.saturating_sub(5).max(1));
+    out.push_str("\nnext:");
+    if let Some(start) = window_start {
+        out.push_str(&format!(
+            "\n  {}",
+            source_read_window_command(root, &file_display, start, 20)
+        ));
+    }
+    out.push_str(&format!(
+        "\n  {}",
+        source_read_ast_command(root, &file_display)
+    ));
+    out.push_str(&format!(
+        "\n  tsift --envelope search {} --path {} --budget normal",
+        shell_quote(symbol),
+        shell_quote(&root.to_string_lossy())
+    ));
+    out
+}
+
+/// 1-based lines where `symbol` appears as a whole identifier.
+fn symbol_reference_lines<'a>(text: &'a str, symbol: &str) -> Vec<(usize, &'a str)> {
+    if symbol.is_empty() {
+        return Vec::new();
+    }
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            line.match_indices(symbol).any(|(start, matched)| {
+                let before = line[..start].chars().next_back();
+                let after = line[start + matched.len()..].chars().next();
+                !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+            })
+        })
+        .map(|(index, line)| (index + 1, line))
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_symbol_read(
     symbol: &str,
@@ -18743,9 +18877,22 @@ fn cmd_symbol_read(
         }
         let db = index::IndexDb::open_read_only_resilient(&target.db_path)
             .with_context(|| format!("opening symbol index {}", target.db_path.display()))?;
-        let hits = db
-            .symbol_search(symbol, search_limit)
-            .with_context(|| format!("searching symbols for {symbol:?}"))?;
+        // #fixsdkrun: with `--file`, search inside that file first. The global
+        // search is bounded, so a common name (`main`) defined in many files
+        // can rank the hinted file's definition out of the limit before the
+        // file filter below ever sees it.
+        let file_scoped_hits = match hinted_file_abs.as_ref() {
+            Some(hinted_file_abs) => db
+                .symbol_search_in_file(symbol, &hinted_file_abs.to_string_lossy(), search_limit)
+                .with_context(|| format!("searching symbols for {symbol:?}"))?,
+            None => Vec::new(),
+        };
+        let hits = if file_scoped_hits.is_empty() {
+            db.symbol_search(symbol, search_limit)
+                .with_context(|| format!("searching symbols for {symbol:?}"))?
+        } else {
+            file_scoped_hits
+        };
         candidates.extend(hits.into_iter().filter_map(|hit| {
             let matches_file = hinted_file_abs.as_ref().is_none_or(|hinted_file_abs| {
                 resolve_indexed_source_file(
@@ -18783,6 +18930,19 @@ fn cmd_symbol_read(
         let hint = file_hint
             .map(|file| format!(" in {}", file.display()))
             .unwrap_or_default();
+        let diagnosis = hinted_file_abs
+            .as_deref()
+            .map(|hinted_file_abs| {
+                symbol_read_file_miss_diagnosis(
+                    &root,
+                    &targets,
+                    symbol,
+                    hinted_file_abs,
+                    file_hint.unwrap_or(hinted_file_abs),
+                    budget,
+                )
+            })
+            .unwrap_or_default();
         let searched = targets
             .iter()
             .map(|target| {
@@ -18793,7 +18953,7 @@ fn cmd_symbol_read(
             })
             .collect::<Vec<_>>()
             .join(", ");
-        format!("no indexed symbol matched {symbol:?}{hint}; searched: {searched}")
+        format!("no indexed symbol matched {symbol:?}{hint}; searched: {searched}{diagnosis}")
     })?;
     let selected_scope = targets[selected_target_index]
         .scope_name
