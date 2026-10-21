@@ -50,8 +50,14 @@ invalidates older projections. Federated inline index repair applies the same ne
 scope exclusions as `index --workspace`, keeping parent-scope refresh idempotent.
 The path component of the watermark is canonicalized before hashing, so equivalent
 relative and absolute `--path` spellings produce the same stored and recomputed
-watermark. Every SQLite graph read uses that path-aware verdict, and `refresh`
-returns non-zero if its immediate post-write validation still fails closed.
+watermark. Markdown inputs contribute their content hash rather than file metadata,
+so an mtime-only touch does not invalidate a projection. Before traversal reads
+begin, refresh prepares every participating index scope and captures the complete
+source watermark that the projection is built against. If inputs change after that
+capture, the written projection is conservatively reported as `stale`; refresh emits
+a retry warning and exits successfully because materialization completed, while
+subsequent graph reads remain fail-closed until a clean refresh. Other immediate
+post-write freshness failures still make `refresh` return non-zero.
 Projection metadata records that canonical path hint and the explicit
 full/session-only mode, so every read recomputes the exact stored watermark domain
 without treating a different path or mode's hash as current.

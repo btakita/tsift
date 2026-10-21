@@ -48,16 +48,16 @@ use crate::{
     graph_db_operator_report_from_disk, graph_db_operator_status_warnings,
     graph_db_read_recovery_diagnostic, graph_db_report_from_store,
     graph_db_resolve_evidence_target_with_path, graph_db_scope_arg, graph_projection_content_hash,
-    graph_substrate_db_path, load_convex_projection_rows, load_convex_projection_snapshot_value,
-    no_rewrite_message, open_db, prepare_conflict_matrix_inputs, print_convex_sync_human,
-    print_graph_db_backend_eval_human, print_graph_db_compaction_human,
-    print_graph_db_doctor_human, print_graph_db_drift_human, print_graph_db_evidence_report,
-    print_graph_db_human, print_graph_db_operator_report, print_json_or_envelope, rewrite_command,
-    schema_overview, shell_quote, sqlite_convex_rows_from_conn, sqlite_graph_freshness,
-    sqlite_graph_freshness_for_path, status_missing_workspace_scopes, table_columns,
-    to_json_schema, tokensave_graph_freshness, traversal_source_watermark, truncate_for_compact,
-    validate_convex_projection_rows, write_traversal_graph_store,
-    write_traversal_graph_store_with_options,
+    graph_refresh_has_only_source_drift, graph_substrate_db_path, load_convex_projection_rows,
+    load_convex_projection_snapshot_value, no_rewrite_message, open_db,
+    prepare_conflict_matrix_inputs, print_convex_sync_human, print_graph_db_backend_eval_human,
+    print_graph_db_compaction_human, print_graph_db_doctor_human, print_graph_db_drift_human,
+    print_graph_db_evidence_report, print_graph_db_human, print_graph_db_operator_report,
+    print_json_or_envelope, rewrite_command, schema_overview, shell_quote,
+    sqlite_convex_rows_from_conn, sqlite_graph_freshness, sqlite_graph_freshness_for_path,
+    status_missing_workspace_scopes, table_columns, to_json_schema, tokensave_graph_freshness,
+    traversal_source_watermark, truncate_for_compact, validate_convex_projection_rows,
+    write_traversal_graph_store, write_traversal_graph_store_with_options,
 };
 use tsift_tokensave::TokensaveDb;
 
@@ -332,7 +332,7 @@ pub(crate) fn cmd_graph_db_refresh(
         file_size_bytes_after: refresh.file_size_bytes_after,
         phase_timings,
     };
-    let report = graph_db_operator_report_from_disk(
+    let mut report = graph_db_operator_report_from_disk(
         root,
         scope,
         &graph_db,
@@ -340,7 +340,14 @@ pub(crate) fn cmd_graph_db_refresh(
         Some(refresh),
         warnings,
     )?;
-    let fail_closed = report.freshness.fail_closed;
+    let source_drift = graph_refresh_has_only_source_drift(&report.freshness);
+    if source_drift {
+        report.warnings.push(
+            "source inputs changed during graph-db refresh; the projection was written successfully but remains stale until the next refresh"
+                .to_string(),
+        );
+    }
+    let fail_closed = report.freshness.fail_closed && !source_drift;
     print_graph_db_operator_report(&report, format)?;
     if fail_closed {
         bail!("graph-db refresh completed with stale projection freshness");

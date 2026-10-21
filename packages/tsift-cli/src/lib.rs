@@ -14168,26 +14168,18 @@ fn traversal_watermark_path(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-fn push_traversal_metadata_watermark_part(
+fn push_traversal_content_watermark_part(
     root: &Path,
     path: &Path,
     label: &str,
     parts: &mut Vec<String>,
 ) {
     let display = traversal_watermark_path(root, path);
-    match fs::metadata(path) {
-        Ok(metadata) => {
-            let (secs, nanos) = metadata
-                .modified()
-                .ok()
-                .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| (duration.as_secs(), duration.subsec_nanos()))
-                .unwrap_or((0, 0));
-            parts.push(format!(
-                "{label}:{display}:len={}:mtime={secs}.{nanos}",
-                metadata.len()
-            ));
-        }
+    match fs::read(path) {
+        Ok(content) => parts.push(format!(
+            "{label}:{display}:blake3={}",
+            blake3::hash(&content).to_hex()
+        )),
         Err(_) => parts.push(format!("{label}:{display}:missing")),
     }
 }
@@ -14229,7 +14221,7 @@ fn push_traversal_summaries_watermark_part(root: &Path, parts: &mut Vec<String>)
             ));
         }
         Err(_) => {
-            push_traversal_metadata_watermark_part(
+            push_traversal_content_watermark_part(
                 root,
                 &summaries_db,
                 "summaries_db_unreadable",
@@ -14307,7 +14299,7 @@ pub(crate) fn traversal_source_watermark(
     let markdown_files = markdown_files_for_traversal(root, path_hint)?;
     parts.push(format!("markdown_count:{}", markdown_files.len()));
     for markdown_path in markdown_files {
-        push_traversal_metadata_watermark_part(root, &markdown_path, "markdown", &mut parts);
+        push_traversal_content_watermark_part(root, &markdown_path, "markdown", &mut parts);
     }
 
     push_traversal_summaries_watermark_part(root, &mut parts)?;
@@ -15372,6 +15364,51 @@ fn build_traversal_graph_source_with_options(
     Ok(graph)
 }
 
+fn prepare_traversal_source_indexes(
+    root: &Path,
+    path_hint: &Path,
+    scope: Option<&str>,
+    session_only: bool,
+) -> Result<()> {
+    if session_only && hinted_markdown_file(root, path_hint).is_some() {
+        return Ok(());
+    }
+
+    let mut targets = Vec::<(PathBuf, Option<String>)>::new();
+    if scope.is_none() && !session_only && should_auto_federate(root, path_hint, scope, false)? {
+        let config = config::Config::load(root)?;
+        let workspace_scopes = config::Config::submodule_dirs(root)?;
+        if !workspace_scopes.is_empty() {
+            targets.push((
+                path_hint.to_path_buf(),
+                Some(config::WORKSPACE_ROOT_SCOPE_ID.to_string()),
+            ));
+            targets.extend(
+                workspace_scopes
+                    .into_iter()
+                    .filter(|workspace_scope| config.federation_for_scope(workspace_scope))
+                    .map(|workspace_scope| (workspace_scope.source_root, Some(workspace_scope.id))),
+            );
+        }
+    }
+    if targets.is_empty() {
+        targets.push((path_hint.to_path_buf(), scope.map(str::to_string)));
+    }
+
+    for (target_path, target_scope) in targets {
+        let (gate, _) = prepare_agent_doc_index_gate_cached(
+            root,
+            &target_path,
+            target_scope.as_deref(),
+            "graph traversal packet",
+        );
+        if let Some(err) = gate.fail_closed_error {
+            bail!(err);
+        }
+    }
+    Ok(())
+}
+
 fn ensure_federated_graph_work_is_bounded(
     root: &Path,
     config: &config::Config,
@@ -15576,6 +15613,13 @@ pub(crate) fn write_traversal_graph_store_with_options(
     scope: Option<&str>,
     session_only: bool,
 ) -> Result<(TraversalGraphBuild, SqliteProjectionRefresh)> {
+    // Prepare every index scope first, then pin the complete source snapshot before
+    // traversal reads begin. A concurrent edit can therefore only make the stored
+    // projection conservatively stale; it can never be blessed by a later watermark.
+    prepare_traversal_source_indexes(root, path_hint, scope, session_only)?;
+    let source_watermark = traversal_source_watermark(root, path_hint, scope, session_only)
+        .ok()
+        .flatten();
     let source_graph =
         build_traversal_graph_source_with_options(root, path_hint, scope, session_only)?;
     let projection =
@@ -15584,10 +15628,7 @@ pub(crate) fn write_traversal_graph_store_with_options(
     // Serialize the write against concurrent refresh/snapshot-import (#gdbwritelock).
     let _write_lock = acquire_graph_db_write_lock(&graph_db)?;
     let mut store = SqliteGraphStore::open(&graph_db)?;
-    let source_watermark = traversal_source_watermark(root, path_hint, scope, session_only)
-        .ok()
-        .flatten()
-        .or_else(|| graph_projection_content_hash(&projection));
+    let source_watermark = source_watermark.or_else(|| graph_projection_content_hash(&projection));
     let refresh = store.replace_projection_with_version(
         scope.unwrap_or("root"),
         &projection,
@@ -15595,6 +15636,14 @@ pub(crate) fn write_traversal_graph_store_with_options(
         source_watermark,
     )?;
     Ok((source_graph, refresh))
+}
+
+pub(crate) fn graph_refresh_has_only_source_drift(freshness: &GraphDbFreshnessReport) -> bool {
+    freshness.fail_closed
+        && !freshness.diagnostics.is_empty()
+        && freshness.diagnostics.iter().all(|diagnostic| {
+            diagnostic.starts_with("graph projection source watermark mismatch:")
+        })
 }
 
 pub(crate) fn write_traversal_graph_store(
@@ -35812,6 +35861,51 @@ fn sample() {}
             first, fourth,
             "watermark must invalidate when the hinted markdown file changes"
         );
+    }
+
+    #[test]
+    fn traversal_source_watermark_ignores_markdown_mtime_when_content_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let hint = root.join("README.md");
+        let body = "# stable content\n";
+        std::fs::write(&hint, body).unwrap();
+
+        let first = traversal_source_watermark(root, &hint, None, true)
+            .unwrap()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&hint, body).unwrap();
+        let second = traversal_source_watermark(root, &hint, None, true)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            first, second,
+            "mtime-only markdown churn must not invalidate the traversal watermark"
+        );
+    }
+
+    #[test]
+    fn graph_refresh_source_drift_is_nonfatal_only_for_a_watermark_race() {
+        let source_drift = GraphDbFreshnessReport {
+            status: "stale".to_string(),
+            fail_closed: true,
+            projection_version: Some(GRAPH_PROJECTION_VERSION.to_string()),
+            content_hash: Some("hash".to_string()),
+            source_watermark: Some("watermark".to_string()),
+            diagnostics: vec![
+                "graph projection source watermark mismatch: expected new got old; run `refresh`"
+                    .to_string(),
+            ],
+        };
+        assert!(graph_refresh_has_only_source_drift(&source_drift));
+
+        let mut corrupt = source_drift;
+        corrupt
+            .diagnostics
+            .push("projection content hash is missing".to_string());
+        assert!(!graph_refresh_has_only_source_drift(&corrupt));
     }
 
     #[test]
