@@ -3,6 +3,7 @@ use std::io::Read as _;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use tsift_agent_doc::{prompt_cache_history, session_cost, session_digest, session_review};
 use tsift_digest::{diff_digest, metric_digest};
 use tsift_quality::lint;
@@ -19,6 +20,25 @@ use crate::{
     render_test_digest_from_input, shell_quote, to_json_schema, truncate_for_compact,
     verify_convex_projection_snapshot,
 };
+
+const MAX_SESSION_EXCERPT_LINES: usize = 200;
+
+#[derive(Debug, Serialize)]
+struct SessionDigestExcerpt {
+    start_line: usize,
+    end_line: usize,
+    requested_lines: usize,
+    truncated: bool,
+    text: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionDigestOutput<'a> {
+    #[serde(flatten)]
+    report: &'a session_digest::SessionDigestReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    excerpt: Option<&'a SessionDigestExcerpt>,
+}
 
 pub(crate) fn cmd_diff_digest(
     path: &Path,
@@ -538,6 +558,8 @@ pub(crate) fn cmd_session_digest(
     path: &Path,
     input_path: Option<&Path>,
     source: Option<&str>,
+    start: Option<usize>,
+    lines: Option<usize>,
     format: OutputFormat,
 ) -> Result<()> {
     let input = match input_path {
@@ -555,12 +577,17 @@ pub(crate) fn cmd_session_digest(
         bail!("no session input provided; pass --input <file> or pipe transcript on stdin");
     }
 
+    let excerpt = build_session_digest_excerpt(&input, start, lines)?;
     let report = session_digest::compute(path, &input, source)?;
+    let output = SessionDigestOutput {
+        report: &report,
+        excerpt: excerpt.as_ref(),
+    };
     if format.json_output {
         println!(
             "{}",
             to_json_schema(
-                &report,
+                &output,
                 format.pretty,
                 format.terse,
                 format.ultra_terse,
@@ -649,6 +676,7 @@ pub(crate) fn cmd_session_digest(
         for warning in &report.warnings {
             println!("warning: {warning}");
         }
+        print_session_digest_excerpt(excerpt.as_ref());
         return Ok(());
     }
 
@@ -773,7 +801,68 @@ pub(crate) fn cmd_session_digest(
     for warning in &report.warnings {
         println!("warning: {warning}");
     }
+    print_session_digest_excerpt(excerpt.as_ref());
     Ok(())
+}
+
+fn build_session_digest_excerpt(
+    input: &str,
+    start: Option<usize>,
+    lines: Option<usize>,
+) -> Result<Option<SessionDigestExcerpt>> {
+    let (start, requested_lines) = match (start, lines) {
+        (None, None) => return Ok(None),
+        (Some(start), Some(lines)) => (start, lines),
+        _ => bail!("--start and --lines must be provided together"),
+    };
+    if start == 0 {
+        bail!("--start must be at least 1");
+    }
+    if requested_lines == 0 {
+        bail!("--lines must be at least 1");
+    }
+
+    let total_lines = input.lines().count();
+    if start > total_lines {
+        bail!(
+            "requested session excerpt starts at line {start}, but the input has {total_lines} lines"
+        );
+    }
+
+    let included_lines = requested_lines
+        .min(MAX_SESSION_EXCERPT_LINES)
+        .min(total_lines - start + 1);
+    let text = input
+        .lines()
+        .skip(start - 1)
+        .take(included_lines)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(Some(SessionDigestExcerpt {
+        start_line: start,
+        end_line: start + included_lines - 1,
+        requested_lines,
+        truncated: included_lines < requested_lines,
+        text,
+    }))
+}
+
+fn print_session_digest_excerpt(excerpt: Option<&SessionDigestExcerpt>) {
+    let Some(excerpt) = excerpt else {
+        return;
+    };
+    println!();
+    println!(
+        "Requested lines {}-{}{}:",
+        excerpt.start_line,
+        excerpt.end_line,
+        if excerpt.truncated {
+            " (truncated)"
+        } else {
+            ""
+        }
+    );
+    println!("{}", excerpt.text);
 }
 
 fn compact_prompt_cache_breakpoints(breakpoints: &[String]) -> String {

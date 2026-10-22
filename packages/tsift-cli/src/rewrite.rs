@@ -631,9 +631,26 @@ fn file_read_rewrite_decision(cmd: &str) -> Option<FileReadRewriteDecision> {
                 target.input, SESSION_READ_LINE_THRESHOLD
             )));
         }
+        let window = if explicit_window {
+            let total_lines = count_file_lines(&input_path)?;
+            let Some(window) = source_window_for_read(target.window, total_lines) else {
+                return Some(FileReadRewriteDecision::Declined(format!(
+                    "requested session window for `{}` is outside the file's {} lines",
+                    target.input, total_lines
+                )));
+            };
+            Some(window)
+        } else {
+            None
+        };
         let digest_path = resolve_digest_context_path(&input_path);
         return Some(FileReadRewriteDecision::Rewritten(
-            build_session_digest_command(&digest_path, &input_path.to_string_lossy(), source),
+            build_session_digest_command(
+                &digest_path,
+                &input_path.to_string_lossy(),
+                source,
+                window,
+            ),
         ));
     }
 
@@ -1011,13 +1028,18 @@ fn build_session_digest_command(
     path: &str,
     input: &str,
     source: session_digest::SessionDigestSource,
+    window: Option<(usize, usize)>,
 ) -> String {
-    format!(
+    let mut command = format!(
         "tsift session-digest --path {} --input {} --source {}",
         shell_quote(path),
         shell_quote(input),
         source.cli_arg()
-    )
+    );
+    if let Some((start, lines)) = window {
+        command.push_str(&format!(" --start {start} --lines {lines}"));
+    }
+    command
 }
 
 fn build_log_digest_read_command(input: &Path) -> String {
