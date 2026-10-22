@@ -1592,11 +1592,15 @@ pub fn run() -> Result<()> {
             path,
             input,
             source,
+            start,
+            lines,
             json,
         }) => cmd_session_digest(
             &path,
             input.as_deref(),
             source.as_deref(),
+            start,
+            lines,
             OutputFormat {
                 json_output: json || terse || schema || envelope,
                 compact,
@@ -24585,7 +24589,7 @@ mod tests {
         assert_eq!(
             result,
             Some(format!(
-                "tsift session-digest --path {} --input {} --source claude-jsonl",
+                "tsift session-digest --path {} --input {} --source claude-jsonl --start 1 --lines 120",
                 shell_quote(&resolve_digest_context_path(&session)),
                 shell_quote(session.to_str().unwrap())
             ))
@@ -24609,7 +24613,7 @@ mod tests {
         assert_eq!(
             result,
             Some(format!(
-                "tsift session-digest --path {} --input {} --source codex-jsonl",
+                "tsift session-digest --path {} --input {} --source codex-jsonl --start 1 --lines 120",
                 shell_quote(&resolve_digest_context_path(&session)),
                 shell_quote(session.to_str().unwrap())
             ))
@@ -24633,7 +24637,7 @@ mod tests {
         assert_eq!(
             result,
             Some(format!(
-                "tsift session-digest --path {} --input {} --source claude-jsonl",
+                "tsift session-digest --path {} --input {} --source claude-jsonl --start 101 --lines 20",
                 shell_quote(&resolve_digest_context_path(&session)),
                 shell_quote(session.to_str().unwrap())
             ))
@@ -24660,7 +24664,7 @@ mod tests {
         assert_eq!(
             result,
             Some(format!(
-                "tsift session-digest --path {} --input {} --source claude-jsonl",
+                "tsift session-digest --path {} --input {} --source claude-jsonl --start 101 --lines 20",
                 shell_quote(&resolve_digest_context_path(&session)),
                 shell_quote(session.to_str().unwrap())
             ))
@@ -24702,13 +24706,13 @@ mod tests {
         fs::write(&session, body).unwrap();
 
         let result = rewrite_command(&format!(
-            "sed -n '1,120p' {}",
+            "sed -n '40,45p' {}",
             shell_quote(session.to_str().unwrap())
         ));
         assert_eq!(
             result,
             Some(format!(
-                "tsift session-digest --path {} --input {} --source markdown",
+                "tsift session-digest --path {} --input {} --source markdown --start 40 --lines 6",
                 shell_quote(&resolve_digest_context_path(&session)),
                 shell_quote(session.to_str().unwrap())
             ))
@@ -31978,6 +31982,10 @@ tier = "private"
             "target/session.md",
             "--source",
             "markdown",
+            "--start",
+            "40",
+            "--lines",
+            "6",
             "--json",
         ]);
         match cli.command {
@@ -31986,11 +31994,15 @@ tier = "private"
                 path,
                 input,
                 source,
+                start,
+                lines,
             }) => {
                 assert!(json);
                 assert_eq!(path, PathBuf::from("."));
                 assert_eq!(input, Some(PathBuf::from("target/session.md")));
                 assert_eq!(source.as_deref(), Some("markdown"));
+                assert_eq!(start, Some(40));
+                assert_eq!(lines, Some(6));
             }
             _ => panic!("expected SessionDigest command"),
         }

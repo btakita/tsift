@@ -165,6 +165,7 @@ tsift session-digest --path . < tasks/software/tsift.md
 tsift session-digest --source claude-jsonl --input ~/.claude/projects/foo/session.jsonl --json
 tsift session-digest --source codex-jsonl --input ~/.codex/sessions/2026/05/02/rollout-....jsonl --json
 tsift session-digest --source agent-doc-log --input .agent-doc/logs/tsift-v0.1.log --json
+tsift session-digest --input tasks/software/tsift.md --source markdown --start 40 --lines 6
 ```
 
 Accepted sources:
@@ -178,10 +179,12 @@ Behavior:
 
 1. Read captured session input from stdin by default, or from `--input <file>`.
 2. Auto-detect markdown, Claude JSONL, Codex JSONL, or `agent-doc` runtime logs unless `--source markdown|claude-jsonl|codex-jsonl|agent-doc-log` forces one parser.
-3. Extract bounded prompt targets, shell commands, touched file paths, symbol-like identifiers, failure lines, runtime-event churn, and closeout evidence such as verification/install/commit/push/version mentions. File references are conservative: shell redirection fragments such as `2>/dev/null`, existing directories, and slash-separated conversational labels without a real file, known filename, or supported file extension are not reported as touched files. Runtime log path fields that point at the session root or another existing directory are not reported as touched files, so project-root `cwd_resolved` events cannot produce empty file anchors.
-4. Ignore copied harness-instruction ballast such as markdown headings, placeholder slash-command examples, and bold imperative labels so prompt/failure hotspots stay focused on actual session work.
-5. Treat successful test summaries, prompt directives, source-code snippets, and bare section labels as non-failures: lines such as `failures:`, `No failures detected`, `test result: ok. ... 0 failed`, `4 passed, 0 failed`, `do [#id] ... failure extraction ...`, and source lines like `panic!(...)` must not appear in session-digest failures or session-review unresolved failures, while real panic/assertion/error/exit evidence is preserved with its command/session anchors. Exit failures from command transcripts must name the parsed command, for example `cargo test exited with code 1`, instead of a generic `command exited with code 1`.
-6. Keep the digest transcript-only: it summarizes what happened in the session, but it does not replay tool calls or attempt to reconstruct the full conversation.
+3. When `--start <line> --lines <count>` is supplied, include that one-based input window alongside the digest. The two flags are required together, and excerpts are capped at 200 lines with explicit truncation metadata in JSON output.
+4. Raw-read rewrites for explicit `head`, `tail`, and `sed -n A,Bp` windows preserve the requested window by adding `--start` and `--lines` to the generated `session-digest` command.
+5. Extract bounded prompt targets, shell commands, touched file paths, symbol-like identifiers, failure lines, runtime-event churn, and closeout evidence such as verification/install/commit/push/version mentions. File references are conservative: shell redirection fragments such as `2>/dev/null`, existing directories, and slash-separated conversational labels without a real file, known filename, or supported file extension are not reported as touched files. Runtime log path fields that point at the session root or another existing directory are not reported as touched files, so project-root `cwd_resolved` events cannot produce empty file anchors.
+6. Ignore copied harness-instruction ballast such as markdown headings, placeholder slash-command examples, and bold imperative labels so prompt/failure hotspots stay focused on actual session work.
+7. Treat successful test summaries, prompt directives, source-code snippets, and bare section labels as non-failures: lines such as `failures:`, `No failures detected`, `test result: ok. ... 0 failed`, `4 passed, 0 failed`, `do [#id] ... failure extraction ...`, and source lines like `panic!(...)` must not appear in session-digest failures or session-review unresolved failures, while real panic/assertion/error/exit evidence is preserved with its command/session anchors. Exit failures from command transcripts must name the parsed command, for example `cargo test exited with code 1`, instead of a generic `command exited with code 1`.
+8. Keep the digest transcript-only: it summarizes what happened in the session, but it does not replay tool calls or reconstruct the conversation outside an explicitly requested excerpt.
 
 `session-digest` is intentionally conservative. It favors bounded evidence over perfect transcript reconstruction so long agent sessions can be collapsed into compact handoff or review context.
 

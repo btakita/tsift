@@ -1030,6 +1030,12 @@ pub enum Commands {
         /// Force the transcript source (`markdown`, `claude-jsonl`, `codex-jsonl`, or `agent-doc-log`)
         #[arg(long)]
         source: Option<String>,
+        /// First one-based input line to include as an excerpt
+        #[arg(long, requires = "lines")]
+        start: Option<usize>,
+        /// Number of input lines to include as an excerpt
+        #[arg(long, requires = "start")]
+        lines: Option<usize>,
         /// Output as JSON
         #[arg(long)]
         json: bool,

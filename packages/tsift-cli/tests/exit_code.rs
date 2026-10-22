@@ -10813,6 +10813,67 @@ do [#sessiondigest]. spec-test-build-install-commit-push
 }
 
 #[test]
+fn session_digest_includes_requested_input_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = dir.path().join("doc.md");
+    let body = (1..=125)
+        .map(|line| format!("body line token ZQ{line:03}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&session, format!("{body}\n")).unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "session-digest",
+            "--input",
+            session.to_str().unwrap(),
+            "--source",
+            "markdown",
+            "--start",
+            "40",
+            "--lines",
+            "6",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "session-digest should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Requested lines 40-45:"));
+    assert!(stdout.contains("body line token ZQ040"));
+    assert!(stdout.contains("body line token ZQ045"));
+    assert!(!stdout.contains("body line token ZQ039"));
+    assert!(!stdout.contains("body line token ZQ046"));
+
+    let output = tsift_bin()
+        .args([
+            "session-digest",
+            "--input",
+            session.to_str().unwrap(),
+            "--source",
+            "markdown",
+            "--start",
+            "40",
+            "--lines",
+            "6",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "JSON session-digest should succeed");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["excerpt"]["start_line"], 40);
+    assert_eq!(json["excerpt"]["end_line"], 45);
+    assert_eq!(json["excerpt"]["requested_lines"], 6);
+    assert_eq!(json["excerpt"]["truncated"], false);
+    assert!(
+        json["excerpt"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("ZQ040") && text.contains("ZQ045"))
+    );
+}
+
+#[test]
 fn session_digest_ignores_successful_test_summaries_from_stdin() {
     let dir = tempfile::tempdir().unwrap();
     let input = "\
