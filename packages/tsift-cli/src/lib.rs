@@ -3493,6 +3493,7 @@ struct TokenCappedPreview {
     preview: Vec<SourceLinePreview>,
     capped_end: usize,
     was_capped: bool,
+    cut_lines: usize,
 }
 
 fn build_token_capped_preview(
@@ -3506,6 +3507,7 @@ fn build_token_capped_preview(
     let mut accumulated_tokens = 0usize;
     let mut capped_end = end;
     let mut was_capped = false;
+    let mut cut_lines = 0usize;
 
     for (idx, line) in all_lines[(start - 1)..end].iter().enumerate() {
         let truncated = truncate_for_budget(line, max_bytes);
@@ -3515,6 +3517,7 @@ fn build_token_capped_preview(
             was_capped = true;
             break;
         }
+        cut_lines += usize::from(truncated != *line);
         accumulated_tokens += line_tokens;
         preview.push(SourceLinePreview {
             line: start + idx,
@@ -3526,6 +3529,7 @@ fn build_token_capped_preview(
         preview,
         capped_end,
         was_capped,
+        cut_lines,
     }
 }
 
@@ -18419,6 +18423,18 @@ fn cmd_source_read(
     }
     let requested_end = end.unwrap_or_else(|| start.saturating_add(lines).saturating_sub(1));
     let end_line = requested_end.min(total_lines);
+    if style == SourceReadStyle::Raw {
+        let selected_lines = end_line.saturating_sub(start).saturating_add(1);
+        let mut stdout = std::io::stdout().lock();
+        for line in source
+            .split_inclusive(|byte| *byte == b'\n')
+            .skip(start.saturating_sub(1))
+            .take(selected_lines)
+        {
+            stdout.write_all(line)?;
+        }
+        return Ok(());
+    }
     let mut warnings = Vec::new();
     let max_items = budget.preview_items();
     let max_bytes = budget.preview_bytes();
@@ -18588,11 +18604,16 @@ fn cmd_source_read(
     }
     let max_bytes = budget.preview_bytes();
     let token_cap = budget.body_token_cap();
-    let (preview, preview_end, body_truncated) = if total_lines == 0 {
-        (Vec::new(), end_line, false)
+    let (preview, preview_end, body_truncated, cut_lines) = if total_lines == 0 {
+        (Vec::new(), end_line, false, 0)
     } else {
         let capped = build_token_capped_preview(&all_lines, start, end_line, max_bytes, token_cap);
-        (capped.preview, capped.capped_end, capped.was_capped)
+        (
+            capped.preview,
+            capped.capped_end,
+            capped.was_capped,
+            capped.cut_lines,
+        )
     };
     let effective_end = if body_truncated {
         preview_end
@@ -18603,6 +18624,11 @@ fn cmd_source_read(
     if body_truncated {
         warnings.push(format!(
             "body preview capped at ~{token_cap} tokens at line {preview_end} of {end_line}"
+        ));
+    }
+    if cut_lines > 0 {
+        warnings.push(format!(
+            "{cut_lines} source line(s) cut to the {max_bytes}-byte preview limit; use --max-bytes to raise it or --style raw for exact bytes"
         ));
     }
     let symbols = load_source_symbols(
@@ -18731,6 +18757,9 @@ fn cmd_source_read(
         }
         if report.range.truncated_before || report.range.truncated_after {
             println!("expand: {}", report.expand.file);
+        }
+        for warning in &report.warnings {
+            eprintln!("warning: {warning}");
         }
     } else {
         println!(
@@ -24773,7 +24802,7 @@ mod tests {
         assert_eq!(
             result,
             Some(format!(
-                "tsift --envelope source-read \"src/lib.rs\" --path {} --style window --start 1 --lines 80 --budget normal",
+                "tsift source-read \"src/lib.rs\" --path {} --style raw --start 1 --lines 120",
                 shell_quote(&dir.path().to_string_lossy())
             ))
         );
@@ -24793,7 +24822,7 @@ mod tests {
         assert_eq!(
             result,
             Some(format!(
-                "tsift --envelope source-read \"src/lib.rs\" --path {} --style window --start 1 --lines 20 --budget normal",
+                "tsift source-read \"src/lib.rs\" --path {} --style raw --start 1 --lines 20",
                 shell_quote(&dir.path().to_string_lossy())
             ))
         );
@@ -24813,7 +24842,7 @@ mod tests {
         assert_eq!(
             result,
             Some(format!(
-                "tsift --envelope source-read \"src/lib.rs\" --path {} --style window --start 40 --lines 21 --budget normal",
+                "tsift source-read \"src/lib.rs\" --path {} --style raw --start 40 --lines 21",
                 shell_quote(&dir.path().to_string_lossy())
             ))
         );
@@ -24833,7 +24862,7 @@ mod tests {
         assert_eq!(
             result,
             Some(format!(
-                "tsift --envelope source-read \"src/lib.rs\" --path {} --style window --start 181 --lines 20 --budget normal",
+                "tsift source-read \"src/lib.rs\" --path {} --style raw --start 181 --lines 20",
                 shell_quote(&dir.path().to_string_lossy())
             ))
         );
@@ -24850,7 +24879,7 @@ mod tests {
         assert_eq!(
             result,
             Some(format!(
-                "tsift --envelope source-read \"src/lib.rs\" --path {} --style window --start 1 --lines 80 --budget normal",
+                "tsift source-read \"src/lib.rs\" --path {} --style raw --start 1 --lines 120",
                 shell_quote(&dir.path().to_string_lossy())
             ))
         );
@@ -36125,6 +36154,16 @@ fn sample() {}
         assert!(!capped.was_capped);
         assert_eq!(capped.preview.len(), 3);
         assert_eq!(capped.capped_end, 3);
+        assert_eq!(capped.cut_lines, 0);
+    }
+
+    #[test]
+    fn build_token_capped_preview_counts_cut_lines() {
+        let lines = vec!["0123456789abcdef", "short", "fedcba9876543210"];
+        let capped = build_token_capped_preview(&lines, 1, 3, 8, 1000);
+        assert!(!capped.was_capped);
+        assert_eq!(capped.preview.len(), 3);
+        assert_eq!(capped.cut_lines, 2);
     }
 
     #[test]
