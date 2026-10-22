@@ -232,6 +232,13 @@ pub fn rewrite_command(command: &str) -> Option<String> {
         return Some(command.to_string());
     }
 
+    // Rewriters operate on one simple command. Decline compound shell input
+    // before tokenizing it so a later command cannot be mistaken for flags or
+    // positional arguments belonging to the first command and then dropped.
+    if has_shell_metacharacters(trimmed) {
+        return None;
+    }
+
     // rg <pattern> [path] [flags] → tsift search "<pattern>" --exact [--path <path>]
     if let Some(rewritten) = rewrite_rg(trimmed) {
         return Some(rewritten);
@@ -1096,7 +1103,14 @@ fn build_digest_runner_command(
 }
 
 fn has_shell_metacharacters(cmd: &str) -> bool {
-    cmd.contains('|') || cmd.contains('>') || cmd.contains('<') || cmd.contains('&')
+    cmd.contains('|')
+        || cmd.contains('>')
+        || cmd.contains('<')
+        || cmd.contains('&')
+        || cmd.contains(';')
+        || cmd.contains('\n')
+        || cmd.contains("$(")
+        || cmd.contains('`')
 }
 
 fn strip_shell_quotes(s: &str) -> &str {
