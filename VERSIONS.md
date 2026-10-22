@@ -6,6 +6,12 @@ Canonical binary version source: `Cargo.toml` `package.version`. The CLI exposes
 
 Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
+## 0.1.108
+
+- **Fail closed on compound shell-command rewrites ([#30](https://github.com/btakita/tsift/issues/30)).** `rewrite` rejects semicolons, newlines, command substitution, and backticks before any rewriter can drop later commands, while authored `tsift` passthrough remains intact.
+- **Preserve requested session-read windows ([#31](https://github.com/btakita/tsift/issues/31)).** Rewritten `sed`, `head`, and `tail` reads propagate `--start`/`--lines` into `session-digest`, which returns the requested bounded excerpt in human and JSON output.
+- **Make rewritten source reads byte-faithful ([#32](https://github.com/btakita/tsift/issues/32)).** Rewrites now use raw, uncapped source ranges without envelope/budget line truncation; whole-file reads request every line and annotated previews report clipped-line counts.
+
 ## 0.1.107
 
 - **Add file-backed decision manifests.** `tsift decision lint` validates authored Markdown decision records, including stable `dec-*` IDs, lifecycle states, dates, repository-confined sources and anchors, resolvable code-symbol anchors, relationship targets, replacement cardinality, and supersedes cycles. `tsift decision import` projects those records idempotently into `.tsift/findings.db`, mapping accepted decisions to trusted findings while keeping other lifecycle states draft-only.
