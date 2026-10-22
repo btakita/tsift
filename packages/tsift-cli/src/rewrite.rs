@@ -863,7 +863,7 @@ fn source_window_for_read(window: FileReadWindow, total_lines: usize) -> Option<
         return None;
     }
     match window {
-        FileReadWindow::FullFile => Some((1, SOURCE_READ_LINE_THRESHOLD.min(total_lines))),
+        FileReadWindow::FullFile => Some((1, total_lines)),
         FileReadWindow::FromStart { lines } => Some((1, lines.min(total_lines))),
         FileReadWindow::FromEnd { lines } => {
             let bounded = lines.min(total_lines);
@@ -885,7 +885,7 @@ fn build_source_read_rewrite_command(
     lines: usize,
 ) -> String {
     format!(
-        "tsift --envelope source-read {} --path {} --style window --start {} --lines {} --budget normal",
+        "tsift source-read {} --path {} --style raw --start {} --lines {}",
         shell_quote(file),
         shell_quote(&root.to_string_lossy()),
         start,

@@ -194,15 +194,17 @@ do [#t275]. spec-test-build-install-commit-push
     fn rewrite_long_source_read(&mut self) {
         let source = self.write_source_file("source-long", 120);
         let rewritten = rewrite_command(&format!("cat {}", source.display())).unwrap();
-        assert!(rewritten.contains("tsift --envelope source-read"));
-        assert!(rewritten.contains("--start 1 --lines 80"));
+        assert!(rewritten.contains("tsift source-read"));
+        assert!(rewritten.contains("--style raw"));
+        assert!(rewritten.contains("--start 1 --lines 120"));
         self.coverage.mark("rewrite/long_source_read");
     }
 
     fn rewrite_short_source_window(&mut self) {
         let source = self.write_source_file("source-short", 120);
         let rewritten = rewrite_command(&format!("head -n 20 {}", source.display())).unwrap();
-        assert!(rewritten.contains("tsift --envelope source-read"));
+        assert!(rewritten.contains("tsift source-read"));
+        assert!(rewritten.contains("--style raw"));
         assert!(rewritten.contains("--start 1 --lines 20"));
         self.coverage.mark("rewrite/short_source_window");
     }

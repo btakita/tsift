@@ -552,14 +552,14 @@ pub enum Commands {
         #[command(subcommand)]
         query: GraphDbQuery,
     },
-    /// Read a source file as an AST-symbol projection by default, or as a bounded line window
+    /// Read a source file as an AST projection, annotated window, or exact raw window
     SourceRead {
         /// Source file to preview (relative to --path/root unless absolute)
         file: PathBuf,
         /// Path to the indexed codebase (defaults to current directory)
         #[arg(long, default_value = ".")]
         path: PathBuf,
-        /// Projection style: ast emits indexed symbols/spans; window emits numbered source lines
+        /// Projection style: ast emits symbols/spans; window is annotated; raw is byte-faithful
         #[arg(long, value_enum, default_value = "ast")]
         style: SourceReadStyle,
         /// First line to include (1-based)
@@ -1951,6 +1951,7 @@ pub enum DispatchTraceFormat {
 pub enum SourceReadStyle {
     Ast,
     Window,
+    Raw,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

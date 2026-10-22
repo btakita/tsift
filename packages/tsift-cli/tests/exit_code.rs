@@ -3033,6 +3033,76 @@ fn source_read_json_reports_bounded_window_handles_and_expansion_commands() {
 }
 
 #[test]
+fn source_read_raw_returns_exact_requested_bytes_without_budget_caps() {
+    let dir = tempfile::tempdir().unwrap();
+    let wide = "x".repeat(400);
+    let source = format!("first\r\n{wide}\nthird-without-newline");
+    fs::write(dir.path().join("wide.rs"), source.as_bytes()).unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "source-read",
+            "wide.rs",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--style",
+            "raw",
+            "--start",
+            "2",
+            "--lines",
+            "2",
+            "--budget",
+            "small",
+            "--max-bytes",
+            "8",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "source-read stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.stdout,
+        format!("{wide}\nthird-without-newline").as_bytes()
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn source_read_compact_warns_with_cut_line_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = format!("{}\n{}\n", "a".repeat(300), "b".repeat(300));
+    fs::write(dir.path().join("wide.rs"), source).unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "--compact",
+            "source-read",
+            "wide.rs",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--style",
+            "window",
+            "--lines",
+            "2",
+            "--max-bytes",
+            "20",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("2 source line(s) cut to the 20-byte preview limit"),
+        "unexpected stderr: {stderr}"
+    );
+}
+
+#[test]
 fn source_read_json_defaults_to_ast_symbol_projection() {
     let dir = indexed_cli_fixture();
 
