@@ -1840,12 +1840,13 @@ pub(crate) fn cmd_session_review_with_budget(
             .map(|cost| format_compact_count(cost.largest_turn_total_tokens))
             .unwrap_or_else(|| "-".to_string());
         println!(
-            "session-review target:{} kind:{} matched:{} claude:{} codex:{} agent_doc:{} aggregate_prompt:{} aggregate_cached:{} aggregate_cache_ratio:{} aggregate_output:{} aggregate_total:{} latest_total:{} latest_largest_turn:{} loops:{} file_reads:{}",
+            "session-review target:{} kind:{} matched:{} claude:{} codex:{} grok:{} agent_doc:{} aggregate_prompt:{} aggregate_cached:{} aggregate_cache_ratio:{} aggregate_output:{} aggregate_total:{} latest_total:{} latest_largest_turn:{} loops:{} file_reads:{}",
             report.target,
             report.target_kind,
             report.sessions_matched,
             report.claude_sessions,
             report.codex_sessions,
+            report.grok_sessions,
             report.agent_doc_logs,
             format_compact_count(report.prompt_tokens),
             format_compact_count(report.cached_input_tokens),
@@ -1954,6 +1955,7 @@ pub(crate) fn cmd_session_review_with_budget(
     println!("  sessions matched:       {}", report.sessions_matched);
     println!("  Claude sessions:        {}", report.claude_sessions);
     println!("  Codex sessions:         {}", report.codex_sessions);
+    println!("  Grok sessions:          {}", report.grok_sessions);
     println!("  agent-doc logs:         {}", report.agent_doc_logs);
     println!("  prompt targets:         {}", report.prompt_target_count);
     println!("  commands:               {}", report.command_groups);

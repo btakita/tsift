@@ -328,6 +328,7 @@ pub struct SessionReviewReport {
     pub sessions_matched: usize,
     pub claude_sessions: usize,
     pub codex_sessions: usize,
+    pub grok_sessions: usize,
     pub agent_doc_logs: usize,
     pub prompt_target_count: usize,
     pub command_groups: usize,
@@ -390,6 +391,7 @@ pub struct SessionReviewOptions {
 enum ReviewSource {
     ClaudeJsonl,
     CodexJsonl,
+    GrokJsonl,
     AgentDocLog,
 }
 
@@ -398,6 +400,7 @@ impl ReviewSource {
         match self {
             Self::ClaudeJsonl => "claude_jsonl",
             Self::CodexJsonl => "codex_jsonl",
+            Self::GrokJsonl => "grok_jsonl",
             Self::AgentDocLog => "agent_doc_log",
         }
     }
@@ -406,12 +409,13 @@ impl ReviewSource {
         match self {
             Self::ClaudeJsonl => "claude-jsonl",
             Self::CodexJsonl => "codex-jsonl",
+            Self::GrokJsonl => "grok-jsonl",
             Self::AgentDocLog => "agent-doc-log",
         }
     }
 
     fn supports_cost(self) -> bool {
-        true
+        !matches!(self, Self::GrokJsonl)
     }
 }
 
@@ -610,6 +614,23 @@ pub fn compute_with_options_and_phases(
         }
     }
 
+    let grok_sessions_dir = resolve_grok_sessions_dir(&context.root, options);
+    let grok_project_dir = grok_sessions_dir.join(grok_project_slug(&context.root));
+    if grok_project_dir.is_dir() {
+        for path in collect_recent_files_with_extension(
+            &grok_project_dir,
+            "jsonl",
+            MAX_RECENT_CANDIDATES_PER_SOURCE,
+        )?
+        .into_iter()
+        .filter(|path| {
+            path.file_name().and_then(|name| name.to_str()) == Some("chat_history.jsonl")
+        }) {
+            sessions_considered += 1;
+            maybe_add_grok_candidate(&mut candidates, &context, &path)?;
+        }
+    }
+
     let mut sessions = candidates.into_values().collect::<Vec<_>>();
     sessions.sort_by(|left, right| {
         right
@@ -642,6 +663,7 @@ pub fn compute_with_options_and_phases(
 
     let mut claude_sessions = 0_usize;
     let mut codex_sessions = 0_usize;
+    let mut grok_sessions = 0_usize;
     let mut agent_doc_logs = 0_usize;
     let mut prompt_target_count = 0_usize;
     let mut command_groups = 0_usize;
@@ -684,6 +706,7 @@ pub fn compute_with_options_and_phases(
         match pending.source {
             ReviewSource::ClaudeJsonl => claude_sessions += 1,
             ReviewSource::CodexJsonl => codex_sessions += 1,
+            ReviewSource::GrokJsonl => grok_sessions += 1,
             ReviewSource::AgentDocLog => agent_doc_logs += 1,
         }
 
@@ -1057,6 +1080,7 @@ pub fn compute_with_options_and_phases(
         sessions_matched: session_rows.len(),
         claude_sessions,
         codex_sessions,
+        grok_sessions,
         agent_doc_logs,
         prompt_target_count,
         command_groups,
@@ -1107,8 +1131,9 @@ pub fn compute_with_options_and_phases(
     phases.push(SessionReviewPhaseTiming {
         name: "session_discovery".to_string(),
         duration_micros: session_discovery_micros,
-        detail: "agent-doc + Claude JSONL + Codex JSONL session candidate discovery and ranking"
-            .to_string(),
+        detail:
+            "agent-doc + Claude JSONL + Codex JSONL + Grok JSONL session candidate discovery and ranking"
+                .to_string(),
     });
     phases.push(SessionReviewPhaseTiming {
         name: "session_digest_total".to_string(),
@@ -1140,7 +1165,7 @@ fn build_target_context(target: &Path) -> Result<TargetContext> {
     let canonical_target = target
         .canonicalize()
         .with_context(|| format!("canonicalizing {}", target.display()))?;
-    // A harness transcript normally lives under ~/.claude or ~/.codex, outside
+    // A harness transcript normally lives under ~/.claude, ~/.codex, or ~/.grok, outside
     // the project it describes. Treating the transcript's parent as the source
     // root makes context-pack auto-index the user's entire home directory. Use
     // the transcript-owned cwd as the root hint before any index/diff work.
@@ -1210,8 +1235,9 @@ fn extract_jsonl_target_cwd(path: &Path) -> Result<Option<PathBuf>> {
             break;
         }
         header.push_str(&line);
-        if let Some(cwd) =
-            extract_claude_cwd_from_text(&header).or_else(|| extract_codex_cwd_from_text(&header))
+        if let Some(cwd) = extract_claude_cwd_from_text(&header)
+            .or_else(|| extract_codex_cwd_from_text(&header))
+            .or_else(|| extract_grok_cwd_from_path(path))
         {
             return Ok(Some(cwd));
         }
@@ -1689,6 +1715,17 @@ fn resolve_codex_sessions_dir(root: &Path, options: &SessionReviewOptions) -> Pa
         .unwrap_or_else(|| PathBuf::from(".codex/sessions"))
 }
 
+fn resolve_grok_sessions_dir(root: &Path, options: &SessionReviewOptions) -> PathBuf {
+    options
+        .claude_projects_dir
+        .as_ref()
+        .and_then(|projects| projects.parent())
+        .and_then(Path::parent)
+        .map(|home| home.join(".grok/sessions"))
+        .or_else(|| home_dir(root).map(|home| home.join(".grok/sessions")))
+        .unwrap_or_else(|| PathBuf::from(".grok/sessions"))
+}
+
 fn resolve_agent_doc_logs_dir(root: &Path, options: &SessionReviewOptions) -> PathBuf {
     options
         .agent_doc_logs_dir
@@ -1705,6 +1742,18 @@ fn home_dir(root: &Path) -> Option<PathBuf> {
 
 fn claude_project_slug(root: &Path) -> String {
     root.display().to_string().replace('/', "-")
+}
+
+fn grok_project_slug(root: &Path) -> String {
+    let mut encoded = String::new();
+    for byte in root.to_string_lossy().bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 fn collect_agent_doc_aliases(text: &str, root: &Path) -> AgentDocAliases {
@@ -1775,13 +1824,15 @@ fn add_explicit_jsonl_candidate(
 ) -> Result<()> {
     let text = fs::read_to_string(path)
         .with_context(|| format!("reading explicit session transcript {}", path.display()))?;
-    let (source, cwd) = if let Some(cwd) = extract_codex_cwd_from_text(&text) {
+    let (source, cwd) = if let Some(cwd) = extract_grok_cwd_from_path(path) {
+        (ReviewSource::GrokJsonl, cwd)
+    } else if let Some(cwd) = extract_codex_cwd_from_text(&text) {
         (ReviewSource::CodexJsonl, cwd)
     } else if let Some(cwd) = extract_claude_cwd_from_text(&text) {
         (ReviewSource::ClaudeJsonl, cwd)
     } else {
         bail!(
-            "explicit JSONL target {} is not a recognized Claude or Codex session transcript",
+            "explicit JSONL target {} is not a recognized Claude, Codex, or Grok session transcript",
             path.display()
         );
     };
@@ -1880,6 +1931,38 @@ fn maybe_add_codex_candidate(
     Ok(())
 }
 
+fn maybe_add_grok_candidate(
+    candidates: &mut BTreeMap<String, PendingSession>,
+    context: &TargetContext,
+    path: &Path,
+) -> Result<()> {
+    let Some(cwd) = extract_grok_cwd_from_path(path) else {
+        return Ok(());
+    };
+    if !cwd_matches_target(context, Some(&cwd)) {
+        return Ok(());
+    }
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("reading Grok session {}", path.display()))?;
+    let signals = extract_grok_match_signals(&text, cwd);
+    let matched_by = match_reasons(context, &signals, signals.cwd.as_deref());
+    if matched_by.is_empty() {
+        return Ok(());
+    }
+    let modified_unix_secs = file_modified_unix_secs(path)?;
+    insert_candidate(
+        candidates,
+        PendingSession::new(
+            ReviewSource::GrokJsonl,
+            path.to_path_buf(),
+            matched_by,
+            modified_unix_secs,
+            text,
+        ),
+    );
+    Ok(())
+}
+
 fn extract_claude_match_signals(text: &str) -> MatchSignals {
     let mut signals = MatchSignals::default();
     for line in text.lines() {
@@ -1958,6 +2041,38 @@ fn extract_codex_match_signals(text: &str) -> MatchSignals {
                             }
                         }
                         _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    signals
+}
+
+fn extract_grok_match_signals(text: &str, cwd: PathBuf) -> MatchSignals {
+    let mut signals = MatchSignals {
+        cwd: Some(cwd),
+        snippets: Vec::new(),
+    };
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("user") => collect_claude_message_snippets(&value, &mut signals.snippets),
+            Some("assistant") => {
+                if let Some(tool_calls) = value
+                    .get("tool_calls")
+                    .and_then(serde_json::Value::as_array)
+                {
+                    for tool_call in tool_calls {
+                        if let Some(arguments) = tool_call.get("arguments") {
+                            signals.snippets.push(match arguments {
+                                serde_json::Value::String(value) => value.clone(),
+                                value => value.to_string(),
+                            });
+                        }
                     }
                 }
             }
@@ -2120,6 +2235,39 @@ fn extract_codex_cwd_from_text(text: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn extract_grok_cwd_from_path(path: &Path) -> Option<PathBuf> {
+    if path.file_name().and_then(|name| name.to_str()) != Some("chat_history.jsonl") {
+        return None;
+    }
+    let project_dir = path.parent()?.parent()?;
+    let sessions_dir = project_dir.parent()?;
+    if sessions_dir.file_name()?.to_str()? != "sessions"
+        || sessions_dir.parent()?.file_name()?.to_str()? != ".grok"
+    {
+        return None;
+    }
+    let encoded = project_dir.file_name()?.to_str()?;
+    percent_decode_path(encoded).map(PathBuf::from)
+}
+
+fn percent_decode_path(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = bytes.get(index + 1..index + 3)?;
+            let text = std::str::from_utf8(hex).ok()?;
+            decoded.push(u8::from_str_radix(text, 16).ok()?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 fn read_jsonl_session_text_if_cwd_matches(
@@ -2580,6 +2728,69 @@ mod tests {
     }
 
     #[test]
+    fn session_review_discovers_grok_build_chat_history_for_doc_target() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let target = root.path().join("tasks/software/tsift.md");
+        fs::create_dir(root.path().join(".git")).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(
+            &target,
+            "---\nagent_doc_session: tsift-v0.1\n---\n\n## Exchange\n",
+        )
+        .unwrap();
+
+        let session_dir = home
+            .path()
+            .join(".grok/sessions")
+            .join(grok_project_slug(root.path()))
+            .join("grok-session-1");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("chat_history.jsonl"),
+            concat!(
+                r#"{"type":"user","content":[{"type":"text","text":"agent-doc /tmp/replace-me/tasks/software/tsift.md"}]}"#,
+                "\n",
+                r#"{"type":"assistant","content":"Running the focused check.","tool_calls":[{"id":"tool-1","name":"run_terminal_command","arguments":{"command":"cargo test -p tsift-agent-doc"}}]}"#,
+                "\n",
+                r#"{"type":"tool_result","tool_call_id":"tool-1","content":"test result: ok. 1 passed; 0 failed"}"#,
+                "\n"
+            )
+            .replace("/tmp/replace-me", &root.path().display().to_string()),
+        )
+        .unwrap();
+
+        let report = compute_with_options(
+            &target,
+            &SessionReviewOptions {
+                claude_projects_dir: Some(home.path().join(".claude/projects")),
+                codex_sessions_dir: Some(home.path().join(".codex/sessions")),
+                agent_doc_logs_dir: Some(root.path().join("missing-agent-doc")),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.sessions_matched, 1);
+        assert_eq!(report.grok_sessions, 1);
+        assert_eq!(report.claude_sessions, 0);
+        assert_eq!(report.codex_sessions, 0);
+        assert_eq!(report.total_tokens, 0);
+        assert!(report.sessions.iter().any(|session| {
+            session.source == "grok_jsonl"
+                && session
+                    .matched_by
+                    .iter()
+                    .any(|reason| reason.starts_with("path:"))
+        }));
+        assert!(
+            report
+                .commands
+                .iter()
+                .any(|command| command.command == "cargo test -p tsift-agent-doc")
+        );
+    }
+
+    #[test]
     fn session_review_admits_explicit_claude_jsonl_target() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join(".git")).unwrap();
@@ -2619,6 +2830,49 @@ mod tests {
     }
 
     #[test]
+    fn session_review_admits_explicit_grok_jsonl_target() {
+        let root = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".git")).unwrap();
+        let transcript = home
+            .path()
+            .join(".grok/sessions")
+            .join(grok_project_slug(root.path()))
+            .join("grok-session-1/chat_history.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"user","content":[{"type":"text","text":"What should I fix?"}]}"#,
+                "\n",
+                r#"{"type":"assistant","content":"Inspecting the project."}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let report = compute_with_options(
+            &transcript,
+            &SessionReviewOptions {
+                claude_projects_dir: Some(home.path().join("missing-claude")),
+                codex_sessions_dir: Some(home.path().join("missing-codex")),
+                agent_doc_logs_dir: Some(home.path().join("missing-agent-doc")),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.root, root.path().display().to_string());
+        assert_eq!(report.sessions_matched, 1);
+        assert_eq!(report.grok_sessions, 1);
+        assert!(
+            report.sessions[0]
+                .matched_by
+                .iter()
+                .any(|reason| reason == "explicit_target")
+        );
+    }
+
+    #[test]
     fn session_review_rejects_unrecognized_explicit_jsonl_target() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join(".git")).unwrap();
@@ -2632,7 +2886,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("not a recognized Claude or Codex session transcript")
+                .contains("not a recognized Claude, Codex, or Grok session transcript")
         );
     }
 

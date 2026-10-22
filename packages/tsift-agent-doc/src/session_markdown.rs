@@ -20,10 +20,6 @@ impl AgentDocSessionDocument {
         let mut in_queue = false;
         for (idx, line) in content.lines().enumerate() {
             let line_number = idx + 1;
-            if let Some(backlog_item) = parse_backlog_line(line, line_number) {
-                backlog_items.push(backlog_item);
-            }
-
             let trimmed = line.trim();
             if trimmed.starts_with("<!-- agent:queue") {
                 in_queue = true;
@@ -33,8 +29,12 @@ impl AgentDocSessionDocument {
                 in_queue = false;
                 continue;
             }
-            if in_queue && let Some(queue_item) = parse_queue_line(line, line_number) {
-                queue_items.push(queue_item);
+            if in_queue {
+                if let Some(queue_item) = parse_queue_line(line, line_number) {
+                    queue_items.push(queue_item);
+                }
+            } else if let Some(backlog_item) = parse_backlog_line(line, line_number) {
+                backlog_items.push(backlog_item);
             }
         }
 
@@ -66,17 +66,32 @@ pub struct AgentDocBacklogItem {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentDocQueueItem {
-    Dispatch { value: String, line: usize },
-    Preset { value: String, line: usize },
-    Do { id: String, line: usize },
+    Dispatch {
+        value: String,
+        line: usize,
+    },
+    Preset {
+        value: String,
+        line: usize,
+    },
+    Do {
+        id: String,
+        line: usize,
+    },
+    Item {
+        id: Option<String>,
+        text: String,
+        line: usize,
+    },
 }
 
 impl AgentDocQueueItem {
     pub fn line(&self) -> usize {
         match self {
-            Self::Dispatch { line, .. } | Self::Preset { line, .. } | Self::Do { line, .. } => {
-                *line
-            }
+            Self::Dispatch { line, .. }
+            | Self::Preset { line, .. }
+            | Self::Do { line, .. }
+            | Self::Item { line, .. } => *line,
         }
     }
 }
@@ -141,11 +156,46 @@ pub fn parse_queue_line(line: &str, line_number: usize) -> Option<AgentDocQueueI
             line: line_number,
         });
     }
-    let rest = trimmed.strip_prefix("- do [#")?;
-    let end = rest.find(']')?;
-    let id = rest[..end].trim();
-    (!id.is_empty()).then(|| AgentDocQueueItem::Do {
-        id: id.to_string(),
+    if let Some(rest) = trimmed.strip_prefix("- do [#") {
+        let end = rest.find(']')?;
+        let id = rest[..end].trim();
+        return (!id.is_empty()).then(|| AgentDocQueueItem::Do {
+            id: id.to_string(),
+            line: line_number,
+        });
+    }
+
+    let mut text = trimmed.strip_prefix("- ")?.trim();
+    for status in ["[ ]", "[x]", "[X]", "[/]", "[/operator]", "[/subagent]"] {
+        if let Some(rest) = text.strip_prefix(status) {
+            text = rest.trim();
+            break;
+        }
+    }
+    text = text
+        .strip_prefix(|ch: char| {
+            matches!(
+                ch,
+                '📥' | '🟡' | '🚧' | '📫' | '⚠' | '❔' | '🔄' | '⏳' | '✅' | '❌' | '⛔'
+            )
+        })
+        .map(str::trim)
+        .unwrap_or(text);
+    let (id, text) = if let Some(rest) = text.strip_prefix("[#") {
+        if let Some(end) = rest.find(']') {
+            (
+                Some(rest[..end].trim().to_string()).filter(|id| !id.is_empty()),
+                rest[end + 1..].trim(),
+            )
+        } else {
+            (None, text)
+        }
+    } else {
+        (None, text)
+    };
+    (!text.is_empty()).then(|| AgentDocQueueItem::Item {
+        id,
+        text: text.to_string(),
         line: line_number,
     })
 }
@@ -215,6 +265,9 @@ agent_doc_session: "tsift-v0.1"
 <!-- agent:queue preset="#spec" go -->
 dispatch #spec-test-build-install-commit-push
 - do [#x5fw]
+- 🚧 [#subagent:grok_backlog#1] Support grok build: Add backlog + queue items
+- [/] 🚧 [#blocked] Resume this queue item when its dependency clears
+- Run free-form verification
 <!-- /agent:queue -->
 
 <!-- agent:backlog -->
@@ -240,6 +293,21 @@ dispatch #spec-test-build-install-commit-push
                 AgentDocQueueItem::Do {
                     id: "x5fw".to_string(),
                     line: 9,
+                },
+                AgentDocQueueItem::Item {
+                    id: Some("subagent:grok_backlog#1".to_string()),
+                    text: "Support grok build: Add backlog + queue items".to_string(),
+                    line: 10,
+                },
+                AgentDocQueueItem::Item {
+                    id: Some("blocked".to_string()),
+                    text: "Resume this queue item when its dependency clears".to_string(),
+                    line: 11,
+                },
+                AgentDocQueueItem::Item {
+                    id: None,
+                    text: "Run free-form verification".to_string(),
+                    line: 12,
                 },
             ]
         );

@@ -14619,6 +14619,40 @@ fn load_agent_doc_traversal_nodes(
                     }
                     job_by_id.insert(id.clone(), node);
                 }
+                AgentDocQueueItem::Item { id, text, line } => {
+                    let detail = id
+                        .as_ref()
+                        .and_then(|id| backlog_by_id.get(id))
+                        .and_then(|node| node.detail.clone())
+                        .unwrap_or_else(|| text.clone());
+                    let node = traversal_job_packet_node(
+                        root,
+                        &markdown_path,
+                        text,
+                        id.as_deref(),
+                        &detail,
+                        *line as i64,
+                    );
+                    graph.add_node(node.clone());
+                    graph.add_edge(
+                        &session.handle,
+                        &node.handle,
+                        "contains",
+                        Some("session queued job packet".to_string()),
+                        1,
+                    );
+                    if let Some(id) = id
+                        && let Some(backlog) = backlog_by_id.get(id)
+                    {
+                        graph.add_edge(
+                            &node.handle,
+                            &backlog.handle,
+                            "targets",
+                            Some("queued backlog item".to_string()),
+                            1,
+                        );
+                    }
+                }
             }
         }
 
@@ -25229,6 +25263,7 @@ Completed `#kgnv`; touched files `main.rs`; tests `cargo test traversal_graph`; 
 <!-- agent:queue -->
 dispatch #spec-test-build-install-commit-push
 - do [#kgnv]
+- 🚧 [#subagent:grok_backlog#1] Support grok build: Add backlog + queue items
 <!-- /agent:queue -->
 
 ## Backlog
@@ -26023,6 +26058,16 @@ agent_doc_format: template
         assert!(graph.edges.iter().any(|edge| {
             edge.from == job.handle && edge.to == backlog.handle && edge.relation == "targets"
         }));
+        let free_text_job = resolve_traversal_node(
+            &graph,
+            "Support grok build: Add backlog + queue items",
+        )
+        .unwrap();
+        assert_eq!(free_text_job.kind, "job_packet");
+        assert_eq!(
+            free_text_job.properties.get("ref_id"),
+            Some(&"subagent:grok_backlog#1".to_string())
+        );
 
         let store = SqliteGraphStore::open(&dir.path().join(".tsift/graph.db")).unwrap();
         let jobs = store.nodes_by_kind("job_packet").unwrap();
@@ -33559,6 +33604,7 @@ fn sample() {}
             sessions_matched: 1,
             claude_sessions: 1,
             codex_sessions: 0,
+            grok_sessions: 0,
             agent_doc_logs: 0,
             prompt_target_count: 2,
             command_groups: 0,

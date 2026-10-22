@@ -23,6 +23,7 @@ pub enum SessionDigestSource {
     Markdown,
     ClaudeJsonl,
     CodexJsonl,
+    GrokJsonl,
     AgentDocLog,
 }
 
@@ -32,9 +33,10 @@ impl SessionDigestSource {
             "markdown" | "md" => Ok(Self::Markdown),
             "jsonl" | "json-lines" | "claude" | "claude-jsonl" => Ok(Self::ClaudeJsonl),
             "codex" | "codex-jsonl" => Ok(Self::CodexJsonl),
+            "grok" | "grok-build" | "grok-jsonl" => Ok(Self::GrokJsonl),
             "agent-doc-log" | "agent_doc_log" | "log" => Ok(Self::AgentDocLog),
             other => bail!(
-                "unsupported session source `{other}`; expected markdown, claude-jsonl, codex-jsonl, or agent-doc-log"
+                "unsupported session source `{other}`; expected markdown, claude-jsonl, codex-jsonl, grok-jsonl, or agent-doc-log"
             ),
         }
     }
@@ -44,6 +46,7 @@ impl SessionDigestSource {
             Self::Markdown => "markdown",
             Self::ClaudeJsonl => "claude_jsonl",
             Self::CodexJsonl => "codex_jsonl",
+            Self::GrokJsonl => "grok_jsonl",
             Self::AgentDocLog => "agent_doc_log",
         }
     }
@@ -53,6 +56,7 @@ impl SessionDigestSource {
             Self::Markdown => "markdown",
             Self::ClaudeJsonl => "claude-jsonl",
             Self::CodexJsonl => "codex-jsonl",
+            Self::GrokJsonl => "grok-jsonl",
             Self::AgentDocLog => "agent-doc-log",
         }
     }
@@ -192,6 +196,7 @@ pub fn compute(path: &Path, input: &str, source_hint: Option<&str>) -> Result<Se
         SessionDigestSource::Markdown => ingest_markdown(&root, input, &mut state)?,
         SessionDigestSource::ClaudeJsonl => ingest_claude_jsonl(&root, input, &mut state)?,
         SessionDigestSource::CodexJsonl => ingest_codex_jsonl(&root, input, &mut state)?,
+        SessionDigestSource::GrokJsonl => ingest_grok_jsonl(&root, input, &mut state)?,
         SessionDigestSource::AgentDocLog => ingest_agent_doc_log(&root, input, &mut state),
     }
 
@@ -346,8 +351,8 @@ fn collect_graph_evidence(
     warnings: &mut Vec<String>,
 ) -> Option<SessionDigestGraphEvidence> {
     use crate::graph_evidence::{
-        DEFAULT_EVIDENCE_MAX_SCAN_NODES, GraphEvidenceQuery, read_graph_evidence_bounded,
-        DEFAULT_GRAPH_DB_RELATIVE,
+        DEFAULT_EVIDENCE_MAX_SCAN_NODES, DEFAULT_GRAPH_DB_RELATIVE, GraphEvidenceQuery,
+        read_graph_evidence_bounded,
     };
 
     let db_path = root.join(DEFAULT_GRAPH_DB_RELATIVE);
@@ -425,6 +430,13 @@ fn resolve_source(input: &str, source_hint: Option<&str>) -> Result<SessionDiges
                         || value.get("type").and_then(Value::as_str) == Some("event_msg")
                     {
                         return Ok(SessionDigestSource::CodexJsonl);
+                    }
+                    if matches!(
+                        value.get("type").and_then(Value::as_str),
+                        Some("system" | "user" | "assistant" | "reasoning" | "tool_result")
+                    ) && value.get("message").is_none()
+                    {
+                        return Ok(SessionDigestSource::GrokJsonl);
                     }
                 }
                 Ok(SessionDigestSource::ClaudeJsonl)
@@ -535,6 +547,75 @@ fn ingest_codex_jsonl(root: &Path, input: &str, state: &mut DigestState) -> Resu
         match value.get("type").and_then(Value::as_str) {
             Some("response_item") => ingest_codex_response_item(root, &value, index + 1, state)?,
             Some("event_msg") => ingest_codex_event_msg(root, &value, index + 1, state)?,
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn ingest_grok_jsonl(root: &Path, input: &str, state: &mut DigestState) -> Result<()> {
+    let mut tool_commands = BTreeMap::<String, String>::new();
+    for (index, raw_line) in input.lines().enumerate() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let value = match serde_json::from_str::<Value>(trimmed) {
+            Ok(value) => value,
+            Err(_) => {
+                state.warnings.push(format!(
+                    "skipping malformed Grok transcript jsonl line {}",
+                    index + 1
+                ));
+                continue;
+            }
+        };
+        match value.get("type").and_then(Value::as_str) {
+            Some("user") => {
+                let user_bias = value.get("synthetic_reason").is_none();
+                let mut blocks = Vec::new();
+                collect_message_blocks(&value, &mut blocks);
+                for block in blocks {
+                    if let TranscriptBlock::Text { text, .. } = block {
+                        ingest_text_block(root, &text, user_bias, None, state)?;
+                    }
+                }
+            }
+            Some("assistant") => {
+                if let Some(text) = value.get("content").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    ingest_text_block(root, text, false, None, state)?;
+                }
+                if let Some(tool_calls) = value.get("tool_calls").and_then(Value::as_array) {
+                    for tool_call in tool_calls {
+                        let Some(name) = tool_call.get("name").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let mut input = tool_call.get("arguments").cloned().unwrap_or(Value::Null);
+                        if let Value::String(raw) = &input
+                            && let Ok(parsed) = serde_json::from_str::<Value>(raw)
+                        {
+                            input = parsed;
+                        }
+                        state.transcript_items += 1;
+                        if let Some(command) = ingest_tool_use(root, name, &input, state)?
+                            && let Some(id) = tool_call.get("id").and_then(Value::as_str)
+                        {
+                            tool_commands.insert(id.to_string(), command);
+                        }
+                    }
+                }
+            }
+            Some("tool_result") => {
+                if let Some(text) = value.get("content").and_then(Value::as_str) {
+                    let command = value
+                        .get("tool_call_id")
+                        .and_then(Value::as_str)
+                        .and_then(|id| tool_commands.remove(id));
+                    ingest_text_block(root, text, false, command.as_deref(), state)?;
+                }
+            }
             _ => {}
         }
     }
@@ -866,7 +947,7 @@ fn ingest_text_block(
 fn extract_tool_command(name: &str, input: &Value) -> Option<String> {
     if !matches!(
         name.to_ascii_lowercase().as_str(),
-        "bash" | "exec_command" | "shell" | "terminal" | "sh"
+        "bash" | "exec_command" | "run_terminal_command" | "shell" | "terminal" | "sh"
     ) {
         return None;
     }
@@ -1955,6 +2036,52 @@ Symbol `run_sync` not found in index.
             failure.command.as_deref() == Some("cargo test --manifest-path Cargo.toml")
         }));
         assert!(report.closeout.iter().any(|entry| entry.kind == "push"));
+    }
+
+    #[test]
+    fn grok_jsonl_digest_extracts_prompt_tool_command_and_result_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "fn run_sync() {}\n").unwrap();
+
+        let input = concat!(
+            r#"{"type":"system","content":"copied harness instructions"}"#,
+            "\n",
+            r#"{"type":"user","content":[{"type":"text","text":"do [#grok]. Fix the failure in src/lib.rs"}]}"#,
+            "\n",
+            r#"{"type":"assistant","content":"I will run the focused test.","tool_calls":[{"id":"tool-1","name":"run_terminal_command","arguments":{"command":"cargo test --manifest-path Cargo.toml"}}]}"#,
+            "\n",
+            r#"{"type":"tool_result","tool_call_id":"tool-1","content":"Error: Symbol `run_sync` not found in src/lib.rs:1:1"}"#,
+            "\n"
+        );
+
+        let report = compute(dir.path(), input, None).unwrap();
+        assert_eq!(report.source, "grok_jsonl");
+        assert!(
+            report
+                .prompt_targets
+                .iter()
+                .any(|target| target.contains("Fix the failure"))
+        );
+        assert!(
+            report
+                .commands
+                .iter()
+                .any(|command| command.command == "cargo test --manifest-path Cargo.toml")
+        );
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|failure| failure.command.as_deref()
+                    == Some("cargo test --manifest-path Cargo.toml"))
+        );
+        assert!(
+            report
+                .touched_files
+                .iter()
+                .any(|path| path.path == "src/lib.rs")
+        );
     }
 
     #[test]

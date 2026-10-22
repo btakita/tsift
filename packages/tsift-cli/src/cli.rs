@@ -1027,7 +1027,7 @@ pub enum Commands {
         /// Read session transcript input from a file instead of stdin
         #[arg(long)]
         input: Option<PathBuf>,
-        /// Force the transcript source (`markdown`, `claude-jsonl`, `codex-jsonl`, or `agent-doc-log`)
+        /// Force the transcript source (`markdown`, `claude-jsonl`, `codex-jsonl`, `grok-jsonl`, or `agent-doc-log`)
         #[arg(long)]
         source: Option<String>,
         /// First one-based input line to include as an excerpt
@@ -1058,7 +1058,7 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Auto-discover related Claude/Codex/agent-doc logs for a document or repo path and aggregate one bounded review
+    /// Auto-discover related Claude/Codex/Grok/agent-doc logs for a document or repo path and aggregate one bounded review
     SessionReview {
         /// Target document or repo path to review (defaults to current directory)
         #[arg(default_value = ".")]

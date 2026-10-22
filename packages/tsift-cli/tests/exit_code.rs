@@ -13370,6 +13370,31 @@ fn rewrite_routes_long_codex_jsonl_reads_to_session_digest() {
 }
 
 #[test]
+fn rewrite_routes_long_grok_jsonl_reads_to_session_digest() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = dir.path().join("chat_history.jsonl");
+    let line = r#"{"type":"user","content":[{"type":"text","text":"do [#grok]. Review this session"}]}"#;
+    let body = std::iter::repeat_n(line, 120)
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&session, format!("{body}\n")).unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "rewrite",
+            &format!("head -n 120 {}", session.to_str().unwrap()),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "rewrite should succeed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("tsift session-digest"));
+    assert!(stdout.contains("--source grok-jsonl"));
+    assert!(stdout.contains(session.to_str().unwrap()));
+}
+
+#[test]
 fn rewrite_run_caps_verbose_tsift_search_output() {
     let dir = tempfile::tempdir().unwrap();
     for idx in 0..80 {

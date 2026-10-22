@@ -6,6 +6,10 @@ Canonical binary version source: `Cargo.toml` `package.version`. The CLI exposes
 
 Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
+## Unreleased
+
+- **Grok Build session context and live queue fidelity.** `session-digest` accepts/detects `grok-jsonl`, `session-review` discovers `~/.grok/sessions/<percent-encoded-cwd>/*/chat_history.jsonl`, and explicit Grok transcript targets resolve back to their source checkout. Grok user text, assistant text, tool calls, and tool results feed the bounded prompt/command/file/failure digest while token-cost totals remain omitted because `chat_history.jsonl` has no usage records. Agent-doc session parsing retains ordinary and claimed free-text queue rows in addition to `dispatch`, `preset`, and `do [#id]` forms.
+
 ## 0.1.108
 
 - **Fail closed on compound shell-command rewrites ([#30](https://github.com/btakita/tsift/issues/30)).** `rewrite` rejects semicolons, newlines, command substitution, and backticks before any rewriter can drop later commands, while authored `tsift` passthrough remains intact.

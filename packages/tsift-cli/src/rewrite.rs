@@ -920,6 +920,14 @@ fn detect_session_digest_source(path: &Path) -> Option<session_digest::SessionDi
             Some(session_digest::SessionDigestSource::Markdown)
         }
         Some("jsonl")
+            if (path_has_component_pair(path, ".grok", "sessions")
+                && path.file_name().and_then(|name| name.to_str())
+                    == Some("chat_history.jsonl"))
+                || file_looks_like_grok_jsonl(path) =>
+        {
+            Some(session_digest::SessionDigestSource::GrokJsonl)
+        }
+        Some("jsonl")
             if path_has_component_pair(path, ".claude", "projects")
                 || file_looks_like_claude_jsonl(path) =>
         {
@@ -1002,6 +1010,29 @@ fn file_looks_like_codex_jsonl(path: &Path) -> bool {
                 value.get("type").and_then(serde_json::Value::as_str),
                 Some("session_meta" | "response_item" | "event_msg")
             )
+        })
+}
+
+fn file_looks_like_grok_jsonl(path: &Path) -> bool {
+    let prefix = match read_file_prefix(path, 16 * 1024) {
+        Some(prefix) => prefix,
+        None => return false,
+    };
+
+    prefix
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(8)
+        .any(|line| {
+            let value = match serde_json::from_str::<serde_json::Value>(line) {
+                Ok(value) => value,
+                Err(_) => return false,
+            };
+            matches!(
+                value.get("type").and_then(serde_json::Value::as_str),
+                Some("system" | "user" | "assistant" | "reasoning" | "tool_result")
+            ) && value.get("message").is_none()
         })
 }
 
