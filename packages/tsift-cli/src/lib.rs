@@ -859,6 +859,30 @@ pub fn run() -> Result<()> {
                 )
             }
         },
+        Some(Commands::Decision { command }) => match command {
+            cli::DecisionCommand::Lint {
+                manifest,
+                path,
+                json,
+            } => commands::decision::cmd_decision_lint(
+                &path,
+                &manifest,
+                json || terse || schema || envelope,
+                pretty,
+            ),
+            cli::DecisionCommand::Import {
+                manifest,
+                path,
+                scope,
+                json,
+            } => commands::decision::cmd_decision_import(
+                &path,
+                &manifest,
+                scope.as_deref(),
+                json || terse || schema || envelope,
+                pretty,
+            ),
+        },
         Some(Commands::Graph {
             symbol,
             path,

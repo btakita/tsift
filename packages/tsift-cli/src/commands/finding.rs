@@ -31,17 +31,17 @@ pub(crate) fn findings_db_path(root: &Path) -> std::path::PathBuf {
 
 /// Resolved anchor for a finding: a stable graph node plus the freshness
 /// watermark (content hash) captured at the moment the finding is authored.
-struct ResolvedAnchor {
+pub(crate) struct ResolvedAnchor {
     /// Stable graph node id for the anchor (`code_symbol:*` or `file:*`).
-    node_id: String,
+    pub(crate) node_id: String,
     /// Graph node kind: `code_symbol` or `file`.
-    node_kind: &'static str,
+    pub(crate) node_kind: &'static str,
     /// Human label (symbol name or file path).
-    label: String,
+    pub(crate) label: String,
     /// Content hash of the anchored content at capture time, when resolvable.
-    watermark: Option<String>,
+    pub(crate) watermark: Option<String>,
     /// Properties to persist on the anchor node (e.g. `file`, `line`).
-    properties: Vec<(String, String)>,
+    pub(crate) properties: Vec<(String, String)>,
 }
 
 /// Hash the bytes of a symbol's body span (preferred) or its full file as the
@@ -73,7 +73,7 @@ fn file_watermark(root: &Path, file: &str) -> Option<String> {
 /// Resolve `--about` against the code index when possible (symbol first, then
 /// file). Anchoring is by stable handle, never by line number, so a finding
 /// survives reformatting.
-fn resolve_anchor(root: &Path, about: &str, scope: Option<&str>) -> Result<ResolvedAnchor> {
+pub(crate) fn resolve_anchor(root: &Path, about: &str, scope: Option<&str>) -> Result<ResolvedAnchor> {
     // 1. Try to resolve as an indexed symbol.
     if let Ok(db) = open_index_db(root, scope)
         && let Ok(symbols) = db.symbol_info(about)
@@ -117,7 +117,7 @@ fn finding_id(kind: &str, title: &str, about: &str) -> String {
     format!("finding:{}", blake3::hash(raw.as_bytes()).to_hex())
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|dur| dur.as_secs() as i64)

@@ -264,6 +264,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: FindingCommand,
     },
+    /// Validate and import a file-backed decision manifest
+    Decision {
+        #[command(subcommand)]
+        command: DecisionCommand,
+    },
     /// Rewrite a shell command to use tsift, or run the bounded tsift equivalent directly
     Rewrite {
         /// The shell command to potentially rewrite
@@ -1245,6 +1250,37 @@ pub enum FindingCommand {
         /// Project root (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum DecisionCommand {
+    /// Validate decision IDs, lifecycle states, links, and repository paths
+    Lint {
+        /// Decision manifest (relative to --path)
+        #[arg(default_value = "decisions.md")]
+        manifest: PathBuf,
+        /// Project root (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate and idempotently import decisions into .tsift/findings.db
+    Import {
+        /// Decision manifest (relative to --path)
+        #[arg(default_value = "decisions.md")]
+        manifest: PathBuf,
+        /// Project root (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Restrict code-symbol anchor resolution to a submodule index
+        #[arg(long)]
+        scope: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
