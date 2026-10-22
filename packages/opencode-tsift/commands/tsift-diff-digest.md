@@ -1,4 +1,4 @@
-<!-- tsift:opencode-command v=0.1.108 name=tsift-diff-digest -->
+<!-- tsift:opencode-command v=0.1.109 name=tsift-diff-digest -->
 ---
 description: Digest current or requested git diff
 ---
