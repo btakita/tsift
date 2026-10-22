@@ -6,6 +6,10 @@ Canonical binary version source: `Cargo.toml` `package.version`. The CLI exposes
 
 Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
+## 0.1.107
+
+- **Add file-backed decision manifests.** `tsift decision lint` validates authored Markdown decision records, including stable `dec-*` IDs, lifecycle states, dates, repository-confined sources and anchors, resolvable code-symbol anchors, relationship targets, replacement cardinality, and supersedes cycles. `tsift decision import` projects those records idempotently into `.tsift/findings.db`, mapping accepted decisions to trusted findings while keeping other lifecycle states draft-only.
+
 ## 0.1.106
 
 - **`symbol-read --file` finds common names and explains misses (`#fixsdkrun`).** With `--file`, `symbol-read` now searches the hinted file's indexed symbols directly instead of filtering the global, limit-bounded symbol search afterwards. A name defined in many files (`main` had 42 definitions in one repository) used to rank the hinted file's definition past the search limit, so the command reported `no indexed symbol matched` for a symbol the fresh index contained. A genuine miss inside a file now explains itself: it says whether the name occurs in the file at all, quotes the lines where it is only referenced (for example `parser.parse_args()`, an imported library method that no file defines), lists the symbols the file does define, and offers bounded `source-read --style window`, whole-file `source-read`, and `search` follow-ups, all capped by the response budget.
