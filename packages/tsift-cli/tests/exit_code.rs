@@ -13350,6 +13350,27 @@ fn rewrite_redirection_fails_closed_with_reason() {
 }
 
 #[test]
+fn rewrite_compound_command_fails_closed_with_reason() {
+    let output = tsift_bin()
+        .args(["rewrite", "rg X d/; rm -rf d"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(
+            "shell metacharacters such as pipes, redirection, or background operators are not rewritten"
+        ),
+        "expected shell-metacharacter no-rewrite reason, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("run the original command unchanged"),
+        "expected passthrough guidance, got: {stderr}"
+    );
+}
+
+#[test]
 fn rewrite_run_envelopes_cargo_test_digest_output_by_default() {
     let dir = tempfile::tempdir().unwrap();
     init_rust_library_crate(dir.path());

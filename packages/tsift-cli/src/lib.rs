@@ -24377,6 +24377,30 @@ mod tests {
     }
 
     #[test]
+    fn rewrite_compound_search_commands_passthrough() {
+        for command in [
+            "grep -c 'X' f.txt; wc -l < f.txt; rm -rf d",
+            "grep -rn 'X' d/; wc -l f",
+            "rg X d/; rm -rf d",
+            "grep -rn X d/\nrm -rf d",
+            "rg $(printf X) d/",
+            "rg `printf X` d/",
+        ] {
+            assert_eq!(
+                rewrite_command(command),
+                None,
+                "compound command must not be partially rewritten: {command:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_tsift_compound_passthrough_remains_exact() {
+        let command = "tsift search hookcaps --exact | head -5";
+        assert_eq!(rewrite_command(command), Some(command.to_string()));
+    }
+
+    #[test]
     fn rewrite_rg_files_passthrough() {
         let result = rewrite_command("rg --files src/tsift .agent-doc logs");
         assert_eq!(result, None);
