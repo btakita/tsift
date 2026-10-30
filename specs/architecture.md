@@ -197,12 +197,60 @@ implicit mutable database shared by all worktrees is forbidden: concurrent
 branch changes would continuously invalidate one another and identical paths
 would not identify a checkout.
 
-Per-worktree databases are the correctness and operational baseline. A future
-storage optimization may deduplicate unchanged data as an immutable,
-content-addressed commit index plus a checkout-local dirty overlay, but that
-optimization must preserve checkout-local freshness, paths, locking, and
-explicit cross-worktree selection. It must not reintroduce a shared mutable
-worktree database.
+Per-worktree databases are the correctness and operational baseline. The
+long-term storage model may deduplicate immutable extraction work, but it must
+not reintroduce a shared mutable worktree database.
+
+### Long-Term Worktree Storage Contract
+
+The target design has three layers:
+
+1. **Immutable extraction artifacts.** An artifact key is a domain-separated
+   digest of the Git blob object id, effective tsift configuration digest,
+   grammar/toolchain digest, and extractor version. Identical keys may be
+   reused by any checkout. Omitting any input is unsafe because identical file
+   bytes can produce different symbols or edges after a configuration,
+   grammar, or extractor change. `tsift-index::worktree_store` owns the typed
+   key contract and its validation.
+2. **Immutable commit/tree manifests.** A manifest maps normalized
+   repository-relative paths in one Git commit/tree to artifact keys. It is
+   append-only and contains no checkout locks, mtimes, or mutable freshness
+   state. Manifests are the roots from which shared artifacts are retained.
+3. **Worktree-local dirty overlays.** Every checkout keeps its own mutable
+   overlay, writer lock, freshness watermarks, and query database. Overlay
+   writes map dirty paths to immutable artifacts; tombstones hide paths that
+   remain in the base tree. A path cannot be both a write and a tombstone.
+   Overlay state is never shared between worktrees.
+
+Cross-worktree queries are an explicit read-only federation over selected
+checkout overlays and manifests. Every hit must carry repository identity,
+worktree root, branch or detached HEAD, commit/tree id, and source path. The
+default remains the current checkout; agents never receive sibling-branch
+results merely because another worktree exists on disk. Federation deduplicates
+identical artifact computation, not result provenance.
+
+Scheduling preserves one writer per dirty overlay. CAS artifact construction
+may run concurrently because publication is immutable and atomic, but a
+checkout's overlay projection and freshness transition are serialized behind
+that checkout's lock. A global writer lock or one mutable SQLite database for
+all worktrees is forbidden.
+
+Garbage collection is mark-and-sweep with a grace period. Its roots are live
+commit/tree manifests, live worktree overlays, pinned snapshots, and in-flight
+artifact publications. A collector may remove an unreferenced immutable
+artifact only after the grace period and may never delete another process's
+overlay or in-flight temporary object. Manifests and artifacts are safe to
+rebuild from Git; dirty overlays are not and therefore require checkout-local
+recovery semantics.
+
+The implementation phases are:
+
+1. checkout-local databases and nested-worktree pruning (current baseline);
+2. typed artifact keys, commit manifests, and dirty overlay/tombstone
+   validation (`tsift-index::worktree_store`, current foundation);
+3. atomic on-disk CAS publication and manifest persistence;
+4. explicit provenance-labelled federation and per-overlay writer scheduling;
+5. reference-tracked, grace-period GC plus cache observability and repair.
 
 ## Multiplicity Model
 
