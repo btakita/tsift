@@ -8,6 +8,7 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **Make cross-worktree federation explicit and provenance-preserving.** The new `tsift-index::worktree_federation` contract requires named peer selection, attaches validated repository/checkout/HEAD/commit/tree/path provenance to every federated hit, and schedules mutable work FIFO with one active writer per overlay while allowing different overlays to proceed concurrently.
 - **Define and validate the long-term worktree store (`#bestlongterm`).** The architecture now specifies immutable extraction artifacts keyed by blob/config/toolchain/extractor identity, commit/tree manifests, checkout-local dirty overlays and tombstones, explicit provenance-labelled federation, per-overlay single-writer scheduling, and grace-period mark-and-sweep GC. `tsift-index::worktree_store` adds executable artifact-key and manifest validation as the foundation without introducing a shared mutable database.
 - **Isolate linked worktree indexes (`#loopmanyworktrees`).** Each checkout continues to own its local `.tsift/index.db`, and repository walks now prune nested linked worktree roots by recognizing their `.git` admin directory's `commondir` marker. This prevents branch-specific trees from thrashing or contaminating a parent index while leaving each worktree searchable through an explicit `--path`; ordinary submodule traversal remains under workspace-scope control.
 

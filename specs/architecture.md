@@ -229,11 +229,32 @@ default remains the current checkout; agents never receive sibling-branch
 results merely because another worktree exists on disk. Federation deduplicates
 identical artifact computation, not result provenance.
 
+The typed federation boundary is `tsift-index::worktree_federation`. A caller
+must construct a non-empty, duplicate-free `ExplicitPeerSelection`; there is no
+implicit "all discovered worktrees" selection. The selected checkout ids are
+resolved against a validated same-repository `FederationCatalog`, and unknown
+peers fail closed. Each `FederationPeer` binds that provenance to validated
+`CommitManifest` and `DirtyOverlayManifest` values, rejecting repository,
+checkout, commit, or tree mismatches before a peer becomes queryable.
+`FederatedHit<T>` has non-optional validated
+`WorktreeProvenance` and a normalized repository-relative source path, so a
+consumer cannot receive a successful federated result without its repository,
+checkout, worktree root, branch-or-detached-HEAD, commit, and tree labels.
+
 Scheduling preserves one writer per dirty overlay. CAS artifact construction
 may run concurrently because publication is immutable and atomic, but a
 checkout's overlay projection and freshness transition are serialized behind
 that checkout's lock. A global writer lock or one mutable SQLite database for
 all worktrees is forbidden.
+
+`OverlayWriteScheduler<T>` is the in-process scheduling contract: work is FIFO
+within each overlay,
+at most one yielded write may be active for an overlay, and completing that
+write makes the next write for the same overlay eligible. A write for another
+overlay remains eligible while the first overlay is active. The scheduler does
+not replace the checkout-local filesystem lock; workers must hold that lock
+while committing the yielded overlay transition so separate processes preserve
+the same single-writer invariant.
 
 Garbage collection is mark-and-sweep with a grace period. Its roots are live
 commit/tree manifests, live worktree overlays, pinned snapshots, and in-flight
