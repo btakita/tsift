@@ -222,6 +222,29 @@ The target design has three layers:
    remain in the base tree. A path cannot be both a write and a tombstone.
    Overlay state is never shared between worktrees.
 
+`tsift-index::worktree_store::WorktreeStore` persists those layers under one
+explicit store root. Artifact bytes live at
+`cas/artifacts/<key-prefix>/<artifact-key>.artifact`; commit manifests live at
+`manifests/commits/<repository-id-digest>/<commit-oid>-<tree-oid>.json`; and
+dirty overlays live at `manifests/overlays/<checkout-id-digest>.json` with a
+same-name `.lock` sidecar. Repository and checkout identifiers are hashed with
+a domain-separated digest so they cannot escape the store root or collide by
+path normalization.
+
+Immutable artifact and commit-manifest publication writes a temporary file in
+the destination directory, syncs its contents, installs it with no-clobber
+semantics, and syncs the parent directory. Re-publication is idempotent only
+when the existing bytes are identical; different bytes at the same address are
+an integrity error. Concurrent publishers therefore either publish one intact
+value or observe the identical winner. Readers open only the canonical target,
+so an abandoned temporary file is never visible as a valid object.
+
+Dirty overlays use the same temporary-file, file-sync, atomic-rename, and
+directory-sync protocol, but replacement is allowed only while holding that
+checkout's sidecar lock. A crash exposes either the previous complete overlay
+or the replacement, never partially serialized JSON. Overlay identity and all
+manifest paths and artifact keys are revalidated after deserialization.
+
 Cross-worktree queries are an explicit read-only federation over selected
 checkout overlays and manifests. Every hit must carry repository identity,
 worktree root, branch or detached HEAD, commit/tree id, and source path. The
@@ -248,7 +271,8 @@ The implementation phases are:
 1. checkout-local databases and nested-worktree pruning (current baseline);
 2. typed artifact keys, commit manifests, and dirty overlay/tombstone
    validation (`tsift-index::worktree_store`, current foundation);
-3. atomic on-disk CAS publication and manifest persistence;
+3. atomic on-disk CAS publication and manifest persistence
+   (`tsift-index::worktree_store`, current persistence layer);
 4. explicit provenance-labelled federation and per-overlay writer scheduling;
 5. reference-tracked, grace-period GC plus cache observability and repair.
 
