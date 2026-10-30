@@ -243,6 +243,24 @@ overlay or in-flight temporary object. Manifests and artifacts are safe to
 rebuild from Git; dirty overlays are not and therefore require checkout-local
 recovery semantics.
 
+`tsift-index::worktree_gc` owns the executable planning contract. Collection
+starts from a consistent inventory plus reference snapshot and produces a
+side-effect-free plan with every retention reason, grace-held and reclaimable
+object/byte counts, and repair findings for durable roots whose artifact is
+missing. An in-flight reference that is not yet in the final inventory is not
+damage. Before deleting any planned candidate, the sweeper must re-read all
+four root classes and verify that the immutable object's publication identity
+still matches the observation; a plan is not a lease and cannot close the
+publication race by itself.
+
+Dirty-overlay recovery is fail-closed. A valid primary overlay wins, otherwise
+a persisted recovery copy is restored. With neither copy, a checkout proven
+clean may rebuild its overlay from Git. A checkout with any dirty path is
+preserved and reported for local repair instead of being reset or projected
+from the base manifest. Repair may rebuild immutable manifest artifacts from
+Git and restore pins, but it must never infer that unpersisted dirty work is
+rebuildable.
+
 The implementation phases are:
 
 1. checkout-local databases and nested-worktree pruning (current baseline);
