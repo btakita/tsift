@@ -179,6 +179,31 @@ Workspace scope ids default to the submodule leaf name when it is unique. If two
 
 Workspace discovery does not treat a `.gitmodules` stanza as sufficient proof of a scope. A declared path is resolvable when its directory is present or the repository index owns a `160000` gitlink for it; an absent path with no gitlink is retained only as a stale-configuration diagnostic. If no declarations resolve, the repository root remains the indexing and query boundary: `index --workspace` indexes `.tsift/index.db`, and `status` recommends or reports that root index instead of an unfixable empty scoped workspace.
 
+## Linked Worktree Isolation
+
+Each linked git worktree is a checkout boundary and owns its own
+`<worktree>/.tsift/index.db`. Root discovery selects the nearest `.git` file or
+directory, so commands run inside a worktree cannot silently reuse the main
+checkout's mutable index. A repository walk also prunes any nested linked
+worktree root: the nested checkout remains searchable through its own path and
+database, but its branch-specific files never enter the parent checkout's
+index. Ordinary git submodules are not pruned by this rule; their ownership and
+federation continue to use the workspace-scope model above.
+
+Default queries are checkout-local. To inspect another worktree, an agent must
+target that worktree explicitly (for example, `tsift search <query> --path
+<worktree>`), which keeps result paths and branch identity unambiguous. An
+implicit mutable database shared by all worktrees is forbidden: concurrent
+branch changes would continuously invalidate one another and identical paths
+would not identify a checkout.
+
+Per-worktree databases are the correctness and operational baseline. A future
+storage optimization may deduplicate unchanged data as an immutable,
+content-addressed commit index plus a checkout-local dirty overlay, but that
+optimization must preserve checkout-local freshness, paths, locking, and
+explicit cross-worktree selection. It must not reintroduce a shared mutable
+worktree database.
+
 ## Multiplicity Model
 
 tsift treats repository multiplicity as an ordered ownership stack rather than a flat set of paths. The precedence is:

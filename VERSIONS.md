@@ -8,6 +8,8 @@ Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
 ## Unreleased
 
+- **Isolate linked worktree indexes (`#loopmanyworktrees`).** Each checkout continues to own its local `.tsift/index.db`, and repository walks now prune nested linked worktree roots by recognizing their `.git` admin directory's `commondir` marker. This prevents branch-specific trees from thrashing or contaminating a parent index while leaving each worktree searchable through an explicit `--path`; ordinary submodule traversal remains under workspace-scope control.
+
 ## 0.1.109
 
 - **Grok Build session context and live queue fidelity.** `session-digest` accepts/detects `grok-jsonl`, `session-review` discovers `~/.grok/sessions/<percent-encoded-cwd>/*/chat_history.jsonl`, and explicit Grok transcript targets resolve back to their source checkout. Grok user text, assistant text, tool calls, and tool results feed the bounded prompt/command/file/failure digest while token-cost totals remain omitted because `chat_history.jsonl` has no usage records. Agent-doc session parsing retains ordinary and claimed free-text queue rows in addition to `dispatch`, `preset`, and `do [#id]` forms.

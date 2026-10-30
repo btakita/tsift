@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use tsift_graph::lang::Lang;
@@ -202,15 +203,46 @@ fn build_walker(root: &Path, excluded_roots: &[PathBuf]) -> ignore::Walk {
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true);
-    if !excluded_roots.is_empty() {
-        let excluded_roots = excluded_roots.to_vec();
-        builder.filter_entry(move |entry| {
-            !excluded_roots
-                .iter()
-                .any(|excluded| entry.path() == excluded || entry.path().starts_with(excluded))
-        });
-    }
+    let root = root.to_path_buf();
+    let excluded_roots = excluded_roots.to_vec();
+    builder.filter_entry(move |entry| {
+        let path = entry.path();
+        let explicitly_excluded = excluded_roots
+            .iter()
+            .any(|excluded| path == excluded || path.starts_with(excluded));
+        !explicitly_excluded && (path == root || !is_linked_worktree_root(path))
+    });
     builder.build()
+}
+
+/// Whether `path` is the root of a linked git worktree.
+///
+/// A linked worktree has a `.git` *file* whose `gitdir:` target is an admin
+/// directory containing `commondir`. A normal submodule also has a `.git`
+/// file, but its target is the repository git dir itself and has no
+/// `commondir`, so submodule ownership remains governed by workspace scope
+/// discovery instead of this worktree guard.
+fn is_linked_worktree_root(path: &Path) -> bool {
+    let marker = path.join(".git");
+    if !marker.is_file() {
+        return false;
+    }
+    let Ok(contents) = fs::read_to_string(marker) else {
+        return false;
+    };
+    let Some(git_dir) = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))
+    else {
+        return false;
+    };
+    let git_dir = PathBuf::from(git_dir.trim());
+    let git_dir = if git_dir.is_absolute() {
+        git_dir
+    } else {
+        path.join(git_dir)
+    };
+    git_dir.join("commondir").is_file()
 }
 
 pub fn changed_since(entries: &[FileEntry], since: SystemTime) -> Vec<&FileEntry> {
@@ -323,6 +355,54 @@ mod tests {
                 .all(|entry| !entry.path.ends_with("sub/mod.rs"))
         );
         assert!(entries.iter().any(|entry| entry.path.ends_with("main.rs")));
+    }
+
+    #[test]
+    fn walk_prunes_nested_linked_worktrees() {
+        let dir = setup_temp_tree();
+        let root = dir.path();
+        let admin = root.join(".git/worktrees/feature");
+        fs::create_dir_all(&admin).unwrap();
+        fs::write(admin.join("commondir"), "../..\n").unwrap();
+        let nested = root.join("feature-worktree");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join(".git"),
+            format!("gitdir: {}\n", admin.display()),
+        )
+        .unwrap();
+        fs::write(nested.join("feature.rs"), "fn feature() {}").unwrap();
+
+        let entries = walk_files(root).unwrap();
+        assert!(entries.iter().any(|entry| entry.path.ends_with("main.rs")));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.path.ends_with("feature-worktree/feature.rs"))
+        );
+    }
+
+    #[test]
+    fn walk_does_not_treat_normal_submodule_as_linked_worktree() {
+        let dir = setup_temp_tree();
+        let root = dir.path();
+        let submodule_git_dir = root.join(".git/modules/submodule");
+        fs::create_dir_all(&submodule_git_dir).unwrap();
+        let nested = root.join("submodule");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join(".git"),
+            format!("gitdir: {}\n", submodule_git_dir.display()),
+        )
+        .unwrap();
+        fs::write(nested.join("submodule.rs"), "fn submodule() {}").unwrap();
+
+        let entries = walk_files(root).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.path.ends_with("submodule/submodule.rs"))
+        );
     }
 
     #[test]
