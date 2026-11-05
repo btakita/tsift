@@ -652,6 +652,49 @@ mod tests {
     }
 
     #[test]
+    fn reads_fail_closed_when_stored_identity_does_not_match_its_address() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = WorktreeStore::new(directory.path().join("store"));
+
+        // A valid commit manifest copied to another commit's address must not
+        // be served as that commit's manifest.
+        let manifest = commit_manifest();
+        store.publish_commit_manifest(&manifest).unwrap();
+        let mut moved = manifest.clone();
+        moved.commit_oid = SHA1_B.into();
+        let moved_path = store.commit_manifest_path(&moved).unwrap();
+        fs::copy(store.commit_manifest_path(&manifest).unwrap(), &moved_path).unwrap();
+        let error = store
+            .read_commit_manifest(&moved.repository_id, &moved.commit_oid, &moved.tree_oid)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its storage address"),
+            "{error:#}"
+        );
+
+        // Likewise a dirty overlay copied to another checkout's address.
+        let overlay = dirty_overlay();
+        store.write_dirty_overlay(&overlay).unwrap();
+        let other_checkout = "worktree-other";
+        fs::copy(
+            store.dirty_overlay_path(&overlay.checkout_id).unwrap(),
+            store.dirty_overlay_path(other_checkout).unwrap(),
+        )
+        .unwrap();
+        let error = store.read_dirty_overlay(other_checkout).unwrap_err();
+        assert!(error.to_string().contains("identity mismatch"), "{error:#}");
+        assert_eq!(
+            store
+                .read_dirty_overlay(&overlay.checkout_id)
+                .unwrap()
+                .unwrap(),
+            overlay
+        );
+    }
+
+    #[test]
     fn dirty_overlay_write_wins_and_tombstone_removes_base_path() {
         let mut base_artifacts = BTreeMap::new();
         base_artifacts.insert("src/lib.rs".into(), DIGEST_C.into());

@@ -492,6 +492,52 @@ mod tests {
     }
 
     #[test]
+    fn peers_and_catalogs_reject_inconsistent_identity() {
+        // Provenance must agree with the base manifest and the overlay it composes.
+        let mut other_repo = base();
+        other_repo.repository_id = "other".into();
+        assert!(FederationPeer::new(provenance("alpha"), other_repo, overlay("alpha")).is_err());
+
+        let mut other_commit = base();
+        other_commit.commit_oid = TREE.into();
+        assert!(FederationPeer::new(provenance("alpha"), other_commit, overlay("alpha")).is_err());
+
+        assert!(FederationPeer::new(provenance("alpha"), base(), overlay("beta")).is_err());
+
+        let mut stale_overlay = overlay("alpha");
+        stale_overlay.base_tree_oid = COMMIT.into();
+        assert!(FederationPeer::new(provenance("alpha"), base(), stale_overlay).is_err());
+
+        // Provenance itself refuses unlabelled or malformed identities.
+        assert!(
+            WorktreeProvenance::new(
+                "example",
+                "alpha",
+                "/repo/worktrees/alpha",
+                HeadState::Branch(" ".into()),
+                COMMIT,
+                TREE,
+            )
+            .is_err()
+        );
+        assert!(
+            WorktreeProvenance::new(
+                "example",
+                "alpha",
+                "/repo/worktrees/alpha",
+                HeadState::Detached,
+                "not-an-oid",
+                TREE,
+            )
+            .is_err()
+        );
+
+        // A catalog holds one repository and one peer per checkout.
+        assert!(FederationCatalog::new("other", [peer("alpha")]).is_err());
+        assert!(FederationCatalog::new("example", [peer("alpha"), peer("alpha")]).is_err());
+    }
+
+    #[test]
     fn scheduler_serializes_each_overlay_without_globally_serializing_writes() {
         let mut scheduler = OverlayWriteScheduler::new();
         let alpha = overlay("alpha");
