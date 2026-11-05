@@ -718,3 +718,148 @@ fn agent_doc_import_without_a_state_db_fails_without_creating_one() {
     assert!(stderr.contains("no agent-doc state database"), "{stderr}");
     assert!(!dir.path().join(".agent-doc").exists());
 }
+
+/// `#decisionitembacklogjoin`: the imported item for backlog id `shipx` links
+/// to the session document's `backlog` node, so `graph-db evidence shipx`
+/// reaches the decisions about it in both documents and the revision that
+/// answered one, while a backlog id no decision mentions carries none.
+#[test]
+fn agent_doc_items_join_backlog_nodes_so_evidence_reaches_their_decisions() {
+    let project = agent_doc_project();
+    fs::write(
+        project.path().join("tasks/a.md"),
+        r#"---
+agent_doc_session: decision-join
+agent_doc_format: template
+---
+
+## Backlog
+
+<!-- agent:backlog -->
+- [ ] [#shipx] ship x
+- [ ] [#lonely] nothing decided about this one
+<!-- /agent:backlog -->
+"#,
+    )
+    .unwrap();
+    let root = project.path().to_string_lossy().to_string();
+    let imported = tsift(&[
+        "graph-db",
+        "--path",
+        &root,
+        "import",
+        "--format",
+        "agent-doc-decisions",
+        "--json",
+    ]);
+    let projected = &report(&imported)["imports"][0]["projected"];
+    assert_eq!(projected["linked_nodes"], "1", "{imported}");
+    assert_eq!(projected["joined_nodes"], "2", "{imported}");
+
+    // The item stays queryable by kind; the backlog node links to it.
+    let items = tsift(&[
+        "graph-db",
+        "--path",
+        &root,
+        "kind",
+        "agent_doc_item",
+        "--property",
+        "ref_id=shipx",
+        "--json",
+    ]);
+    let item = report(&items)["nodes"][0]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("item shipx missing: {items}"))
+        .to_string();
+    let links = tsift(&[
+        "graph-db",
+        "--path",
+        &root,
+        "edges",
+        "--edge-kind",
+        "decision_item",
+        "--json",
+    ]);
+    let link_edges = report(&links)["edges"].as_array().unwrap();
+    assert_eq!(link_edges.len(), 1, "{links}");
+    assert_eq!(link_edges[0]["to_id"], item.as_str());
+    let backlog = link_edges[0]["from_id"].as_str().unwrap().to_string();
+    assert!(backlog.starts_with("gbak-"), "{links}");
+
+    let evidence = tsift(&["graph-db", "--path", &root, "evidence", "shipx", "--json"]);
+    let packet = report(&evidence);
+    assert_eq!(packet["target_node"]["id"], backlog.as_str(), "{evidence}");
+    let rows: Vec<(u64, String, String, String)> = packet["decision_graph"]
+        .as_array()
+        .unwrap_or_else(|| panic!("decision_graph missing: {evidence}"))
+        .iter()
+        .map(|row| {
+            (
+                row["hops"].as_u64().unwrap(),
+                row["kind"].as_str().unwrap().to_string(),
+                row["label"].as_str().unwrap().to_string(),
+                row["edge_kind"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let row = |hops: u64, kind: &str, label: &str, edge: &str| {
+        (hops, kind.to_string(), label.to_string(), edge.to_string())
+    };
+    assert_eq!(
+        rows,
+        vec![
+            row(1, "agent_doc_item", "ship x", "decision_item"),
+            row(2, "agent_doc_decision", "Ship X?", "applies_to"),
+            row(2, "agent_doc_decision", "When?", "applies_to"),
+            row(3, "agent_doc_revision", "yes", "answers"),
+        ],
+        "{evidence}"
+    );
+    let dec1 = decision_id(&root, "dec-1");
+    let revision = &packet["decision_graph"][3];
+    assert_eq!(revision["edge_to"], dec1.as_str());
+    assert!(
+        packet["next_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|command| command
+                .as_str()
+                .is_some_and(|command| command.contains("incident") && command.contains(&item))),
+        "{evidence}"
+    );
+
+    // --depth bounds the walk; a backlog id with no decisions has no rows.
+    let shallow = tsift(&[
+        "graph-db", "--path", &root, "evidence", "shipx", "--depth", "1", "--json",
+    ]);
+    assert_eq!(
+        report(&shallow)["decision_graph"].as_array().map(Vec::len),
+        Some(1),
+        "{shallow}"
+    );
+    let lonely = tsift(&["graph-db", "--path", &root, "evidence", "lonely", "--json"]);
+    assert!(report(&lonely).get("decision_graph").is_none(), "{lonely}");
+
+    // Removing the import drops the link with the item.
+    tsift(&[
+        "graph-db",
+        "--path",
+        &root,
+        "import",
+        "--remove",
+        "--format",
+        "agent-doc-decisions",
+        "--json",
+    ]);
+    let links = tsift(&[
+        "graph-db",
+        "--path",
+        &root,
+        "edges",
+        "--edge-kind",
+        "decision_item",
+        "--json",
+    ]);
+    assert_eq!(report(&links)["edges"].as_array().map_or(0, Vec::len), 0);
+}

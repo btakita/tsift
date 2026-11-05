@@ -6947,6 +6947,12 @@ struct GraphDbEvidenceReport {
     source_handles: Vec<SubstrateTerseGraphNode>,
     worker_results: Vec<SubstrateTerseGraphNode>,
     semantic_related: Vec<SubstrateTerseGraphNode>,
+    /// Imported agent-doc decision-graph rows about the target's backlog id
+    /// (`#decisionitembacklogjoin`): the linked shared node (`agent_doc_item`,
+    /// or the question it was outranked to), then every decision, revision,
+    /// or question whose edges lead into it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    decision_graph: Vec<GraphDbEvidenceDecisionRow>,
     shortest_paths: Vec<GraphDbEvidencePath>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_budget: Option<GraphDbOutputBudgetReport>,
@@ -6960,6 +6966,98 @@ struct GraphDbEvidenceReport {
     fixture_coverage: GraphDbFixtureCoverage,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     warnings: Vec<String>,
+}
+
+/// One decision-graph row in an evidence packet: the node, how many hops it
+/// sits from the target, and the edge (`edge_from -edge_kind-> edge_to`, as
+/// stored) that reached it from the node one hop closer to the target.
+#[derive(Clone, Serialize, Deserialize)]
+struct GraphDbEvidenceDecisionRow {
+    #[serde(flatten)]
+    node: SubstrateTerseGraphNode,
+    hops: usize,
+    edge_from: String,
+    edge_kind: String,
+    edge_to: String,
+}
+
+/// Decision-graph rows about `target`: the `agent_doc_item` nodes its
+/// `decision_item` edges reach, then, walking agent-doc's edges backwards
+/// (`decision -applies_to-> item`, `revision -answers-> decision`,
+/// `decision -depends_on-> decision`), every imported reasoning node that leads
+/// into them, within `depth` hops of the target. Rows sort by hops, kind,
+/// label, and id; `limit` caps them (0 = unlimited).
+fn graph_db_evidence_decision_rows<S: GraphStore>(
+    store: &S,
+    target: &SubstrateGraphNode,
+    depth: usize,
+    limit: usize,
+) -> Result<Vec<GraphDbEvidenceDecisionRow>> {
+    let is_reasoning = |node: &SubstrateGraphNode| {
+        node.kind.starts_with("agent_doc_") && node.kind != "agent_doc_document"
+    };
+    let mut rows: Vec<(SubstrateGraphNode, usize, SubstrateGraphEdge)> = Vec::new();
+    let mut seen = BTreeSet::from([target.id.clone()]);
+    let mut frontier = Vec::new();
+    if depth == 0 {
+        return Ok(Vec::new());
+    }
+    for edge in store.outgoing_edges(&target.id, Some(agent_doc_decisions::BACKLOG_ITEM_EDGE))? {
+        if !seen.insert(edge.to_id.clone()) {
+            continue;
+        }
+        let Some(node) = store.node(&edge.to_id)? else {
+            continue;
+        };
+        if !is_reasoning(&node) {
+            continue;
+        }
+        frontier.push(node.id.clone());
+        rows.push((node, 1, edge));
+    }
+    for hops in 2..=depth {
+        let mut next = Vec::new();
+        for id in &frontier {
+            for edge in store.incident_edges(id, None)? {
+                if edge.to_id != *id || !seen.insert(edge.from_id.clone()) {
+                    continue;
+                }
+                let Some(node) = store.node(&edge.from_id)? else {
+                    continue;
+                };
+                if !is_reasoning(&node) {
+                    continue;
+                }
+                next.push(node.id.clone());
+                rows.push((node, hops, edge));
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        next.sort();
+        frontier = next;
+    }
+    rows.sort_by(|left, right| {
+        left.1
+            .cmp(&right.1)
+            .then(left.0.kind.cmp(&right.0.kind))
+            .then(left.0.label.cmp(&right.0.label))
+            .then(left.0.id.cmp(&right.0.id))
+    });
+    if limit > 0 && rows.len() > limit {
+        rows.truncate(limit);
+    }
+    Ok(rows
+        .into_iter()
+        .map(|(node, hops, edge)| GraphDbEvidenceDecisionRow {
+            node: node.into(),
+            hops,
+            edge_from: edge.from_id,
+            edge_kind: edge.kind,
+            edge_to: edge.to_id,
+        })
+        .collect())
 }
 
 pub(crate) struct GraphDbEvidenceInput<'a, S: GraphStore> {
@@ -10486,10 +10584,12 @@ pub(crate) fn graph_db_evidence_report_from_store<S: GraphStore>(
         &target_node,
         &worker_results,
     )?);
+    let decision_graph = graph_db_evidence_decision_rows(store, &target_node, depth, limit)?;
     if worker_context.is_empty()
         && source_handles.is_empty()
         && worker_results.is_empty()
         && semantic_related.is_empty()
+        && decision_graph.is_empty()
     {
         warnings.push(format!(
             "graph-db evidence target {} resolved to a {} node but has no projection-linked context rows; add source/file tokens to the backlog text or rerun graph-db refresh after the session document is indexed",
@@ -10510,7 +10610,7 @@ pub(crate) fn graph_db_evidence_report_from_store<S: GraphStore>(
             expand: node.properties.get("expand").cloned(),
         })
         .collect::<Vec<_>>();
-    let next_commands = graph_db_evidence_next_commands(
+    let mut next_commands = graph_db_evidence_next_commands(
         root,
         scope,
         &target_node,
@@ -10519,6 +10619,14 @@ pub(crate) fn graph_db_evidence_report_from_store<S: GraphStore>(
         &worker_results,
         &semantic_related,
     );
+    for row in decision_graph.iter().filter(|row| row.hops == 1) {
+        next_commands.push(format!(
+            "tsift graph-db --path {}{} incident {} --json",
+            shell_quote(root.to_string_lossy().as_ref()),
+            graph_db_scope_arg(scope),
+            shell_quote(&row.node.id)
+        ));
+    }
     let replay_commands = graph_db_evidence_replay_commands(root, scope, target, depth, limit);
     let packet_id = graph_db_evidence_packet_id(target, &target_node, &freshness);
     let projection_hash = freshness.content_hash.clone();
@@ -10537,6 +10645,7 @@ pub(crate) fn graph_db_evidence_report_from_store<S: GraphStore>(
         source_handles: source_handles.into_iter().map(Into::into).collect(),
         worker_results: worker_results.into_iter().map(Into::into).collect(),
         semantic_related: semantic_related.into_iter().map(Into::into).collect(),
+        decision_graph,
         shortest_paths,
         output_budget: Some(output_budget),
         truncated,
@@ -10587,6 +10696,12 @@ fn print_graph_db_evidence_human(report: &GraphDbEvidenceReport) {
             );
         }
     }
+    for row in &report.decision_graph {
+        println!(
+            "decision: {} hop(s) [{}] {} ({} -{}-> {})",
+            row.hops, row.node.kind, row.node.label, row.edge_from, row.edge_kind, row.edge_to
+        );
+    }
     for command in &report.next_commands {
         println!("next: {command}");
     }
@@ -10627,6 +10742,7 @@ pub(crate) fn print_graph_db_evidence_report(
                     envelope_metric("source_handles", report.source_handles.len()),
                     envelope_metric("worker_results", report.worker_results.len()),
                     envelope_metric("semantic_related", report.semantic_related.len()),
+                    envelope_metric("decision_graph", report.decision_graph.len()),
                     envelope_metric("paths", report.shortest_paths.len()),
                 ],
             },

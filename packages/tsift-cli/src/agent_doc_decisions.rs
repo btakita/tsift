@@ -35,6 +35,13 @@
 //! counterpart of agent-doc's own in-document rule that a decision outranks an
 //! item placeholder. Each document becomes a node that joins the indexed
 //! `file` node of the session document when that file is indexed.
+//!
+//! Backlog join (`#decisionitembacklogjoin`): an item id is a backlog id, so
+//! each shared node (`agent_doc_item`, or the question an item was outranked
+//! to) carries a `link` to the indexed `backlog` nodes with the same `ref_id`. The refresh resolves it into a
+//! `backlog -decision_item-> agent_doc_item` edge per matching backlog node,
+//! and `graph-db evidence <backlog id>` walks from that item back along the
+//! decision graph's edges to the decisions, revisions and questions about it.
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
@@ -45,7 +52,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::graph_import::{EdgeFile, EdgeFileEdge, EdgeFileNode, JoinFields, JoinSpec};
+use crate::graph_import::{EdgeFile, EdgeFileEdge, EdgeFileNode, JoinFields, JoinSpec, LinkSpec};
 
 /// Adapter name recorded on the import.
 pub(crate) const AGENT_DOC_DECISIONS_ADAPTER: &str = "agent-doc-decisions";
@@ -64,6 +71,10 @@ const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 /// than the few SELECTs below.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 const DOCUMENT_KIND: &str = "agent_doc_document";
+/// Projection kind of a session document's backlog item.
+const BACKLOG_KIND: &str = "backlog";
+/// Edge from an indexed `backlog` node to the `agent_doc_item` with its id.
+pub(crate) const BACKLOG_ITEM_EDGE: &str = "decision_item";
 const KIND_PREFIX: &str = "agent_doc_";
 
 const EDGE_TABLE: &str = "answer_ledger_edges";
@@ -491,6 +502,7 @@ fn lower_cache(cache: &Cache, root: &Path) -> Result<EdgeFile> {
                     ..JoinFields::default()
                 })
             }),
+            link: None,
             properties,
         });
     }
@@ -592,6 +604,7 @@ fn lower_cache(cache: &Cache, root: &Path) -> Result<EdgeFile> {
             kind: Some(graph_kind(kind)),
             label: Some(if label.is_empty() { id.clone() } else { label }),
             join: None,
+            link: None,
             properties,
         });
         edges.insert(
@@ -619,6 +632,17 @@ fn lower_cache(cache: &Cache, root: &Path) -> Result<EdgeFile> {
                 entry.label.clone()
             }),
             join: None,
+            // A shared id is the same id in every document, so each indexed
+            // backlog node with that id links to it and `graph-db evidence
+            // <id>` reaches the decisions about the item
+            // (`#decisionitembacklogjoin`). The link also covers an item one
+            // document outranked to a question; an id no backlog carries
+            // (`commit:<sha>`, `r-<hex>`) links nothing.
+            link: Some(LinkSpec {
+                edge: BACKLOG_ITEM_EDGE.to_string(),
+                kinds: vec![BACKLOG_KIND.to_string()],
+                ref_id: id.clone(),
+            }),
             properties,
         });
     }
@@ -836,6 +860,17 @@ mod tests {
         // One shared node for `shipx`; the question outranks the item.
         let shipx = node(&file, "ref:shipx");
         assert_eq!(shipx.kind.as_deref(), Some("agent_doc_question"));
+        // Shared ids link to the backlog nodes with the same id; document-local
+        // decisions do not (`#decisionitembacklogjoin`).
+        assert_eq!(
+            shipx.link,
+            Some(LinkSpec {
+                edge: BACKLOG_ITEM_EDGE.to_string(),
+                kinds: vec!["backlog".to_string()],
+                ref_id: "shipx".to_string(),
+            })
+        );
+        assert!(node(&file, &a).link.is_none());
         assert_eq!(shipx.properties["documents"], 2);
         assert_eq!(shipx.properties["open"], "true");
         edge(&file, &a, "applies_to", "ref:shipx");

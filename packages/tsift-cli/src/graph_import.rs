@@ -77,8 +77,29 @@ pub(crate) struct EdgeFileNode {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join: Option<JoinSpec>,
+    /// Indexed nodes this node links to without merging into them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<LinkSpec>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub properties: BTreeMap<String, Value>,
+}
+
+/// Links an imported node to the indexed nodes that carry the same `ref_id`,
+/// keeping both. A `join` makes the imported node *be* its indexed
+/// counterpart; a link adds an `edge` from each matched indexed node to the
+/// imported node, so an outgoing walk from the indexed node reaches the import
+/// (`#decisionitembacklogjoin`: a backlog node reaches the agent-doc decision
+/// item for the same id). Like joins, links resolve at every refresh against
+/// the projection being built, so a stored snapshot links to the backlog the
+/// session documents hold now.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub(crate) struct LinkSpec {
+    /// Kind of the edge from each matched indexed node to this node.
+    pub edge: String,
+    /// Indexed node kinds to match (e.g. `backlog`).
+    pub kinds: Vec<String>,
+    /// The `ref_id` property the indexed node must carry.
+    pub ref_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -155,6 +176,10 @@ pub(crate) struct GraphImportStats {
     /// Joins that matched more than one indexed node (all are linked) or too
     /// many to be meaningful (none are linked).
     pub ambiguous_joins: usize,
+    /// Declared nodes whose `link` reached at least one indexed node.
+    pub linked_nodes: usize,
+    /// Declared nodes with a `link` that reached nothing (or too many nodes).
+    pub unmatched_links: usize,
     /// Undeclared edge endpoints that matched an indexed node by name.
     pub matched_endpoints: usize,
     /// Undeclared edge endpoints that matched nothing and became `external` nodes.
@@ -356,6 +381,16 @@ fn validate_edge_file(file: &EdgeFile) -> Result<()> {
                 bail!("node `{}` has a `join.line` without `join.path`", node.id);
             }
         }
+        if let Some(link) = &node.link
+            && (link.edge.trim().is_empty()
+                || link.ref_id.trim().is_empty()
+                || link.kinds.iter().all(|kind| kind.trim().is_empty()))
+        {
+            bail!(
+                "node `{}` has a `link` without an `edge`, `ref_id`, or `kinds`",
+                node.id
+            );
+        }
     }
     for (index, edge) in file.edges.iter().enumerate() {
         if edge.from.trim().is_empty() || edge.to.trim().is_empty() {
@@ -501,6 +536,34 @@ impl JoinIndex {
     }
 }
 
+/// Indexed node ids by `(kind, ref_id)` for the kinds `file`'s links ask
+/// for, taken before the file's own rows are appended so a link never lands on
+/// the import itself.
+fn link_index(file: &EdgeFile, nodes: &[GraphNode]) -> BTreeMap<(String, String), Vec<String>> {
+    let kinds: BTreeSet<&str> = file
+        .nodes
+        .iter()
+        .filter_map(|node| node.link.as_ref())
+        .flat_map(|link| link.kinds.iter().map(String::as_str))
+        .collect();
+    let mut index: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    if kinds.is_empty() {
+        return index;
+    }
+    for node in nodes {
+        if !kinds.contains(node.kind.as_str()) {
+            continue;
+        }
+        if let Some(ref_id) = node.properties.get("ref_id") {
+            index
+                .entry((node.kind.clone(), ref_id.clone()))
+                .or_default()
+                .push(node.id.clone());
+        }
+    }
+    index
+}
+
 /// Stable id of an imported (non-joined) node.
 pub(crate) fn graph_import_node_id(source: &str, local_id: &str) -> String {
     crate::stable_handle("gimp", &format!("{source}\u{0}{local_id}"))
@@ -530,6 +593,7 @@ pub(crate) fn append_edge_file_rows(
         ..GraphImportStats::default()
     };
     let join_index = JoinIndex::build(nodes);
+    let link_index = link_index(file, nodes);
     let mut existing_node_ids: BTreeSet<String> =
         nodes.iter().map(|node| node.id.clone()).collect();
     let mut existing_edges: BTreeSet<(String, String, String)> = edges
@@ -664,6 +728,48 @@ pub(crate) fn append_edge_file_rows(
         }
     }
 
+    // Links: an edge from each indexed node carrying the same `ref_id` to the
+    // node this declared node resolved to. Both stay in the graph.
+    for node in &declared {
+        let Some(link) = &node.link else {
+            continue;
+        };
+        let mut matches: Vec<String> = link
+            .kinds
+            .iter()
+            .filter_map(|kind| link_index.get(&(kind.clone(), link.ref_id.clone())))
+            .flatten()
+            .cloned()
+            .collect();
+        matches.sort();
+        matches.dedup();
+        if matches.is_empty() || matches.len() > MAX_JOIN_MATCHES {
+            stats.unmatched_links += 1;
+            continue;
+        }
+        stats.linked_nodes += 1;
+        let targets = resolved.get(&node.id).cloned().unwrap_or_default();
+        for from in &matches {
+            for to in &targets {
+                if from == to {
+                    continue;
+                }
+                if !existing_edges.insert((from.clone(), to.clone(), link.edge.clone())) {
+                    stats.duplicate_edges += 1;
+                    continue;
+                }
+                edges.push(
+                    GraphEdge::new(from.clone(), to.clone(), link.edge.clone())
+                        .with_property("provider", GRAPH_IMPORT_PROVIDER)
+                        .with_property("import_source", source.as_str())
+                        .with_property("ref_id", link.ref_id.as_str())
+                        .with_provenance(provenance.clone()),
+                );
+                stats.edges += 1;
+            }
+        }
+    }
+
     let summary_id = graph_import_source_node_id(&source);
     if !nodes.iter().any(|node| node.id == summary_id) {
         let mut summary = GraphNode::new(summary_id, GRAPH_IMPORT_SOURCE_KIND, source.as_str())
@@ -676,6 +782,8 @@ pub(crate) fn append_edge_file_rows(
             .with_property("joined_nodes", stats.joined_nodes.to_string())
             .with_property("unmatched_joins", stats.unmatched_joins.to_string())
             .with_property("ambiguous_joins", stats.ambiguous_joins.to_string())
+            .with_property("linked_nodes", stats.linked_nodes.to_string())
+            .with_property("unmatched_links", stats.unmatched_links.to_string())
             .with_property("matched_endpoints", stats.matched_endpoints.to_string())
             .with_property("external_endpoints", stats.external_endpoints.to_string())
             .with_provenance(provenance);
@@ -994,6 +1102,9 @@ pub(crate) fn cmd_graph_db_import(
         next_commands.push(format!(
             "tsift graph-db --path {root_arg}{scope_arg} incident <node-id> --json  # decisions, documents and evidence touching it"
         ));
+        next_commands.push(format!(
+            "tsift graph-db --path {root_arg}{scope_arg} evidence <backlog-id> --json  # decision_graph: the decisions about a backlog item"
+        ));
     }
 
     let report = GraphDbImportReport {
@@ -1060,6 +1171,8 @@ pub(crate) fn cmd_graph_db_import(
                                 | "joined_nodes"
                                 | "unmatched_joins"
                                 | "ambiguous_joins"
+                                | "linked_nodes"
+                                | "unmatched_links"
                                 | "matched_endpoints"
                                 | "external_endpoints"
                                 | "duplicate_edges"
@@ -1286,6 +1399,7 @@ impl TraceLowering {
                 kind: Some(kind.to_string()),
                 label: Some(label.to_string()),
                 join,
+                link: None,
                 properties,
             });
         id
@@ -1653,6 +1767,95 @@ mod tests {
             .with_property("path", path)
             .with_property("line", line.to_string())
             .with_property("detail", format!("{language} schema"))
+    }
+
+    #[test]
+    fn link_adds_an_edge_from_each_indexed_ref_id_match_and_keeps_the_node() {
+        let file: EdgeFile = serde_json::from_value(serde_json::json!({
+            "source": "s",
+            "nodes": [
+                {"id": "ref:shipx", "kind": "agent_doc_item",
+                 "link": {"edge": "decision_item", "kinds": ["backlog"], "ref_id": "shipx"}},
+                {"id": "ref:gone", "kind": "agent_doc_item",
+                 "link": {"edge": "decision_item", "kinds": ["backlog"], "ref_id": "gone"}}
+            ],
+            "edges": [{"from": "dec", "to": "ref:shipx", "kind": "applies_to"}]
+        }))
+        .unwrap();
+        let backlog = |id: &str, ref_id: &str| {
+            GraphNode::new(id, "backlog", format!("#{ref_id}")).with_property("ref_id", ref_id)
+        };
+        let mut nodes = vec![
+            backlog("gbak-a", "shipx"),
+            backlog("gbak-b", "shipx"),
+            backlog("gbak-other", "other"),
+            // Same ref_id, wrong kind: a link names the kinds it joins.
+            GraphNode::new("gjob-a", "job_packet", "do").with_property("ref_id", "shipx"),
+        ];
+        let mut edges = Vec::new();
+        let stats = append_edge_file_rows(&file, &mut nodes, &mut edges);
+        assert_eq!(stats.linked_nodes, 1);
+        assert_eq!(stats.unmatched_links, 1, "no backlog carries `gone`");
+        assert_eq!(stats.joined_nodes, 0, "a link is not a join");
+        let item = graph_import_node_id("s", "ref:shipx");
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node.id == item && node.kind == "agent_doc_item"),
+            "the linked item stays an imported node"
+        );
+        let mut linked: Vec<&str> = edges
+            .iter()
+            .filter(|edge| edge.kind == "decision_item")
+            .map(|edge| {
+                assert_eq!(edge.to_id, item);
+                assert_eq!(
+                    edge.properties.get("ref_id").map(String::as_str),
+                    Some("shipx")
+                );
+                edge.from_id.as_str()
+            })
+            .collect();
+        linked.sort();
+        assert_eq!(linked, vec!["gbak-a", "gbak-b"]);
+        assert_eq!(stats.edges, 3, "applies_to plus one link per backlog node");
+        let summary = nodes
+            .iter()
+            .find(|node| node.id == graph_import_source_node_id("s"))
+            .expect("summary node");
+        assert_eq!(
+            summary.properties.get("linked_nodes").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            summary
+                .properties
+                .get("unmatched_links")
+                .map(String::as_str),
+            Some("1")
+        );
+
+        // Re-appending onto the same rows adds no duplicate links.
+        let again = append_edge_file_rows(&file, &mut nodes, &mut edges);
+        assert_eq!(
+            edges
+                .iter()
+                .filter(|edge| edge.kind == "decision_item")
+                .count(),
+            2
+        );
+        assert_eq!(again.duplicate_edges, 3);
+    }
+
+    #[test]
+    fn link_without_ref_id_or_kinds_is_refused() {
+        let file: EdgeFile = serde_json::from_value(serde_json::json!({
+            "nodes": [{"id": "x", "link": {"edge": "e", "kinds": [], "ref_id": "x"}}],
+            "edges": []
+        }))
+        .unwrap();
+        let err = validate_edge_file(&file).unwrap_err().to_string();
+        assert!(err.contains("`link`"), "{err}");
     }
 
     #[test]
