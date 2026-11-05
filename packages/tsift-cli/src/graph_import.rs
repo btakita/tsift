@@ -960,6 +960,155 @@ fn write_stored_atomically(path: &Path, file: &EdgeFile) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// agent-doc decision import freshness (`#decisiongraphimportrefresh`)
+// ---------------------------------------------------------------------------
+
+/// Whether a stored `agent-doc-decisions` import still matches its state.db.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DecisionImportState {
+    /// The decision cache digest equals the one the import recorded.
+    Current,
+    /// The cache moved on and the stored import was not rewritten (check only).
+    Stale,
+    /// The cache moved on and the stored import was re-lowered in place.
+    Reimported,
+    /// The state.db could not be read or lowered; the stored import is kept.
+    Unavailable,
+}
+
+/// One stored `agent-doc-decisions` import and what the freshness check did.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct DecisionImportFreshness {
+    pub source: String,
+    pub stored_file: PathBuf,
+    pub state_db: PathBuf,
+    pub state: DecisionImportState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// The state.db a stored agent-doc import was lowered from: its recorded
+/// `imported_from` (root-relative unless absolute), else the default path.
+fn decision_import_state_db(root: &Path, file: &EdgeFile) -> PathBuf {
+    match file.imported_from.as_deref() {
+        Some(from) if Path::new(from).is_absolute() => PathBuf::from(from),
+        Some(from) => root.join(from),
+        None => crate::agent_doc_decisions::default_state_db(root),
+    }
+}
+
+/// Check every stored `agent-doc-decisions` import beside `graph_db` against
+/// its live state.db and, with `apply`, re-lower the stale ones in place.
+///
+/// The import is a snapshot (the stored file, never the live database, feeds
+/// the projection watermark), so it silently lags as agent-doc caches new
+/// decisions. This is the bounded catch-up: per import, one read-only
+/// snapshot read of the cache rows to compare digests; the Markdown walk and
+/// lowering run only when the digest moved. It writes nothing but the
+/// stored import file and never refreshes the projection: the changed file's
+/// hash is part of the source watermark, so graph reads report the
+/// projection stale and the next `graph-db refresh` projects it. Only an
+/// import the operator already made is ever refreshed; nothing is created,
+/// and a failure leaves the stored import as it was.
+pub(crate) fn refresh_agent_doc_decision_imports(
+    root: &Path,
+    graph_db: &Path,
+    apply: bool,
+) -> Vec<DecisionImportFreshness> {
+    let mut outcomes = Vec::new();
+    for stored in stored_graph_import_files(&graph_imports_dir_for_db(graph_db)) {
+        let Some(file) = read_stored(&stored) else {
+            continue;
+        };
+        if file.adapter.as_deref() != Some(crate::agent_doc_decisions::AGENT_DOC_DECISIONS_ADAPTER)
+        {
+            continue;
+        }
+        let source = file.source.clone().unwrap_or_default();
+        let state_db = decision_import_state_db(root, &file);
+        let mut outcome = DecisionImportFreshness {
+            source: source.clone(),
+            stored_file: stored.clone(),
+            state_db: state_db.clone(),
+            state: DecisionImportState::Current,
+            detail: None,
+        };
+        let digest = match crate::agent_doc_decisions::agent_doc_cache_digest(&state_db) {
+            Ok(digest) => digest,
+            Err(err) => {
+                outcome.state = DecisionImportState::Unavailable;
+                outcome.detail = Some(format!("{err:#}"));
+                outcomes.push(outcome);
+                continue;
+            }
+        };
+        let recorded = file
+            .properties
+            .get(crate::agent_doc_decisions::CACHE_DIGEST_PROPERTY)
+            .and_then(Value::as_str);
+        if recorded == Some(digest.as_str()) {
+            outcomes.push(outcome);
+            continue;
+        }
+        if !apply {
+            outcome.state = DecisionImportState::Stale;
+            outcomes.push(outcome);
+            continue;
+        }
+        let relowered = parse_import_file(
+            root,
+            &state_db,
+            ImportFormat::AgentDocDecisions,
+            Some(&source),
+            &source,
+        )
+        .and_then(|mut relowered| {
+            relowered.imported_from = file.imported_from.clone();
+            write_stored_atomically(&stored, &relowered)
+        });
+        match relowered {
+            Ok(()) => outcome.state = DecisionImportState::Reimported,
+            Err(err) => {
+                outcome.state = DecisionImportState::Unavailable;
+                outcome.detail = Some(format!("{err:#}"));
+            }
+        }
+        outcomes.push(outcome);
+    }
+    outcomes
+}
+
+/// One operator-facing line for a non-current outcome (`None` when current).
+pub(crate) fn decision_import_freshness_line(
+    root: &Path,
+    outcome: &DecisionImportFreshness,
+    refresh_command: &str,
+) -> Option<String> {
+    let state_db = outcome
+        .state_db
+        .strip_prefix(root)
+        .unwrap_or(&outcome.state_db)
+        .display()
+        .to_string();
+    let source = &outcome.source;
+    match outcome.state {
+        DecisionImportState::Current => None,
+        DecisionImportState::Stale => Some(format!(
+            "graph import `{source}` is stale: agent-doc cached new decisions in {state_db} since it was imported; run `tsift graph-db import --format agent-doc-decisions {} --source {source}` (or bare `tsift status`) to re-import",
+            crate::shell_quote(&state_db)
+        )),
+        DecisionImportState::Reimported => Some(format!(
+            "graph import `{source}` re-imported from {state_db} (agent-doc decision cache changed); run `{refresh_command}` to project it"
+        )),
+        DecisionImportState::Unavailable => Some(format!(
+            "graph import `{source}` kept as stored: could not re-read {state_db}: {}",
+            outcome.detail.as_deref().unwrap_or("unknown error")
+        )),
+    }
+}
+
 pub(crate) fn cmd_graph_db_import(
     options: GraphDbImportOptions<'_>,
     format: crate::output::OutputFormat,

@@ -272,6 +272,23 @@ pub(crate) fn cmd_graph_db_refresh(
     format: OutputFormat,
 ) -> Result<()> {
     ensure_graph_refresh_work_is_bounded(root, path, scope)?;
+    // Catch stored agent-doc decision imports up before the watermark is
+    // taken, so the projection carries the decisions current at refresh time
+    // and a re-lowered import bypasses cached reuse (`#decisiongraphimportrefresh`).
+    let graph_db = graph_substrate_db_path(root, scope);
+    let mut decision_import_lines = Vec::new();
+    for outcome in crate::graph_import::refresh_agent_doc_decision_imports(root, &graph_db, true) {
+        match outcome.state {
+            crate::graph_import::DecisionImportState::Current => {}
+            crate::graph_import::DecisionImportState::Reimported => eprintln!(
+                "graph-db refresh: re-imported agent-doc decisions `{}` (decision cache changed since import)",
+                outcome.source
+            ),
+            _ => decision_import_lines.extend(crate::graph_import::decision_import_freshness_line(
+                root, &outcome, "",
+            )),
+        }
+    }
     let source_watermark = traversal_source_watermark(root, path, scope, false)?;
     let cached_refresh = if rebuild {
         None
@@ -308,7 +325,7 @@ pub(crate) fn cmd_graph_db_refresh(
                 phase_timings,
             )
         };
-    let graph_db = graph_substrate_db_path(root, scope);
+    warnings.extend(decision_import_lines);
     warnings.extend(graph_db_operator_status_warnings(root, scope));
     let warnings = dedupe_preserve_order(warnings);
     let refresh = GraphDbRefreshSummary {
@@ -2850,6 +2867,9 @@ pub(crate) fn cmd_status(path: &std::path::Path, options: StatusCommandOptions) 
             report = status::check_status_with_cache(&root, &status_cache)?;
         }
     }
+    report
+        .reminders
+        .extend(status_agent_doc_decision_imports(&root, auto_fix));
     if options.json_output {
         println!(
             "{}",
@@ -2865,6 +2885,45 @@ pub(crate) fn cmd_status(path: &std::path::Path, options: StatusCommandOptions) 
         print!("{}", status::format_human(&report, options.compact));
     }
     Ok(())
+}
+
+/// Keep stored `agent-doc-decisions` graph imports caught up with the
+/// decisions agent-doc keeps caching (`#decisiongraphimportrefresh`). With
+/// auto-fix a stale import is re-lowered in place; `--no-fix` only reports
+/// it. Never refreshes the graph projection (the next `graph-db refresh`
+/// does), never creates an import, and never fails `status`.
+fn status_agent_doc_decision_imports(root: &Path, auto_fix: bool) -> Vec<String> {
+    let mut graph_dbs = vec![(None, graph_substrate_db_path(root, None))];
+    if let Ok(scopes) = config::Config::submodule_dirs(root) {
+        graph_dbs.extend(scopes.into_iter().map(|scope| {
+            let graph_db = graph_substrate_db_path(root, Some(&scope.id));
+            (Some(scope.id), graph_db)
+        }));
+    }
+    let root_arg = shell_quote(root.to_string_lossy().as_ref());
+    let mut lines = Vec::new();
+    for (scope, graph_db) in graph_dbs {
+        let refresh_command = format!(
+            "tsift graph-db --path {root_arg}{} refresh --json",
+            graph_db_scope_arg(scope.as_deref())
+        );
+        for outcome in
+            crate::graph_import::refresh_agent_doc_decision_imports(root, &graph_db, auto_fix)
+        {
+            if outcome.state == crate::graph_import::DecisionImportState::Reimported {
+                eprintln!(
+                    "status fix: re-imported agent-doc decisions `{}` (decision cache changed since import)",
+                    outcome.source
+                );
+            }
+            lines.extend(crate::graph_import::decision_import_freshness_line(
+                root,
+                &outcome,
+                &refresh_command,
+            ));
+        }
+    }
+    lines
 }
 
 pub(crate) fn cmd_locks(

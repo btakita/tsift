@@ -863,3 +863,170 @@ agent_doc_format: template
     ]);
     assert_eq!(report(&links)["edges"].as_array().map_or(0, Vec::len), 0);
 }
+
+fn stored_import_file(root: &str) -> std::path::PathBuf {
+    let listed = tsift(&["graph-db", "--path", root, "import", "--list", "--json"]);
+    std::path::PathBuf::from(
+        report(&listed)["imports"][0]["stored_file"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no stored import: {listed}")),
+    )
+}
+
+fn status_reminders(root: &str, extra: &[&str]) -> Vec<String> {
+    let mut args = vec!["status", root, "--json"];
+    args.extend_from_slice(extra);
+    let status = tsift(&args);
+    status["reminders"]
+        .as_array()
+        .map(|reminders| {
+            reminders
+                .iter()
+                .filter_map(|reminder| reminder.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn revision_answers(root: &str) -> Vec<String> {
+    let revisions = tsift(&[
+        "graph-db",
+        "--path",
+        root,
+        "kind",
+        "agent_doc_revision",
+        "--json",
+    ]);
+    report(&revisions)["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|node| node["label"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// `#decisiongraphimportrefresh`: the import is a snapshot, so it used to lag
+/// silently as agent-doc cached new decisions (graph freshness stayed
+/// `current`, status said nothing). Bare `tsift status` and `graph-db
+/// refresh` now catch a stored import up, `--no-fix` reports it, and nothing
+/// is rewritten while the decision cache is unchanged, not even when the
+/// controller re-stores the same rows.
+#[test]
+fn agent_doc_decision_import_catches_up_only_when_the_decision_cache_changed() {
+    let project = agent_doc_project();
+    let root = project.path().to_string_lossy().to_string();
+    let state_db = project.path().join(".agent-doc/state.db");
+    tsift(&["graph-db", "--path", &root, "refresh", "--json"]);
+    tsift(&[
+        "graph-db",
+        "--path",
+        &root,
+        "import",
+        "--format",
+        "agent-doc-decisions",
+        "--json",
+    ]);
+    let stored = stored_import_file(&root);
+    let snapshot = fs::read(&stored).unwrap();
+    let digest = |bytes: &[u8]| -> String {
+        let file: Value = serde_json::from_slice(bytes).unwrap();
+        file["properties"]["agent_doc_cache_digest"]
+            .as_str()
+            .unwrap_or_else(|| panic!("import records no cache digest: {file}"))
+            .to_string()
+    };
+    let first_digest = digest(&snapshot);
+
+    // The controller re-stores the same rows every cycle (only bookkeeping
+    // columns move): the import stays current and is not rewritten.
+    let conn = rusqlite::Connection::open(&state_db).unwrap();
+    conn.execute_batch(
+        "UPDATE answer_ledger_nodes SET recorded_at = recorded_at + 100;
+         UPDATE answer_ledger_edges SET recorded_at = recorded_at + 100;",
+    )
+    .unwrap();
+    drop(conn);
+    let reminders = status_reminders(&root, &[]);
+    assert!(
+        !reminders.iter().any(|line| line.contains("graph import")),
+        "{reminders:?}"
+    );
+    assert_eq!(
+        fs::read(&stored).unwrap(),
+        snapshot,
+        "unchanged cache rewrote the import"
+    );
+
+    // A new answer is cached. `--no-fix` reports the stale import and writes nothing.
+    write_agent_doc_state(project.path(), "yes, behind a flag");
+    let before_status = fs::read(&state_db).unwrap();
+    let reminders = status_reminders(&root, &["--no-fix"]);
+    assert!(
+        reminders.iter().any(
+            |line| line.contains("graph import `agent-doc-decisions` is stale")
+                && line.contains("--format agent-doc-decisions")
+        ),
+        "{reminders:?}"
+    );
+    assert_eq!(fs::read(&stored).unwrap(), snapshot);
+    assert_eq!(revision_answers(&root), vec!["yes"]);
+
+    // Bare status re-lowers the stored import in place (never state.db) and
+    // points at the refresh that projects it.
+    let reminders = status_reminders(&root, &[]);
+    assert!(
+        reminders.iter().any(|line| line
+            .contains("graph import `agent-doc-decisions` re-imported")
+            && line.contains("refresh --json")),
+        "{reminders:?}"
+    );
+    assert_eq!(
+        fs::read(&state_db).unwrap(),
+        before_status,
+        "status wrote state.db"
+    );
+    let relowered = fs::read(&stored).unwrap();
+    assert_ne!(relowered, snapshot);
+    assert_ne!(digest(&relowered), first_digest);
+    let relowered_file: Value = serde_json::from_slice(&relowered).unwrap();
+    assert_eq!(relowered_file["imported_from"], ".agent-doc/state.db");
+    assert_eq!(relowered_file["source"], "agent-doc-decisions");
+    tsift(&["graph-db", "--path", &root, "refresh", "--json"]);
+    assert_eq!(revision_answers(&root), vec!["yes, behind a flag"]);
+    // Caught up: the next status is silent and rewrites nothing.
+    let reminders = status_reminders(&root, &[]);
+    assert!(
+        !reminders.iter().any(|line| line.contains("graph import")),
+        "{reminders:?}"
+    );
+    assert_eq!(fs::read(&stored).unwrap(), relowered);
+
+    // `graph-db refresh` alone catches up too, before it takes the watermark.
+    write_agent_doc_state(project.path(), "no");
+    tsift(&["graph-db", "--path", &root, "refresh", "--json"]);
+    assert_eq!(revision_answers(&root), vec!["no"]);
+    let caught_up = fs::read(&stored).unwrap();
+    let again = tsift(&["graph-db", "--path", &root, "refresh", "--json"]);
+    assert_eq!(fs::read(&stored).unwrap(), caught_up);
+    assert_eq!(
+        report(&again)["refresh"]["mode"],
+        "cached_source_watermark_reuse",
+        "an unchanged cache must not invalidate the projection: {again}"
+    );
+
+    // An unreadable state.db keeps the stored import and never fails status.
+    fs::remove_file(&state_db).unwrap();
+    for sidecar in ["state.db-wal", "state.db-shm"] {
+        let _ = fs::remove_file(project.path().join(".agent-doc").join(sidecar));
+    }
+    let reminders = status_reminders(&root, &[]);
+    assert!(
+        reminders
+            .iter()
+            .any(|line| line.contains("kept as stored")
+                && line.contains("no agent-doc state database")),
+        "{reminders:?}"
+    );
+    assert_eq!(fs::read(&stored).unwrap(), caught_up);
+    assert!(!state_db.exists(), "the check must not create state.db");
+}

@@ -64,6 +64,11 @@ pub(crate) const AGENT_DOC_STATE_DB: &str = ".agent-doc/state.db";
 pub(crate) const SCHEMA_ANSWER_LEDGER_EDGES_V1: &str = "agent-doc/answer-ledger-edges/v1";
 /// Cache shape since `#decisiongraph`: typed nodes plus edge provenance.
 pub(crate) const SCHEMA_DECISION_GRAPH_V2: &str = "agent-doc/decision-graph/v2";
+/// Summary-node property recording the digest of the cache rows an import
+/// lowered (`#decisiongraphimportrefresh`), so a later `tsift status` or
+/// `graph-db refresh` can tell whether the decision cache moved on without
+/// lowering it again.
+pub(crate) const CACHE_DIGEST_PROPERTY: &str = "agent_doc_cache_digest";
 
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 /// The controller writes `state.db` continuously; a reader waits briefly for
@@ -357,8 +362,12 @@ fn source_rank(source: &str) -> u8 {
 /// Lower the decision graphs cached in `state_db` into one edge file.
 pub(crate) fn lower_agent_doc_decisions(state_db: &Path, root: &Path) -> Result<EdgeFile> {
     let mut cache = read_cache(state_db)?;
+    // Digest the rows as read, before path-hash naming adds walk results.
+    let digest = cache_digest(&cache);
     let named_by_hash = name_documents_by_path_hash(&mut cache, root);
     let mut file = lower_cache(&cache, root)?;
+    file.properties
+        .insert(CACHE_DIGEST_PROPERTY.to_string(), Value::from(digest));
     if named_by_hash > 0 {
         file.properties.insert(
             "documents_named_by_path_hash".to_string(),
@@ -366,6 +375,64 @@ pub(crate) fn lower_agent_doc_decisions(state_db: &Path, root: &Path) -> Result<
         );
     }
     Ok(file)
+}
+
+/// Digest of the decision cache in `state_db`: one read-only snapshot read of
+/// the same rows [`lower_agent_doc_decisions`] lowers, with no Markdown walk
+/// and no lowering. Equal to the [`CACHE_DIGEST_PROPERTY`] an import recorded
+/// exactly when re-importing would read the same rows with the same tsift.
+pub(crate) fn agent_doc_cache_digest(state_db: &Path) -> Result<String> {
+    Ok(cache_digest(&read_cache(state_db)?))
+}
+
+/// blake3 over the cache rows plus this tsift's version: a tsift upgrade may
+/// lower the same rows differently, so it re-imports once too.
+/// `recorded_at` is not read, so an upsert that changes nothing (agent-doc
+/// re-stores every node each cycle) leaves the digest alone.
+fn cache_digest(cache: &Cache) -> String {
+    fn field(hasher: &mut blake3::Hasher, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                hasher.update(&[1]);
+                hasher.update(&(value.len() as u64).to_le_bytes());
+                hasher.update(value.as_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+    }
+    let mut hasher = blake3::Hasher::new();
+    field(&mut hasher, Some(AGENT_DOC_DECISIONS_ADAPTER));
+    field(&mut hasher, Some(env!("CARGO_PKG_VERSION")));
+    field(&mut hasher, Some(cache.schema));
+    hasher.update(&(cache.edges.len() as u64).to_le_bytes());
+    for edge in &cache.edges {
+        field(&mut hasher, Some(&edge.document_id));
+        field(&mut hasher, Some(&edge.from));
+        field(&mut hasher, Some(&edge.kind));
+        field(&mut hasher, Some(&edge.to));
+        field(&mut hasher, edge.source.as_deref());
+        field(&mut hasher, edge.clause.as_deref());
+    }
+    hasher.update(&(cache.nodes.len() as u64).to_le_bytes());
+    for node in &cache.nodes {
+        let open = node.open.map(|open| if open { "1" } else { "0" });
+        let first_seen_at = node.first_seen_at.map(|at| at.to_string());
+        field(&mut hasher, Some(&node.document_id));
+        field(&mut hasher, Some(&node.id));
+        field(&mut hasher, Some(&node.kind));
+        field(&mut hasher, Some(&node.label));
+        field(&mut hasher, open);
+        field(&mut hasher, node.location.as_deref());
+        field(&mut hasher, first_seen_at.as_deref());
+    }
+    hasher.update(&(cache.paths.len() as u64).to_le_bytes());
+    for (id, path) in &cache.paths {
+        field(&mut hasher, Some(id));
+        field(&mut hasher, Some(path));
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 /// agent-doc's document id: SHA-256 hex of the canonical path string
@@ -977,6 +1044,43 @@ mod tests {
         let document = node(&file, &format!("document:{id}"));
         assert_eq!(document.label.as_deref(), Some("tasks/plan.md"));
         assert_eq!(file.properties["documents_named_by_path_hash"], 1);
+    }
+
+    #[test]
+    fn cache_digest_tracks_decision_rows_not_bookkeeping() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE answer_ledger_edges (document_id TEXT NOT NULL, from_id TEXT NOT NULL,
+                kind TEXT NOT NULL, to_id TEXT NOT NULL, recorded_at INTEGER NOT NULL);
+             CREATE TABLE answer_ledger_nodes (document_id TEXT NOT NULL, node_id TEXT NOT NULL,
+                kind TEXT NOT NULL, label TEXT NOT NULL, open INTEGER, location TEXT,
+                first_seen_at INTEGER, recorded_at INTEGER NOT NULL);
+             INSERT INTO answer_ledger_nodes VALUES ('d', 'dec-1', 'decision', 'Ship?', 1, NULL, 5, 1);
+             INSERT INTO answer_ledger_edges VALUES ('d', 'dec-1@a', 'answers', 'dec-1', 1);",
+        )
+        .unwrap();
+        let digest = agent_doc_cache_digest(&db).unwrap();
+        let file = lower_agent_doc_decisions(&db, dir.path()).unwrap();
+        assert_eq!(file.properties[CACHE_DIGEST_PROPERTY], digest.as_str());
+
+        conn.execute_batch(
+            "UPDATE answer_ledger_nodes SET recorded_at = 99;
+             UPDATE answer_ledger_edges SET recorded_at = 99;",
+        )
+        .unwrap();
+        assert_eq!(agent_doc_cache_digest(&db).unwrap(), digest);
+
+        conn.execute_batch("UPDATE answer_ledger_nodes SET open = 0")
+            .unwrap();
+        let closed = agent_doc_cache_digest(&db).unwrap();
+        assert_ne!(closed, digest);
+        conn.execute_batch(
+            "INSERT INTO answer_ledger_edges VALUES ('d', 'dec-1@b', 'answers', 'dec-1', 1)",
+        )
+        .unwrap();
+        assert_ne!(agent_doc_cache_digest(&db).unwrap(), closed);
     }
 
     #[test]
