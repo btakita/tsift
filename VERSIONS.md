@@ -6,7 +6,7 @@ Canonical binary version source: `Cargo.toml` `package.version`. The CLI exposes
 
 Use `BREAKING CHANGE:` prefix in version entries to flag incompatible changes.
 
-## Unreleased
+## 0.1.110
 
 - **Index agent-doc decision graphs across documents (`#decisiongraphtsift`).** `tsift graph-db import --format agent-doc-decisions [STATE_DB]` (also detected by `--format auto` from the SQLite header; FILE defaults to `.agent-doc/state.db`) reads agent-doc's cached `answer_ledger_nodes`/`answer_ledger_edges` read-only in one snapshot, recognizes the v1 (edges-only) and v2 (`#decisiongraph`) cache shapes and refuses unknown ones, and lowers every document's decision graph into one stored import: document-local `agent_doc_decision`/`agent_doc_revision` nodes, shared `agent_doc_question`/`agent_doc_item`/`agent_doc_evidence` nodes per id, `agent_doc_document` nodes joined to the indexed session markdown files, and agent-doc's typed edges with their `edge_source`/`clause`. An item reference to a decision exactly one other document owns resolves to that decision, so `depends_on` crosses documents. agent-doc does not depend on the import. See specs/graph.md "agent-doc decision-graph adapter".
 - **Persist the worktree artifact CAS and manifests (`#caspublish`).** `tsift-index::worktree_store::WorktreeStore` now publishes immutable artifacts and commit/tree manifests with synced, no-clobber atomic writes; conflicting bytes at one address fail closed. Dirty-overlay manifests are atomically replaced behind checkout-local sidecar locks, revalidate their stored identity on reads, and ignore abandoned temporary files.
