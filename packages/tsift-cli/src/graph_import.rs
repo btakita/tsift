@@ -18,7 +18,9 @@
 //! counted rather than rejected.
 //!
 //! haiven-sdk's `codegen/trace.json` is accepted natively through a small
-//! adapter that lowers it into the generic shape (see [`lower_haiven_trace`]).
+//! adapter that lowers it into the generic shape (see [`lower_haiven_trace`]),
+//! and so is agent-doc's `.agent-doc/state.db` decision-graph cache, read
+//! read-only (see [`crate::agent_doc_decisions`]).
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -134,6 +136,7 @@ pub(crate) enum ImportFormat {
     Auto,
     Edges,
     HaivenTrace,
+    AgentDocDecisions,
 }
 
 /// Per-source resolution counts, also stored on the source's summary node.
@@ -223,6 +226,29 @@ pub(crate) fn graph_import_watermark_parts(graph_db: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Parse an import file in `format` like [`parse_edge_file`], also accepting
+/// agent-doc's SQLite `state.db` (`--format agent-doc-decisions`, or `auto`
+/// on a file with the SQLite header). `root` relativizes the session
+/// document paths that database records.
+pub(crate) fn parse_import_file(
+    root: &Path,
+    file: &Path,
+    format: ImportFormat,
+    source_override: Option<&str>,
+    default_source: &str,
+) -> Result<EdgeFile> {
+    let agent_doc = match format {
+        ImportFormat::AgentDocDecisions => true,
+        ImportFormat::Auto => crate::agent_doc_decisions::is_sqlite_file(file),
+        _ => false,
+    };
+    if !agent_doc {
+        return parse_edge_file(file, format, source_override, default_source);
+    }
+    let lowered = crate::agent_doc_decisions::lower_agent_doc_decisions(file, root)?;
+    finish_edge_file(lowered, source_override, default_source)
+}
+
 /// Parse an import file in `format`, lowering adapter formats into an
 /// [`EdgeFile`]. `source_override` wins over the file's own `source`, which
 /// wins over `default_source`.
@@ -232,6 +258,12 @@ pub(crate) fn parse_edge_file(
     source_override: Option<&str>,
     default_source: &str,
 ) -> Result<EdgeFile> {
+    if format == ImportFormat::AgentDocDecisions {
+        bail!(
+            "{} is read by `parse_import_file`, not as an edge file",
+            file.display()
+        );
+    }
     let text = fs::read_to_string(file)
         .with_context(|| format!("reading edge file {}", file.display()))?;
     let value: Value = serde_json::from_str(&text)
@@ -241,7 +273,7 @@ pub(crate) fn parse_edge_file(
         ImportFormat::Auto => ImportFormat::Edges,
         other => other,
     };
-    let mut edge_file = match format {
+    let edge_file = match format {
         ImportFormat::HaivenTrace => {
             let model = file
                 .parent()
@@ -281,6 +313,15 @@ pub(crate) fn parse_edge_file(
             parsed
         }
     };
+    finish_edge_file(edge_file, source_override, default_source)
+}
+
+/// Stamp the format, settle the source id, and validate.
+fn finish_edge_file(
+    mut edge_file: EdgeFile,
+    source_override: Option<&str>,
+    default_source: &str,
+) -> Result<EdgeFile> {
     edge_file.format = Some(GRAPH_EDGES_FORMAT.to_string());
     let source = source_override
         .map(str::to_string)
@@ -686,6 +727,7 @@ impl From<crate::cli::GraphImportFormat> for ImportFormat {
             crate::cli::GraphImportFormat::Auto => ImportFormat::Auto,
             crate::cli::GraphImportFormat::Edges => ImportFormat::Edges,
             crate::cli::GraphImportFormat::HaivenTrace => ImportFormat::HaivenTrace,
+            crate::cli::GraphImportFormat::AgentDocDecisions => ImportFormat::AgentDocDecisions,
         }
     }
 }
@@ -830,9 +872,13 @@ pub(crate) fn cmd_graph_db_import(
     } else if options.remove {
         let source = match (options.source, options.file) {
             (Some(source), _) => source.to_string(),
+            (None, None) if options.format == ImportFormat::AgentDocDecisions => {
+                crate::agent_doc_decisions::AGENT_DOC_DECISIONS_SOURCE.to_string()
+            }
             (None, Some(file)) => {
                 let file = resolve_import_file(root, file);
-                parse_edge_file(
+                parse_import_file(
+                    root,
                     &file,
                     options.format,
                     None,
@@ -853,14 +899,18 @@ pub(crate) fn cmd_graph_db_import(
         fs::remove_file(&stored).with_context(|| format!("removing {}", stored.display()))?;
         ("remove", true)
     } else {
-        let file = resolve_import_file(
-            root,
-            options
-                .file
-                .context("graph-db import needs FILE (or --list / --remove)")?,
-        );
+        // `--format agent-doc-decisions` defaults FILE to the project's
+        // agent-doc controller database.
+        let file = match options.file {
+            Some(file) => resolve_import_file(root, file),
+            None if options.format == ImportFormat::AgentDocDecisions => {
+                crate::agent_doc_decisions::default_state_db(root)
+            }
+            None => bail!("graph-db import needs FILE (or --list / --remove)"),
+        };
         let file = file.as_path();
-        let mut edge_file = parse_edge_file(
+        let mut edge_file = parse_import_file(
+            root,
             file,
             options.format,
             options.source,
@@ -930,6 +980,19 @@ pub(crate) fn cmd_graph_db_import(
         ));
         next_commands.push(format!(
             "tsift graph-db --path {root_arg}{scope_arg} neighborhood <contract-node-id> --depth 2 --json  # declarations + carrying frames + conformance scenarios"
+        ));
+    }
+    if imports.iter().any(|entry| {
+        entry.adapter.as_deref() == Some(crate::agent_doc_decisions::AGENT_DOC_DECISIONS_ADAPTER)
+    }) {
+        next_commands.push(format!(
+            "tsift graph-db --path {root_arg}{scope_arg} kind agent_doc_decision --json  # decisions across documents"
+        ));
+        next_commands.push(format!(
+            "tsift graph-db --path {root_arg}{scope_arg} kind agent_doc_item --property ref_id=<id> --json  # one backlog/item id"
+        ));
+        next_commands.push(format!(
+            "tsift graph-db --path {root_arg}{scope_arg} incident <node-id> --json  # decisions, documents and evidence touching it"
         ));
     }
 

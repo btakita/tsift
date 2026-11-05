@@ -479,3 +479,242 @@ fn haiven_trace_without_contracts_lock_still_imports() {
         "{imported}"
     );
 }
+
+/// A project whose agent-doc controller cached decision graphs for two
+/// session documents (`#decisiongraphtsift`): `tasks/b.md` depends on a
+/// decision only `tasks/a.md` owns, and both mention item `shipx`.
+fn agent_doc_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    git(root, &["init", "-q"]);
+    fs::create_dir_all(root.join("tasks")).unwrap();
+    fs::create_dir_all(root.join(".agent-doc")).unwrap();
+    fs::write(root.join("tasks/a.md"), "# A\n\n- [#shipx] ship x\n").unwrap();
+    fs::write(root.join("tasks/b.md"), "# B\n\nsee [#shipx]\n").unwrap();
+    write_agent_doc_state(root, "yes");
+    dir
+}
+
+/// agent-doc-sqlite `answer_ledger_index` DDL (`#decisiongraph`) plus the
+/// controller's `documents` table, in WAL mode like the live controller.
+fn write_agent_doc_state(root: &Path, answer: &str) {
+    let canonical = fs::canonicalize(root).unwrap();
+    let conn = rusqlite::Connection::open(root.join(".agent-doc/state.db")).unwrap();
+    conn.execute_batch(
+        r#"
+        PRAGMA journal_mode = WAL;
+        DROP TABLE IF EXISTS answer_ledger_edges;
+        DROP TABLE IF EXISTS answer_ledger_nodes;
+        DROP TABLE IF EXISTS documents;
+        CREATE TABLE answer_ledger_edges (
+            document_id TEXT NOT NULL, from_id TEXT NOT NULL, kind TEXT NOT NULL,
+            to_id TEXT NOT NULL, recorded_at INTEGER NOT NULL,
+            source TEXT NOT NULL DEFAULT 'derived', clause TEXT,
+            PRIMARY KEY (document_id, from_id, kind, to_id));
+        CREATE TABLE answer_ledger_nodes (
+            document_id TEXT NOT NULL, node_id TEXT NOT NULL, kind TEXT NOT NULL,
+            label TEXT NOT NULL, open INTEGER, location TEXT, first_seen_at INTEGER,
+            recorded_at INTEGER NOT NULL, PRIMARY KEY (document_id, node_id));
+        CREATE TABLE documents (document_id TEXT PRIMARY KEY, canonical_path TEXT NOT NULL);
+        INSERT INTO answer_ledger_nodes VALUES
+            ('da', 'dec-1', 'decision', 'Ship X?', 0, NULL, 5, 1),
+            ('da', 'shipx', 'item', 'ship x', 1, NULL, 5, 1),
+            ('db', 'dec-2', 'decision', 'When?', 1, NULL, 6, 1),
+            ('db', 'shipx', 'item', '', 1, NULL, 6, 1);
+        INSERT INTO answer_ledger_edges VALUES
+            ('da', 'dec-1', 'applies_to', 'shipx', 1, 'derived', NULL),
+            ('db', 'dec-2', 'applies_to', 'shipx', 1, 'derived', NULL),
+            ('db', 'dec-2', 'depends_on', 'dec-1', 1, 'operator', NULL);
+        "#,
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO answer_ledger_nodes VALUES ('da', 'dec-1@r', 'revision', ?1, NULL, 'queue row', 5, 1)",
+        [answer],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO answer_ledger_edges VALUES ('da', 'dec-1@r', 'answers', 'dec-1', 1, 'derived', NULL)",
+        [],
+    )
+    .unwrap();
+    for (id, name) in [("da", "tasks/a.md"), ("db", "tasks/b.md")] {
+        conn.execute(
+            "INSERT INTO documents VALUES (?1, ?2)",
+            [id, canonical.join(name).to_string_lossy().as_ref()],
+        )
+        .unwrap();
+    }
+}
+
+fn decision_id(root: &str, ref_id: &str) -> String {
+    let decisions = tsift(&[
+        "graph-db",
+        "--path",
+        root,
+        "kind",
+        "agent_doc_decision",
+        "--property",
+        &format!("ref_id={ref_id}"),
+        "--json",
+    ]);
+    report(&decisions)["nodes"][0]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("decision {ref_id} missing: {decisions}"))
+        .to_string()
+}
+
+#[test]
+fn agent_doc_decision_cache_imports_read_only_and_traverses_across_documents() {
+    let project = agent_doc_project();
+    let root = project.path().to_string_lossy().to_string();
+    let state_db = project.path().join(".agent-doc/state.db");
+    tsift(&["graph-db", "--path", &root, "refresh", "--json"]);
+    let before = fs::read(&state_db).unwrap();
+
+    // FILE defaults to the project's .agent-doc/state.db.
+    let imported = tsift(&[
+        "graph-db",
+        "--path",
+        &root,
+        "import",
+        "--format",
+        "agent-doc-decisions",
+        "--json",
+    ]);
+    assert_eq!(
+        fs::read(&state_db).unwrap(),
+        before,
+        "import must not write state.db"
+    );
+    let entry = &report(&imported)["imports"][0];
+    assert_eq!(entry["source"], "agent-doc-decisions", "{imported}");
+    assert_eq!(entry["adapter"], "agent-doc-decisions");
+    assert_eq!(entry["imported_from"], ".agent-doc/state.db");
+    let projected = &entry["projected"];
+    assert_eq!(projected["agent_doc_schema"], "agent-doc/decision-graph/v2");
+    assert_eq!(projected["agent_doc_documents"], "2");
+    // Both session documents join their indexed markdown file nodes.
+    assert_eq!(projected["joined_nodes"], "2", "{imported}");
+    assert_eq!(projected["external_endpoints"], "0", "{imported}");
+
+    // From b.md's decision: its operator dependency on a.md's decision, the
+    // shared item, and both indexed session files.
+    let dec2 = decision_id(&root, "dec-2");
+    let dec1 = decision_id(&root, "dec-1");
+    let hood = neighborhood(&root, &dec2);
+    let labels = node_labels(&hood);
+    for expected in [
+        ("agent_doc_decision", "Ship X?"),
+        ("agent_doc_item", "ship x"),
+        ("file", "tasks/a.md"),
+        ("file", "tasks/b.md"),
+    ] {
+        assert!(
+            labels.contains(&(expected.0.to_string(), expected.1.to_string())),
+            "{expected:?} missing from {labels:?}"
+        );
+    }
+    let depends = report(&hood)["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|edge| edge["kind"] == "depends_on")
+        .unwrap_or_else(|| panic!("depends_on edge missing: {hood}"));
+    assert_eq!(depends["from_id"], dec2.as_str());
+    assert_eq!(depends["to_id"], dec1.as_str());
+    assert_eq!(depends["properties"]["edge_source"], "operator");
+
+    // `auto` recognizes the SQLite file; re-importing is idempotent.
+    let count_edges = |root: &str| -> usize {
+        let edges = tsift(&[
+            "graph-db",
+            "--path",
+            root,
+            "edges",
+            "--property",
+            "import_source=agent-doc-decisions",
+            "--limit",
+            "0",
+            "--json",
+        ]);
+        report(&edges)["edges"].as_array().map_or(0, Vec::len)
+    };
+    let edges_before = count_edges(&root);
+    assert!(edges_before > 0);
+    let reimport = tsift(&[
+        "graph-db",
+        "--path",
+        &root,
+        "import",
+        ".agent-doc/state.db",
+        "--json",
+    ]);
+    assert_eq!(
+        report(&reimport)["imports"][0]["adapter"],
+        "agent-doc-decisions"
+    );
+    assert_eq!(
+        count_edges(&root),
+        edges_before,
+        "re-import must be idempotent"
+    );
+
+    // A changed cache replaces the snapshot: the new answer is what projects.
+    write_agent_doc_state(project.path(), "yes, behind a flag");
+    tsift(&[
+        "graph-db",
+        "--path",
+        &root,
+        "import",
+        "--format",
+        "agent-doc-decisions",
+        "--json",
+    ]);
+    let revisions = tsift(&[
+        "graph-db",
+        "--path",
+        &root,
+        "kind",
+        "agent_doc_revision",
+        "--json",
+    ]);
+    let answers: Vec<&str> = report(&revisions)["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|node| node["label"].as_str())
+        .collect();
+    assert_eq!(answers, vec!["yes, behind a flag"]);
+
+    // The snapshot is optional: removing it drops every row.
+    tsift(&[
+        "graph-db",
+        "--path",
+        &root,
+        "import",
+        "--remove",
+        "--format",
+        "agent-doc-decisions",
+        "--json",
+    ]);
+    assert_eq!(count_edges(&root), 0);
+}
+
+#[test]
+fn agent_doc_import_without_a_state_db_fails_without_creating_one() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    let root = dir.path().to_string_lossy().to_string();
+    let stderr = tsift_fails(&[
+        "graph-db",
+        "--path",
+        &root,
+        "import",
+        "--format",
+        "agent-doc-decisions",
+        "--json",
+    ]);
+    assert!(stderr.contains("no agent-doc state database"), "{stderr}");
+    assert!(!dir.path().join(".agent-doc").exists());
+}

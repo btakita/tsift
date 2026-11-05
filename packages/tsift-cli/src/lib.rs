@@ -8,6 +8,7 @@ mod ast_navigation_tests;
 #[cfg(test)]
 mod kotlin_grammar_link_tests;
 
+mod agent_doc_decisions;
 mod cli;
 mod commands;
 mod community_detection;

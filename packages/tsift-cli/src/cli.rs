@@ -2008,6 +2008,8 @@ pub enum GraphImportFormat {
     Auto,
     Edges,
     HaivenTrace,
+    /// agent-doc's `.agent-doc/state.db` decision-graph cache, read read-only
+    AgentDocDecisions,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -2069,14 +2071,14 @@ pub enum GraphDbQuery {
         #[arg(long)]
         replace: bool,
     },
-    /// Import an external edge file (tsift-graph-edges/v1 JSON, or a haiven-sdk codegen trace.json) into graph.db; re-importing the same source replaces it
+    /// Import an external edge file (tsift-graph-edges/v1 JSON, a haiven-sdk codegen trace.json, or an agent-doc state.db decision-graph cache) into graph.db; re-importing the same source replaces it
     Import {
-        /// Edge file to import. See specs/graph-db-import.md for the format.
+        /// Edge file to import (tsift-graph-edges/v1 JSON, a haiven-sdk trace.json, or an agent-doc state.db). See specs/graph.md "External Edge Import". Defaults to `.agent-doc/state.db` with --format agent-doc-decisions.
         file: Option<PathBuf>,
         /// Stable source id for this import (default: the file's `source`, else its root-relative path). Re-importing a source replaces its rows.
         #[arg(long)]
         source: Option<String>,
-        /// Input format; `auto` detects a haiven-sdk trace.json and otherwise reads tsift-graph-edges/v1
+        /// Input format; `auto` detects a haiven-sdk trace.json or an agent-doc SQLite state.db and otherwise reads tsift-graph-edges/v1
         #[arg(long, value_enum, default_value = "auto")]
         format: GraphImportFormat,
         /// Remove the stored import for --source (or FILE's source) instead of importing
