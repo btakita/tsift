@@ -1122,17 +1122,35 @@ pub(crate) fn cmd_search_worker(
     output: &Path,
     fts_index_fresh: Option<bool>,
     target: SearchTargetPaths<'_>,
+    federated: bool,
+    degraded_labels: &[String],
 ) -> Result<()> {
     maybe_apply_search_worker_test_hooks()?;
-    let response = run_sift_search(
-        path,
-        cache_dir,
-        query,
-        limit,
-        strategy,
-        fts_index_fresh,
-        target,
-    )?;
+    let response = if federated {
+        // `timeout_secs = 0` keeps this process on the in-process loop. The
+        // parent owns the deadline and kills this process when it expires.
+        let degraded = degraded_labels.iter().cloned().collect::<HashSet<_>>();
+        federated_sift_search(
+            path,
+            cache_dir,
+            query,
+            limit,
+            0,
+            strategy,
+            fts_index_fresh,
+            &degraded,
+        )?
+    } else {
+        run_sift_search(
+            path,
+            cache_dir,
+            query,
+            limit,
+            strategy,
+            fts_index_fresh,
+            target,
+        )?
+    };
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
     }

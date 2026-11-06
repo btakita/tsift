@@ -7483,6 +7483,162 @@ fn timed_federated_search_uses_each_scopes_own_index() {
     assert!(!rendered.contains("notes.txt"), "{rendered}");
 }
 
+// A timed workspace search used to start one `__search-worker` per scope. Each
+// worker is a full tsift process, so a few hundred scopes spent more time
+// starting processes than searching. Fresh FTS scopes stay in the parent.
+#[test]
+fn timed_federated_search_runs_fresh_scopes_in_process() {
+    let dir = indexed_workspace_cli_fixture();
+    let root = dir.path().to_str().unwrap();
+    let spawn_count = dir.path().join("spawn-count");
+
+    let output = tsift_bin()
+        .env("TSIFT_TEST_SEARCH_WORKER_SPAWN_COUNT_FILE", &spawn_count)
+        .env(
+            "TSIFT_TEST_SEARCH_WORKER_PID_FILE",
+            dir.path().join("worker.pid"),
+        )
+        .args([
+            "search",
+            "fn",
+            "--strategy",
+            "lexical",
+            "--path",
+            root,
+            "--timeout",
+            "30",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(rendered.contains("src/alpha/lib.rs"), "{rendered}");
+    assert!(rendered.contains("src/beta/lib.rs"), "{rendered}");
+    assert!(
+        !spawn_count.exists(),
+        "fresh federated search must not spawn a search worker"
+    );
+    assert!(
+        !dir.path().join("worker.pid").exists(),
+        "fresh federated search must not start __search-worker"
+    );
+}
+
+// The shared deadline stops the in-process loop. One sleep past `--timeout`
+// must not be followed by a search of every remaining scope, and it must not
+// fall back to a worker.
+#[test]
+fn timed_federated_search_shares_one_deadline_across_scopes() {
+    let dir = indexed_workspace_cli_fixture();
+    let root = dir.path().to_str().unwrap();
+    let spawn_count = dir.path().join("spawn-count");
+    let scope_log = dir.path().join("scopes.log");
+
+    let started = Instant::now();
+    let output = tsift_bin()
+        .env("TSIFT_TEST_SEARCH_WORKER_SPAWN_COUNT_FILE", &spawn_count)
+        .env("TSIFT_TEST_FEDERATED_SCOPE_LOG", &scope_log)
+        .env("TSIFT_TEST_FEDERATED_SCOPE_SLEEP_MS", "1200")
+        .args([
+            "search",
+            "fn",
+            "--strategy",
+            "lexical",
+            "--path",
+            root,
+            "--timeout",
+            "1",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        !output.status.success(),
+        "expected the shared deadline to fail the search"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("timed out after 1s"), "{stderr}");
+    let log = fs::read_to_string(&scope_log).unwrap_or_default();
+    assert_eq!(
+        log.lines().count(),
+        1,
+        "only the scope that crossed the deadline should start, got {log:?}"
+    );
+    assert!(
+        !spawn_count.exists(),
+        "the deadline must be enforced in-process"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the search should stop after the first scope, not walk every scope"
+    );
+}
+
+// A scope a writer holds still falls back to the live rebuild, but that walk
+// shares one helper with the rest of the federation instead of one process
+// per scope.
+#[test]
+fn timed_federated_search_uses_one_worker_when_a_scope_is_locked() {
+    let dir = indexed_workspace_cli_fixture();
+    let alpha_db = dir.path().join(".tsift/indexes/alpha/index.db");
+    assert!(
+        alpha_db.exists(),
+        "expected the alpha scope index at {}",
+        alpha_db.display()
+    );
+    fs::write(
+        dir.path().join("src/alpha/extra.rs"),
+        "fn extra_alpha() {}\n",
+    )
+    .unwrap();
+    let _lock = hold_writer_lock(&alpha_db.with_file_name("index.lock"));
+    let spawn_count = dir.path().join("spawn-count");
+
+    let output = tsift_bin()
+        .env("TSIFT_TEST_SEARCH_WORKER_SPAWN_COUNT_FILE", &spawn_count)
+        .args([
+            "search",
+            "fn",
+            "--strategy",
+            "lexical",
+            "--path",
+            dir.path().to_str().unwrap(),
+            "--timeout",
+            "30",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        rendered.contains("extra.rs"),
+        "the locked scope must still be searched: {rendered}"
+    );
+    assert!(
+        rendered.contains("src/beta/lib.rs"),
+        "fresh scopes must still contribute hits: {rendered}"
+    );
+    let count = fs::read_to_string(&spawn_count).unwrap_or_else(|_| "0".to_string());
+    assert_eq!(
+        count.trim(),
+        "1",
+        "a locked scope shares one worker with the federation, count={count}"
+    );
+}
+
 // The live fallback at a workspace root has to skip the scopes under it: walking
 // them outlasted the search's own timeout, and it took the whole federated search
 // down with it.
