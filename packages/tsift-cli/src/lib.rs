@@ -508,6 +508,8 @@ pub fn run() -> Result<()> {
             fts_db,
             excluded_roots,
             lang,
+            federated,
+            degraded_label,
         }) => cmd_search_worker(
             &path,
             &cache_dir,
@@ -521,6 +523,8 @@ pub fn run() -> Result<()> {
                 excluded_roots: &excluded_roots,
             },
             &lang,
+            federated,
+            &degraded_label,
         ),
         Some(Commands::DigestRunner {
             kind,
@@ -29169,6 +29173,63 @@ tier = "isolated"
     }
 
     #[test]
+    fn fresh_federated_scopes_run_in_process_and_share_one_deadline() {
+        let dir = setup_workspace();
+        index_workspace(dir.path());
+        let targets = resolve_search_index_targets(dir.path(), dir.path(), None, true).unwrap();
+        assert!(
+            targets.len() >= 3,
+            "workspace root plus both scopes, got {}",
+            targets.len()
+        );
+        assert!(federated_targets_run_in_process(
+            &targets,
+            Some(true),
+            &HashSet::new()
+        ));
+        let degraded = HashSet::from([targets[1].label.clone()]);
+        assert!(
+            !federated_targets_run_in_process(&targets, Some(false), &degraded),
+            "a scope that cannot use FTS must not take the per-scope worker path"
+        );
+
+        let response = federated_sift_search_in_process(
+            dir.path(),
+            &dir.path().join(".tsift/search-cache"),
+            "fn",
+            10,
+            "lexical",
+            Some(true),
+            &HashSet::new(),
+            &targets,
+            Some(Instant::now() + Duration::from_secs(30)),
+            30,
+        )
+        .unwrap();
+        assert_eq!(hit_adapter(&response, "src/alpha/lib.rs"), FTS_ADAPTER);
+        assert_eq!(hit_adapter(&response, "src/beta/lib.rs"), FTS_ADAPTER);
+
+        let err = federated_sift_search_in_process(
+            dir.path(),
+            &dir.path().join(".tsift/search-cache"),
+            "fn",
+            10,
+            "lexical",
+            Some(true),
+            &HashSet::new(),
+            &targets,
+            Some(Instant::now().checked_sub(Duration::from_secs(1)).unwrap()),
+            1,
+        )
+        .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("timed out after 1s"),
+            "a deadline that has already passed must stop before the next scope: {message}"
+        );
+    }
+
+    #[test]
     fn federated_search_degrades_only_the_scope_a_writer_holds() {
         let dir = setup_workspace();
         index_workspace(dir.path());
@@ -37327,6 +37388,167 @@ fn merge_search_responses(
     }
 }
 
+fn federated_target_fresh(
+    label: &str,
+    fts_index_fresh: Option<bool>,
+    degraded_labels: &HashSet<String>,
+) -> Option<bool> {
+    if degraded_labels.contains(label) {
+        Some(false)
+    } else {
+        fts_index_fresh.map(|_| true)
+    }
+}
+
+/// `Some(true)` and a database on disk is an FTS query. A live rebuild (FTS
+/// forced off, freshness unknown, or the database missing) can walk the tree,
+/// so those federations share one killable helper instead of one per scope.
+fn federated_scope_runs_in_process(db_path: &Path, fresh: Option<bool>) -> bool {
+    if fts_search_forced_off() {
+        return false;
+    }
+    matches!(fresh, Some(true)) && db_path.exists()
+}
+
+fn federated_targets_run_in_process(
+    targets: &[SearchIndexTarget],
+    fts_index_fresh: Option<bool>,
+    degraded_labels: &HashSet<String>,
+) -> bool {
+    targets.iter().all(|target| {
+        let fresh = federated_target_fresh(&target.label, fts_index_fresh, degraded_labels);
+        federated_scope_runs_in_process(&target.db_path, fresh)
+    })
+}
+
+fn finish_federated_scope_response(
+    mut response: sift::SearchResponse,
+    root: &Path,
+    source_root: &Path,
+    excluded_roots: &[PathBuf],
+    query: &str,
+) -> sift::SearchResponse {
+    // Rank-derived FTS scores restart at every scope; the line-match score
+    // is the one that means the same thing across them.
+    if response.strategy == sift::FTS_STRATEGY {
+        for hit in &mut response.hits {
+            hit.score = sift::line_match_score(&hit.snippet, query);
+        }
+    }
+    absolutize_search_hit_paths(&mut response, source_root);
+    if !excluded_roots.is_empty() {
+        response.hits.retain(|hit| {
+            let path = Path::new(&hit.path);
+            !excluded_roots
+                .iter()
+                .any(|excluded| path.starts_with(excluded))
+        });
+    }
+    response.root = root.display().to_string();
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+fn federated_sift_search_in_process(
+    root: &Path,
+    cache_dir: &Path,
+    query: &str,
+    limit: usize,
+    strategy: &str,
+    fts_index_fresh: Option<bool>,
+    degraded_labels: &HashSet<String>,
+    targets: &[SearchIndexTarget],
+    languages: &[String],
+    deadline: Option<Instant>,
+    timeout_secs: u64,
+) -> Result<sift::SearchResponse> {
+    let mut responses = Vec::with_capacity(targets.len());
+    for target in targets {
+        // Sleep and the scope log happen before the deadline check, so a test
+        // can show that a later scope never starts.
+        maybe_apply_federated_scope_test_hook()?;
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            bail!(
+                "{}",
+                search_timeout_message(timeout_secs, strategy, targets)?
+            );
+        }
+        let target_fresh = federated_target_fresh(&target.label, fts_index_fresh, degraded_labels);
+        let response = run_sift_search(
+            &target.source_root,
+            cache_dir,
+            query,
+            limit,
+            strategy,
+            target_fresh,
+            SearchTargetPaths {
+                fts_db: Some(target.db_path.as_path()),
+                excluded_roots: &target.excluded_roots,
+            },
+            languages,
+        )?;
+        responses.push(finish_federated_scope_response(
+            response,
+            root,
+            &target.source_root,
+            &target.excluded_roots,
+            query,
+        ));
+    }
+    Ok(merge_search_responses(root, strategy, limit, responses))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_federated_search_worker(
+    root: &Path,
+    cache_dir: &Path,
+    query: &str,
+    limit: usize,
+    timeout_secs: u64,
+    strategy: &str,
+    fts_index_fresh: Option<bool>,
+    degraded_labels: &HashSet<String>,
+    targets: &[SearchIndexTarget],
+    languages: &[String],
+) -> Result<sift::SearchResponse> {
+    let output_path = next_search_worker_output_path();
+    let mut command = Command::new(
+        std::env::current_exe().context("resolving tsift executable for timed search")?,
+    );
+    command
+        .arg("__search-worker")
+        .arg("--federated")
+        .arg("--path")
+        .arg(root)
+        .arg("--cache-dir")
+        .arg(cache_dir)
+        .arg("--query")
+        .arg(query)
+        .arg("--limit")
+        .arg(limit.to_string())
+        .arg("--strategy")
+        .arg(strategy)
+        .arg("--output")
+        .arg(&output_path);
+    if let Some(fresh) = fts_index_fresh {
+        command.arg("--fts-index-fresh").arg(fresh.to_string());
+    }
+    for label in degraded_labels {
+        command.arg("--degraded-label").arg(label);
+    }
+    for language in languages {
+        command.arg("--lang").arg(language);
+    }
+    note_search_worker_spawn()?;
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawning timed federated search worker")?;
+    finish_timed_search_worker(child, &output_path, timeout_secs, strategy, targets)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn federated_sift_search(
     root: &Path,
@@ -37359,46 +37581,41 @@ pub(crate) fn federated_sift_search(
         return Ok(empty_search_response(root, strategy));
     }
 
-    let mut responses = Vec::with_capacity(targets.len());
-    for target in &targets {
-        let target_fresh = if degraded_labels.contains(&target.label) {
-            Some(false)
-        } else {
-            fts_index_fresh.map(|_| true)
-        };
-        let mut response = run_search_with_timeout(
-            &target.source_root,
+    // One process per scope was most of a workspace search: each helper is a
+    // full tsift process. Fresh FTS scopes stay in this process and share the
+    // deadline. A live tree walk still needs a killable helper, but the
+    // federation gets one of those, not one per scope.
+    if timeout_secs > 0
+        && !federated_targets_run_in_process(&targets, fts_index_fresh, degraded_labels)
+    {
+        return run_federated_search_worker(
+            root,
             cache_dir,
             query,
             limit,
             timeout_secs,
             strategy,
-            std::slice::from_ref(target),
-            target_fresh,
+            fts_index_fresh,
+            degraded_labels,
+            &targets,
             languages,
-        )?;
-        // Rank-derived FTS scores restart at every scope; the line-match score
-        // is the one that means the same thing across them.
-        if response.strategy == sift::FTS_STRATEGY {
-            for hit in &mut response.hits {
-                hit.score = sift::line_match_score(&hit.snippet, query);
-            }
-        }
-        absolutize_search_hit_paths(&mut response, &target.source_root);
-        if !target.excluded_roots.is_empty() {
-            response.hits.retain(|hit| {
-                let path = Path::new(&hit.path);
-                !target
-                    .excluded_roots
-                    .iter()
-                    .any(|excluded| path.starts_with(excluded))
-            });
-        }
-        response.root = root.display().to_string();
-        responses.push(response);
+        );
     }
 
-    Ok(merge_search_responses(root, strategy, limit, responses))
+    let deadline = (timeout_secs > 0).then(|| Instant::now() + Duration::from_secs(timeout_secs));
+    federated_sift_search_in_process(
+        root,
+        cache_dir,
+        query,
+        limit,
+        strategy,
+        fts_index_fresh,
+        degraded_labels,
+        &targets,
+        languages,
+        deadline,
+        timeout_secs,
+    )
 }
 
 /// Federated symbol search across every scoped `.tsift/indexes/<scope>/index.db`
@@ -37863,13 +38080,23 @@ pub(crate) fn run_search_with_timeout(
     for language in languages {
         command.arg("--lang").arg(language);
     }
-    let mut child = command
+    note_search_worker_spawn()?;
+    let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .context("spawning timed sift search worker")?;
+    finish_timed_search_worker(child, &output_path, timeout_secs, strategy, search_targets)
+}
 
+fn finish_timed_search_worker(
+    mut child: std::process::Child,
+    output_path: &Path,
+    timeout_secs: u64,
+    strategy: &str,
+    search_targets: &[SearchIndexTarget],
+) -> Result<sift::SearchResponse> {
     let timeout = Duration::from_secs(timeout_secs);
     let status =
         wait_for_child_exit(&mut child, timeout).context("waiting for timed sift search worker")?;
@@ -37877,7 +38104,7 @@ pub(crate) fn run_search_with_timeout(
         maybe_apply_search_timeout_test_barrier()?;
         let _ = child.kill();
         let _ = child.wait();
-        let _ = fs::remove_file(&output_path);
+        let _ = fs::remove_file(output_path);
         bail!(
             "{}",
             search_timeout_message(timeout_secs, strategy, search_targets)?
@@ -37887,7 +38114,7 @@ pub(crate) fn run_search_with_timeout(
     let status = status.unwrap();
     let stderr = read_child_stderr(&mut child)?;
     if !status.success() {
-        let _ = fs::remove_file(&output_path);
+        let _ = fs::remove_file(output_path);
         let message = stderr.trim();
         if message.is_empty() {
             bail!("sift search worker exited with status {}", status);
@@ -37895,9 +38122,9 @@ pub(crate) fn run_search_with_timeout(
         bail!("{}", message);
     }
 
-    let raw = fs::read_to_string(&output_path)
+    let raw = fs::read_to_string(output_path)
         .with_context(|| format!("reading search worker output: {}", output_path.display()))?;
-    let _ = fs::remove_file(&output_path);
+    let _ = fs::remove_file(output_path);
     serde_json::from_str(&raw).context("parsing search worker output")
 }
 
@@ -37987,6 +38214,41 @@ pub(crate) fn maybe_apply_search_worker_test_hooks() -> Result<()> {
         let delay_ms = ms
             .parse::<u64>()
             .with_context(|| format!("parsing TSIFT_TEST_SEARCH_WORKER_SLEEP_MS={ms}"))?;
+        std::thread::sleep(Duration::from_millis(delay_ms));
+    }
+    Ok(())
+}
+
+/// Counts `__search-worker` processes this parent starts. Unset in production.
+fn note_search_worker_spawn() -> Result<()> {
+    let Ok(path) = std::env::var("TSIFT_TEST_SEARCH_WORKER_SPAWN_COUNT_FILE") else {
+        return Ok(());
+    };
+    let count = fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+        .saturating_add(1);
+    fs::write(&path, count.to_string())
+        .with_context(|| format!("writing search worker spawn count: {path}"))
+}
+
+/// Per-scope hook for the in-process federated loop. Unset in production.
+/// The log write and sleep finish before the shared deadline is checked.
+fn maybe_apply_federated_scope_test_hook() -> Result<()> {
+    if let Ok(path) = std::env::var("TSIFT_TEST_FEDERATED_SCOPE_LOG") {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("opening federated scope log: {path}"))?;
+        std::io::Write::write_all(&mut file, b"scope\n")
+            .with_context(|| format!("writing federated scope log: {path}"))?;
+    }
+    if let Ok(ms) = std::env::var("TSIFT_TEST_FEDERATED_SCOPE_SLEEP_MS") {
+        let delay_ms = ms
+            .parse::<u64>()
+            .with_context(|| format!("parsing TSIFT_TEST_FEDERATED_SCOPE_SLEEP_MS={ms}"))?;
         std::thread::sleep(Duration::from_millis(delay_ms));
     }
     Ok(())

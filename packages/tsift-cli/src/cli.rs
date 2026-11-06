@@ -181,6 +181,12 @@ pub enum Commands {
         /// Indexer languages the lexical hits must match. Absent ⇒ no filter.
         #[arg(long = "lang")]
         lang: Vec<String>,
+        /// Search every federated scope of `--path` in this process.
+        #[arg(long)]
+        federated: bool,
+        /// Scope label whose index a concurrent writer holds. Repeatable.
+        #[arg(long = "degraded-label")]
+        degraded_label: Vec<String>,
     },
     /// Run a shell command and emit a bounded, artifact-backed test/log digest envelope
     #[command(name = "digest-runner", alias = "__digest-runner")]
