@@ -505,6 +505,8 @@ pub fn run() -> Result<()> {
             strategy,
             output,
             fts_index_fresh,
+            fts_db,
+            excluded_roots,
         }) => cmd_search_worker(
             &path,
             &cache_dir,
@@ -513,6 +515,10 @@ pub fn run() -> Result<()> {
             &strategy,
             &output,
             fts_index_fresh,
+            SearchTargetPaths {
+                fts_db: fts_db.as_deref(),
+                excluded_roots: &excluded_roots,
+            },
         ),
         Some(Commands::DigestRunner {
             kind,
@@ -3732,6 +3738,7 @@ fn resolve_query_index_target(
     scope: Option<&str>,
 ) -> Result<SearchIndexTarget> {
     let cfg = config::Config::load(root)?;
+    let scopes = config::Config::submodule_dirs(root)?;
     if let Some(scope_name) = scope {
         if scope_name == config::WORKSPACE_ROOT_SCOPE_ID {
             return workspace_root_index_target(root);
@@ -3741,7 +3748,7 @@ fn resolve_query_index_target(
                 label: format!("submodule `{}` index", scope.id),
                 db_path: cfg.db_path_for(root, &scope.id),
                 source_root: scope.source_root.clone(),
-                excluded_roots: Vec::new(),
+                excluded_roots: descendant_scope_roots(&scopes, &scope.source_root),
                 scope_name: Some(scope.id.clone()),
                 reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
             });
@@ -3763,7 +3770,7 @@ fn resolve_query_index_target(
             label: format!("submodule `{}` index", scope.id),
             db_path: cfg.db_path_for(root, &scope.id),
             source_root: scope.source_root.clone(),
-            excluded_roots: Vec::new(),
+            excluded_roots: descendant_scope_roots(&scopes, &scope.source_root),
             scope_name: Some(scope.id.clone()),
             reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
         });
@@ -3778,7 +3785,7 @@ fn resolve_query_index_target(
             label: format!("submodule `{}` index", scope.id),
             db_path: cfg.db_path_for(root, &scope.id),
             source_root: scope.source_root.clone(),
-            excluded_roots: Vec::new(),
+            excluded_roots: descendant_scope_roots(&scopes, &scope.source_root),
             scope_name: Some(scope.id.clone()),
             reindex_cmd: format!("tsift index --submodule {} {}", scope.id, root.display()),
         });
@@ -22403,7 +22410,7 @@ pub(crate) fn apply_status_fixes(root: &Path, report: &status::StatusReport) -> 
             &excluded_roots,
         )?;
     }
-    for scope in scopes {
+    for scope in &scopes {
         if !scope_ids_needing_fix.contains(scope.id.as_str()) {
             continue;
         }
@@ -22416,7 +22423,7 @@ pub(crate) fn apply_status_fixes(root: &Path, report: &status::StatusReport) -> 
             continue;
         }
         eprintln!("status fix: refreshing submodule `{}` index", scope.id);
-        run_index_update(
+        run_index_update_excluding(
             &cfg.db_path_for(root, &scope.id),
             &scope.source_root,
             format!("status auto-fix refreshing submodule `{}` index", scope.id),
@@ -22424,6 +22431,7 @@ pub(crate) fn apply_status_fixes(root: &Path, report: &status::StatusReport) -> 
             Some(scope.id.as_str()),
             false,
             true,
+            &descendant_scope_roots(&scopes, &scope.source_root),
         )?;
     }
 
@@ -22472,12 +22480,13 @@ pub(crate) fn autoindex_missing_workspace_scopes(
         )?;
     }
     let cfg = config::Config::load(root)?;
-    for scope in config::Config::submodule_dirs(root)? {
+    let scopes = config::Config::submodule_dirs(root)?;
+    for scope in &scopes {
         if !missing_scope_ids.contains(scope.id.as_str()) || !scope.source_root.exists() {
             continue;
         }
         let db_path = cfg.db_path_for(root, &scope.id);
-        run_index_update(
+        run_index_update_excluding(
             &db_path,
             &scope.source_root,
             format!(
@@ -22488,6 +22497,7 @@ pub(crate) fn autoindex_missing_workspace_scopes(
             Some(scope.id.as_str()),
             false,
             false,
+            &descendant_scope_roots(&scopes, &scope.source_root),
         )?;
     }
     Ok(())
@@ -28652,6 +28662,76 @@ fn main() { api::handler(); }
         dir
     }
 
+    fn nested_scope_paths_in_parent_index(root: &std::path::Path) -> Vec<String> {
+        let cfg = config::Config::load(root).unwrap();
+        let db_path = cfg.db_path_for(root, "parent");
+        index::IndexDb::file_paths_read_only(&db_path)
+            .unwrap()
+            .into_iter()
+            .filter(|path| path.contains("vendor/child"))
+            .collect()
+    }
+
+    fn status_fix_options() -> StatusCommandOptions {
+        StatusCommandOptions {
+            fix: false,
+            no_fix: false,
+            fix_instructions: false,
+            json_output: true,
+            compact: false,
+            pretty: false,
+            terse: false,
+            schema: false,
+        }
+    }
+
+    /// Every writer of a scope's index must agree with `status` and search on
+    /// what the scope owns. One that did not pulled a nested scope's files back
+    /// in, and search then spent its whole deadline deleting them again.
+    #[test]
+    fn status_fix_keeps_nested_scope_out_of_parent_index() {
+        let dir = setup_workspace_with_nested_scope();
+        let root = dir.path();
+        cmd_status(root, status_fix_options()).unwrap();
+        assert_eq!(
+            nested_scope_paths_in_parent_index(root),
+            Vec::<String>::new()
+        );
+
+        let parent_lib = root.join("src/parent/lib.rs");
+        std::fs::File::options()
+            .write(true)
+            .open(&parent_lib)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000))
+            .unwrap();
+        let stale = status::check_status(root).unwrap();
+        assert!(matches!(stale.index, status::IndexStatus::Stale { .. }));
+        cmd_status(root, status_fix_options()).unwrap();
+
+        assert_eq!(
+            nested_scope_paths_in_parent_index(root),
+            Vec::<String>::new()
+        );
+        let report = status::check_status(root).unwrap();
+        assert!(matches!(report.index, status::IndexStatus::Fresh { .. }));
+    }
+
+    #[test]
+    fn query_autoindex_keeps_nested_scope_out_of_parent_index() {
+        let dir = setup_workspace_with_nested_scope();
+        let root = dir.path();
+        let target = resolve_query_index_target(root, root, Some("parent")).unwrap();
+        assert_eq!(target.excluded_roots.len(), 1);
+
+        ensure_query_index_current(root, &target).unwrap();
+
+        assert_eq!(
+            nested_scope_paths_in_parent_index(root),
+            Vec::<String>::new()
+        );
+    }
+
     #[test]
     fn federated_refresh_keeps_nested_scope_out_of_parent_index() {
         let dir = setup_workspace_with_nested_scope();
@@ -29016,6 +29096,7 @@ tier = "isolated"
             0,
             "lexical",
             None,
+            &HashSet::new(),
         )
         .unwrap();
 
@@ -29031,6 +29112,89 @@ tier = "isolated"
             "isolated scope should not leak lexical hits: {:?}",
             response.hits
         );
+    }
+
+    const FTS_ADAPTER: &str = "tsift index.db FTS5 adapter";
+
+    fn index_workspace(root: &Path) {
+        cmd_index(
+            root, false, false, false, false, false, true, None, false, false, false, false, false,
+            false,
+        )
+        .unwrap();
+    }
+
+    fn hit_adapter<'a>(response: &'a sift::SearchResponse, path_suffix: &str) -> &'a str {
+        response
+            .hits
+            .iter()
+            .find(|hit| hit.path.ends_with(path_suffix))
+            .unwrap_or_else(|| panic!("no {path_suffix} hit in {:?}", response.hits))
+            .provenance
+            .source
+            .as_str()
+    }
+
+    fn federated_search(
+        root: &Path,
+        query: &str,
+        degraded_labels: &HashSet<String>,
+    ) -> sift::SearchResponse {
+        federated_sift_search(
+            root,
+            &root.join(".tsift/search-cache"),
+            query,
+            10,
+            0,
+            "lexical",
+            Some(degraded_labels.is_empty()),
+            degraded_labels,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn federated_search_serves_each_scope_from_its_own_index() {
+        let dir = setup_workspace();
+        index_workspace(dir.path());
+
+        let response = federated_search(dir.path(), "fn", &HashSet::new());
+
+        assert_eq!(hit_adapter(&response, "src/alpha/lib.rs"), FTS_ADAPTER);
+        assert_eq!(hit_adapter(&response, "src/beta/lib.rs"), FTS_ADAPTER);
+    }
+
+    #[test]
+    fn federated_search_degrades_only_the_scope_a_writer_holds() {
+        let dir = setup_workspace();
+        index_workspace(dir.path());
+
+        let degraded = HashSet::from(["submodule `alpha` index".to_string()]);
+        let response = federated_search(dir.path(), "fn", &degraded);
+
+        assert_ne!(hit_adapter(&response, "src/alpha/lib.rs"), FTS_ADAPTER);
+        assert_eq!(hit_adapter(&response, "src/beta/lib.rs"), FTS_ADAPTER);
+    }
+
+    #[test]
+    fn federated_search_ranks_the_phrase_match_across_scopes() {
+        let dir = setup_workspace();
+        std::fs::write(
+            dir.path().join("src/alpha/lib.rs"),
+            "// needle only\nfn alpha() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/beta/lib.rs"),
+            "// needle thread\nfn beta() {}\n",
+        )
+        .unwrap();
+        index_workspace(dir.path());
+
+        let response = federated_search(dir.path(), "needle thread", &HashSet::new());
+
+        assert!(response.hits[0].path.ends_with("src/beta/lib.rs"));
+        assert!(response.hits[0].score > response.hits[1].score);
     }
 
     #[test]
@@ -29072,6 +29236,7 @@ tier = "private"
             0,
             "lexical",
             None,
+            &HashSet::new(),
         )
         .unwrap();
 
@@ -31228,7 +31393,7 @@ tier = "private"
         let search_dir = dir.path().to_path_buf();
         let cache_dir = search_dir.join(".tsift/search-cache");
         std::fs::write(search_dir.join("test.rs"), "fn main() {}").unwrap();
-        let result = run_sift_search(&search_dir, &cache_dir, "main", 1, "lexical", None);
+        let result = run_sift_search(&search_dir, &cache_dir, "main", 1, "lexical", None, SearchTargetPaths::default());
         assert!(result.is_ok(), "direct search should succeed");
         assert!(
             cache_dir.exists(),
@@ -31332,7 +31497,7 @@ tier = "private"
             return;
         }
         let response =
-            run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical", None).unwrap();
+            run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical", None, SearchTargetPaths::default()).unwrap();
         assert_eq!(response.strategy, "fts");
         assert!(response.hits.iter().any(|h| h.path.ends_with("alpha.rs")));
     }
@@ -31347,7 +31512,7 @@ tier = "private"
         let cache_dir = root.join(".tsift/search-cache");
 
         let response =
-            run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical", None).unwrap();
+            run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical", None, SearchTargetPaths::default()).unwrap();
         assert_eq!(response.strategy, "lexical");
     }
 
@@ -31368,12 +31533,28 @@ tier = "private"
         if fts_search_forced_off() {
             return;
         }
-        let fresh =
-            run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical", Some(true)).unwrap();
+        let fresh = run_sift_search(
+            root,
+            &cache_dir,
+            "alpha_handler",
+            5,
+            "lexical",
+            Some(true),
+            SearchTargetPaths::default(),
+        )
+        .unwrap();
         assert_eq!(fresh.strategy, "fts");
 
-        let stale =
-            run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical", Some(false)).unwrap();
+        let stale = run_sift_search(
+            root,
+            &cache_dir,
+            "alpha_handler",
+            5,
+            "lexical",
+            Some(false),
+            SearchTargetPaths::default(),
+        )
+        .unwrap();
         assert_eq!(stale.strategy, "lexical");
     }
 
@@ -36982,6 +37163,7 @@ fn merge_search_responses(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn federated_sift_search(
     root: &Path,
     cache_dir: &Path,
@@ -36990,6 +37172,9 @@ pub(crate) fn federated_sift_search(
     timeout_secs: u64,
     strategy: &str,
     fts_index_fresh: Option<bool>,
+    // Labels of the targets a concurrent writer held stale. Only those fall
+    // back to the live rebuild; the rest stay on their own fresh FTS indexes.
+    degraded_labels: &HashSet<String>,
 ) -> Result<sift::SearchResponse> {
     let targets = resolve_search_index_targets(root, root, None, true)?;
     if targets.is_empty() {
@@ -37010,6 +37195,11 @@ pub(crate) fn federated_sift_search(
 
     let mut responses = Vec::with_capacity(targets.len());
     for target in &targets {
+        let target_fresh = if degraded_labels.contains(&target.label) {
+            Some(false)
+        } else {
+            fts_index_fresh.map(|_| true)
+        };
         let mut response = run_search_with_timeout(
             &target.source_root,
             cache_dir,
@@ -37018,8 +37208,15 @@ pub(crate) fn federated_sift_search(
             timeout_secs,
             strategy,
             std::slice::from_ref(target),
-            fts_index_fresh,
+            target_fresh,
         )?;
+        // Rank-derived FTS scores restart at every scope; the line-match score
+        // is the one that means the same thing across them.
+        if response.strategy == sift::FTS_STRATEGY {
+            for hit in &mut response.hits {
+                hit.score = sift::line_match_score(&hit.snippet, query);
+            }
+        }
         absolutize_search_hit_paths(&mut response, &target.source_root);
         if !target.excluded_roots.is_empty() {
             response.hits.retain(|hit| {
@@ -37133,6 +37330,18 @@ pub(crate) fn federated_exact_search(
     Ok(merge_search_responses(root, "exact", limit, responses))
 }
 
+/// What the caller resolved for a search path, which `run_sift_search` cannot
+/// work out from the path alone.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SearchTargetPaths<'a> {
+    /// The path's index. Without it a workspace scope, whose index lives under
+    /// the workspace root, looked for `<scope>/.tsift/index.db`, missed, and
+    /// re-read every file in the scope on every search.
+    pub(crate) fts_db: Option<&'a Path>,
+    /// Scope roots nested under the path, skipped by the live fallback.
+    pub(crate) excluded_roots: &'a [PathBuf],
+}
+
 pub(crate) fn run_sift_search(
     search_path: &Path,
     cache_dir: &Path,
@@ -37148,6 +37357,7 @@ pub(crate) fn run_sift_search(
     // This drops the redundant `inspect_read_only` walk on the normal CLI path,
     // where `precheck_search_indexes` already established freshness.
     fts_index_fresh: Option<bool>,
+    target: SearchTargetPaths<'_>,
 ) -> Result<sift::SearchResponse> {
     // #015t Phase 4 cutover: the `index.db` FTS5 path is now the DEFAULT for
     // lexical search. The normal search flow runs `precheck_search_indexes` with
@@ -37166,7 +37376,10 @@ pub(crate) fn run_sift_search(
     // (timeout=0) and `__search-worker` subprocess routes pass through here; the
     // worker inherits the env var and is handed the freshness verdict explicitly.
     if !fts_search_forced_off() {
-        let db_path = search_path.join(".tsift/index.db");
+        let db_path = target
+            .fts_db
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| search_path.join(".tsift/index.db"));
         let use_fts = match fts_index_fresh {
             Some(fresh) => fresh && db_path.exists(),
             None => db_path.exists() && index_db_is_fresh_for_fts(&db_path, search_path),
@@ -37180,7 +37393,8 @@ pub(crate) fn run_sift_search(
     let engine = Sift::builder().with_cache_dir(cache_dir).build();
     let options = SearchOptions::default()
         .with_limit(limit)
-        .with_strategy(strategy.to_string());
+        .with_strategy(strategy.to_string())
+        .with_excluded_roots(target.excluded_roots.to_vec());
     let input = SearchInput::new(search_path, query).with_options(options);
     engine.search(input).context("sift search failed")
 }
@@ -37427,6 +37641,14 @@ pub(crate) fn run_search_with_timeout(
     // skips the redundant `inspect_read_only` walk (see `run_sift_search`).
     fts_index_fresh: Option<bool>,
 ) -> Result<sift::SearchResponse> {
+    let target = search_targets
+        .iter()
+        .find(|target| target.source_root == search_path)
+        .map(|target| SearchTargetPaths {
+            fts_db: Some(target.db_path.as_path()),
+            excluded_roots: &target.excluded_roots,
+        })
+        .unwrap_or_default();
     if timeout_secs == 0 {
         return run_sift_search(
             search_path,
@@ -37435,6 +37657,7 @@ pub(crate) fn run_search_with_timeout(
             limit,
             strategy,
             fts_index_fresh,
+            target,
         );
     }
 
@@ -37458,6 +37681,12 @@ pub(crate) fn run_search_with_timeout(
         .arg(&output_path);
     if let Some(fresh) = fts_index_fresh {
         command.arg("--fts-index-fresh").arg(fresh.to_string());
+    }
+    if let Some(fts_db) = target.fts_db {
+        command.arg("--fts-db").arg(fts_db);
+    }
+    for excluded in target.excluded_roots {
+        command.arg("--exclude-root").arg(excluded);
     }
     let mut child = command
         .stdin(Stdio::null())

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -9,7 +10,8 @@ use tsift_quality::lint;
 
 use crate::output::{OutputFormat, ResponseBudget, ToolEnvelopeSummary};
 use crate::{
-    DegradedSearchMode, SearchBudgetReportInput, SearchFacetFilters, TagpathSearchOpts,
+    DegradedSearchMode, SearchBudgetReportInput, SearchFacetFilters, SearchTargetPaths,
+    TagpathSearchOpts,
     abbreviate_kind, abbreviate_match_type, annotate_hits_with_tagpath, apply_search_facet_filters,
     build_search_budget_follow_up, build_search_budget_report, compact_snippet,
     degraded_search_mode, emit_degraded_search_note, envelope_metric, federated_exact_search,
@@ -592,6 +594,16 @@ pub(crate) fn cmd_search_with_budget(
     let fts_index_fresh = precheck
         .as_ref()
         .map(|_| degraded_mode != Some(DegradedSearchMode::ReadOnly));
+    let degraded_labels: HashSet<String> = precheck
+        .as_ref()
+        .map(|precheck| {
+            precheck
+                .degraded_targets
+                .iter()
+                .map(|target| target.label.clone())
+                .collect()
+        })
+        .unwrap_or_default();
     let search_targets = if requested_exact_search {
         Vec::new()
     } else if let Some(precheck) = precheck.as_ref() {
@@ -730,6 +742,7 @@ pub(crate) fn cmd_search_with_budget(
             timeout_secs,
             &effective_strategy,
             fts_index_fresh,
+            &degraded_labels,
         )?
     } else {
         run_search_with_timeout(
@@ -1099,6 +1112,7 @@ fn prune_hits_to_path_scope(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_search_worker(
     path: &Path,
     cache_dir: &Path,
@@ -1107,9 +1121,18 @@ pub(crate) fn cmd_search_worker(
     strategy: &str,
     output: &Path,
     fts_index_fresh: Option<bool>,
+    target: SearchTargetPaths<'_>,
 ) -> Result<()> {
     maybe_apply_search_worker_test_hooks()?;
-    let response = run_sift_search(path, cache_dir, query, limit, strategy, fts_index_fresh)?;
+    let response = run_sift_search(
+        path,
+        cache_dir,
+        query,
+        limit,
+        strategy,
+        fts_index_fresh,
+        target,
+    )?;
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
     }

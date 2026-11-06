@@ -135,6 +135,7 @@ pub struct SearchResponse {
 pub struct SearchOptions {
     limit: usize,
     strategy: String,
+    excluded_roots: Vec<PathBuf>,
 }
 
 impl Default for SearchOptions {
@@ -142,6 +143,7 @@ impl Default for SearchOptions {
         Self {
             limit: 10,
             strategy: "lexical".to_string(),
+            excluded_roots: Vec::new(),
         }
     }
 }
@@ -154,6 +156,14 @@ impl SearchOptions {
 
     pub fn with_strategy(mut self, strategy: String) -> Self {
         self.strategy = strategy;
+        self
+    }
+
+    /// Directories the live fallback must not walk: the scopes nested under a
+    /// workspace root. Reading them cost more than the search's whole timeout,
+    /// for hits the caller would have dropped.
+    pub fn with_excluded_roots(mut self, excluded_roots: Vec<PathBuf>) -> Self {
+        self.excluded_roots = excluded_roots;
         self
     }
 }
@@ -211,9 +221,13 @@ pub struct TokenIndex {
 
 impl TokenIndex {
     pub fn build(root: &Path) -> Result<Self> {
+        Self::build_excluding(root, &[])
+    }
+
+    pub fn build_excluding(root: &Path, excluded_roots: &[PathBuf]) -> Result<Self> {
         let mut token_to_files: HashMap<String, Vec<String>> = HashMap::new();
         let mut total_files = 0usize;
-        for path in candidate_files(root)? {
+        for path in candidate_files(root, excluded_roots)? {
             let Ok(contents) = fs::read_to_string(&path) else {
                 continue;
             };
@@ -310,10 +324,11 @@ impl Sift {
         // read a persisted `token-index.json` (the deleted, never-invalidated
         // cache). The generic `cache_dir` hook above is retained for a future,
         // properly-invalidated cache but no longer backs the token index.
-        let token_index = TokenIndex::build(&input.root)?;
+        let excluded_roots = &input.options.excluded_roots;
+        let token_index = TokenIndex::build_excluding(&input.root, excluded_roots)?;
 
         let filtered_files = if query_tokens.is_empty() {
-            candidate_files(&input.root)?
+            candidate_files(&input.root, excluded_roots)?
         } else {
             token_index
                 .files_matching_any(&query_tokens)
@@ -409,16 +424,22 @@ fn sealed_coverage(indexed_artifacts: usize) -> SearchCoverageSnapshot {
     }
 }
 
-fn candidate_files(root: &Path) -> Result<Vec<PathBuf>> {
+fn candidate_files(root: &Path, excluded_roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
     if root.is_file() {
         return Ok(vec![root.to_path_buf()]);
     }
 
+    let excluded_roots = excluded_roots.to_vec();
     let mut files = Vec::new();
     for entry in WalkBuilder::new(root)
         .hidden(true)
         .git_ignore(true)
         .git_exclude(true)
+        .filter_entry(move |entry| {
+            !excluded_roots
+                .iter()
+                .any(|excluded| entry.path().starts_with(excluded))
+        })
         .build()
     {
         let entry = entry.with_context(|| format!("walking search root: {}", root.display()))?;
@@ -477,6 +498,9 @@ pub fn fts_match_query(query: &str) -> Option<String> {
 /// Each hit's body is read from the inline FTS column, so no file is re-read from
 /// disk. The JSON `TokenIndex` stays the default search path; this runs only when
 /// the caller opts in (`TSIFT_FTS_SEARCH`) and a real `index.db` exists.
+/// `SearchResponse::strategy` of [`fts_search`].
+pub const FTS_STRATEGY: &str = "fts";
+
 pub fn fts_search(
     db_path: &Path,
     root: &Path,
@@ -489,7 +513,7 @@ pub fn fts_search(
         indexed_artifacts: indexed,
         root: root.display().to_string(),
         skipped_artifacts: 0,
-        strategy: "fts".to_string(),
+        strategy: FTS_STRATEGY.to_string(),
     };
 
     if limit == 0 {
@@ -546,7 +570,7 @@ pub fn fts_search(
         indexed_artifacts,
         root: root.display().to_string(),
         skipped_artifacts: 0,
-        strategy: "fts".to_string(),
+        strategy: FTS_STRATEGY.to_string(),
     })
 }
 
@@ -561,6 +585,30 @@ fn representative_line(body: &str) -> (usize, String) {
     (1, String::new())
 }
 
+fn line_score(line_lower: &str, query_lower: &str, query_tokens: &[String]) -> f64 {
+    let phrase_score = if !query_lower.is_empty() && line_lower.contains(query_lower) {
+        50.0 + query_lower.len() as f64
+    } else {
+        0.0
+    };
+    let token_score = query_tokens
+        .iter()
+        .filter(|token| line_lower.contains(token.as_str()))
+        .count() as f64
+        * 10.0;
+    phrase_score + token_score
+}
+
+/// The score [`score_file`] gives `line` for `query`. It depends only on the
+/// line and the query, so it compares across indexes, unlike BM25 or a rank.
+pub fn line_match_score(line: &str, query: &str) -> f64 {
+    line_score(
+        &line.to_lowercase(),
+        &query.to_lowercase(),
+        &tokenize(query),
+    )
+}
+
 fn score_file(
     path: &Path,
     contents: &str,
@@ -571,21 +619,7 @@ fn score_file(
     let mut best: Option<FileCandidate> = None;
     for (idx, line) in contents.lines().enumerate() {
         let line_lower = line.to_lowercase();
-        let phrase_score = if !query_lower.is_empty() && line_lower.contains(&query_lower) {
-            50.0 + query_lower.len() as f64
-        } else {
-            0.0
-        };
-        let token_score = if query_tokens.is_empty() {
-            0.0
-        } else {
-            query_tokens
-                .iter()
-                .filter(|token| line_lower.contains(token.as_str()))
-                .count() as f64
-                * 10.0
-        };
-        let score = phrase_score + token_score;
+        let score = line_score(&line_lower, &query_lower, query_tokens);
         if score <= 0.0 {
             continue;
         }
@@ -634,6 +668,17 @@ fn file_timestamp(path: &Path) -> ArtifactFreshness {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_match_score_matches_the_file_scorer() {
+        let query = "Needle Thread";
+        let tokens = tokenize(query);
+        let line = "  a needle thread here";
+        let file = score_file(Path::new("a.md"), line, query, &tokens).unwrap();
+        assert_eq!(line_match_score(file.snippet.as_str(), query), file.score);
+        assert!(line_match_score("needle only", query) < file.score);
+        assert_eq!(line_match_score("nothing", query), 0.0);
+    }
 
     #[test]
     fn local_adapter_returns_ranked_lexical_hits() {

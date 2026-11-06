@@ -7439,6 +7439,83 @@ fn workspace_path_refuses_endpoints_in_different_scopes() {
     }
 }
 
+// A scope's index lives under the workspace root. The timed search worker used
+// to look for `<scope>/.tsift/index.db`, miss, and re-read the whole scope on
+// every search. FTS rows exist only for indexed languages, so a `.txt` hit can
+// only come from that rebuild.
+#[test]
+fn timed_federated_search_uses_each_scopes_own_index() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join(".gitmodules"),
+        "[submodule \"src/alpha\"]\n\tpath = src/alpha\n\turl = https://example.com/alpha\n",
+    )
+    .unwrap();
+    let alpha = dir.path().join("src/alpha");
+    fs::create_dir_all(&alpha).unwrap();
+    fs::write(alpha.join("lib.rs"), "// quarry words\nfn alpha() {}\n").unwrap();
+    fs::write(alpha.join("notes.txt"), "quarry words\n").unwrap();
+    let root = dir.path().to_str().unwrap();
+
+    let output = tsift_bin()
+        .args([
+            "search",
+            "quarry words",
+            "--path",
+            root,
+            "--federated",
+            "--strategy",
+            "lexical",
+            "--timeout",
+            "30",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(rendered.contains("lib.rs"), "{rendered}");
+    assert!(!rendered.contains("notes.txt"), "{rendered}");
+}
+
+// The live fallback at a workspace root has to skip the scopes under it: walking
+// them outlasted the search's own timeout, and it took the whole federated search
+// down with it.
+#[test]
+fn search_worker_fallback_skips_excluded_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let scope = dir.path().join("src/alpha");
+    fs::create_dir_all(&scope).unwrap();
+    fs::write(dir.path().join("root.md"), "quarry\n").unwrap();
+    fs::write(scope.join("nested.md"), "quarry\n").unwrap();
+    let output_path = dir.path().join("worker.json");
+
+    let status = tsift_bin()
+        .arg("__search-worker")
+        .arg("--path")
+        .arg(dir.path())
+        .arg("--cache-dir")
+        .arg(dir.path().join("cache"))
+        .args(["--query", "quarry", "--limit", "5", "--strategy", "lexical"])
+        .arg("--output")
+        .arg(&output_path)
+        .args(["--fts-index-fresh", "false"])
+        .arg("--exclude-root")
+        .arg(&scope)
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    let rendered = fs::read_to_string(&output_path).unwrap();
+    assert!(rendered.contains("root.md"), "{rendered}");
+    assert!(!rendered.contains("nested.md"), "{rendered}");
+}
+
 #[test]
 // #wsfed regression: whether plain `tsift search <query>` worked at a workspace
 // root used to depend on the *shape* of the query. An identifier routed to the

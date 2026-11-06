@@ -169,6 +169,14 @@ pub enum Commands {
         /// ⇒ the worker inspects on its own.
         #[arg(long)]
         fts_index_fresh: Option<bool>,
+        /// The `index.db` the parent resolved for `--path`. A workspace scope's
+        /// index lives under the workspace root, not under `--path`. Absent ⇒
+        /// `<path>/.tsift/index.db`.
+        #[arg(long)]
+        fts_db: Option<PathBuf>,
+        /// Scope roots nested under `--path` that the live fallback must skip.
+        #[arg(long = "exclude-root")]
+        excluded_roots: Vec<PathBuf>,
     },
     /// Run a shell command and emit a bounded, artifact-backed test/log digest envelope
     #[command(name = "digest-runner", alias = "__digest-runner")]

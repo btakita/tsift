@@ -58,6 +58,14 @@ const INDEX_DB_WAL_AUTOCHECKPOINT_PAGES: i64 = 256;
 /// keeps the apply linear in the number of changed files.
 const INDEX_APPLY_COMMIT_CHUNK_FILES: usize = 512;
 
+/// Remove one `content_fts` row by rowid. `path` is `UNINDEXED`, so the
+/// `WHERE path = ?` form scans the virtual table and reads every stored body:
+/// one changed file cost a full read of the corpus. A 1.4GB index spent 150ms
+/// per file, an apply of 9k deletions never reached its first commit, and each
+/// search that paid for it was killed and rolled back by its caller's deadline.
+/// [`IndexDb::load_fts_rowids`] resolves the rowids in one pass instead.
+const DELETE_FTS_ROW_SQL: &str = "DELETE FROM content_fts WHERE rowid = ?1";
+
 type InspectScopeKey = (PathBuf, PathBuf, bool);
 type CachedInspectResult = std::result::Result<ReadOnlyInspectResult, String>;
 
@@ -899,6 +907,25 @@ impl IndexDb {
         Ok(())
     }
 
+    /// `content_fts` rowids by path, read from the FTS5 `_content` shadow table
+    /// (`c0` is the `path` column). That table is an ordinary b-tree whose long
+    /// `body` values sit in overflow pages, so this pass skips them; selecting
+    /// through the virtual table would load every body.
+    fn load_fts_rowids(&self) -> Result<HashMap<String, Vec<i64>>> {
+        let mut rowids: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, c0 FROM content_fts_content")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (rowid, path) = row?;
+            rowids.entry(path).or_default().push(rowid);
+        }
+        Ok(rowids)
+    }
+
     fn file_state_has_extractor_version(&self) -> Result<bool> {
         let mut stmt = self.conn.prepare("PRAGMA table_info(file_state)")?;
         let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -1183,9 +1210,18 @@ impl IndexDb {
             let mut insert_fts = self
                 .conn
                 .prepare("INSERT INTO content_fts (path, body) VALUES (?1, ?2)")?;
-            let mut delete_fts = self
-                .conn
-                .prepare("DELETE FROM content_fts WHERE path = ?1")?;
+            let mut delete_fts = self.conn.prepare(DELETE_FTS_ROW_SQL)?;
+            let fts_rowids = if summary.changes.is_empty() {
+                HashMap::new()
+            } else {
+                self.load_fts_rowids()?
+            };
+            let mut delete_fts_rows = |path: &str| -> Result<()> {
+                for rowid in fts_rowids.get(path).into_iter().flatten() {
+                    delete_fts.execute(rusqlite::params![rowid])?;
+                }
+                Ok(())
+            };
             let mut insert_symbol = self.conn.prepare(
                 "INSERT INTO symbols (name, kind, language, signature, file, line, end_line, node_kind, start_byte, end_byte, body_start_byte, body_end_byte, parent_module, visibility, tags) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
             )?;
@@ -1215,7 +1251,7 @@ impl IndexDb {
                         let (secs, nanos) = system_time_to_pair(mtime);
                         delete_symbols.execute(rusqlite::params![&path_str])?;
                         delete_zonemap.execute(rusqlite::params![&path_str])?;
-                        delete_fts.execute(rusqlite::params![&path_str])?;
+                        delete_fts_rows(&path_str)?;
                         delete_edges.execute(rusqlite::params![&path_str])?;
                         delete_routes.execute(rusqlite::params![&path_str])?;
                         let lang = languages.resolve(&change.path);
@@ -1367,7 +1403,7 @@ impl IndexDb {
                         delete_file.execute(rusqlite::params![&path_str])?;
                         delete_symbols.execute(rusqlite::params![&path_str])?;
                         delete_zonemap.execute(rusqlite::params![&path_str])?;
-                        delete_fts.execute(rusqlite::params![&path_str])?;
+                        delete_fts_rows(&path_str)?;
                         delete_edges.execute(rusqlite::params![&path_str])?;
                         delete_routes.execute(rusqlite::params![&path_str])?;
                     }
@@ -2748,6 +2784,86 @@ mod tests {
         db.apply_changes(dir.path()).unwrap();
         assert_eq!(db.content_fts_count().unwrap(), 2);
         assert!(db.content_fts_search("frobnicate", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fts_rowid_map_agrees_with_the_virtual_table() {
+        // Pins the `_content` shadow-table layout `load_fts_rowids` relies on.
+        let dir = setup_tree();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        let mut through_vtable: Vec<(String, i64)> = db
+            .conn
+            .prepare("SELECT path, rowid FROM content_fts")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        through_vtable.sort();
+        assert!(!through_vtable.is_empty());
+
+        let mut from_map: Vec<(String, i64)> = db
+            .load_fts_rowids()
+            .unwrap()
+            .into_iter()
+            .flat_map(|(path, rowids)| rowids.into_iter().map(move |id| (path.clone(), id)))
+            .collect();
+        from_map.sort();
+        assert_eq!(from_map, through_vtable);
+    }
+
+    #[test]
+    fn fts_row_delete_does_not_scan_the_table() {
+        let dir = setup_tree();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+
+        let plan = |sql: &str, param: rusqlite::types::Value| -> String {
+            db.conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map([param], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+                .join(" ")
+        };
+        let by_path = plan(
+            "DELETE FROM content_fts WHERE path = ?1",
+            "x".to_string().into(),
+        );
+        let by_rowid = plan(DELETE_FTS_ROW_SQL, 1_i64.into());
+        // Plan strings are compared rather than spelled out: FTS5 reports a
+        // rowid constraint in the virtual-table index string, which the
+        // unconstrained scan by `path` does not have.
+        assert_ne!(
+            by_rowid, by_path,
+            "the delete must use the rowid constraint"
+        );
+    }
+
+    #[test]
+    fn apply_removes_every_fts_row_a_path_holds() {
+        // A path with a duplicate row (an interrupted older writer) must come
+        // out whole, as `DELETE ... WHERE path = ?` did.
+        let dir = setup_tree();
+        let db = db_in(dir.path());
+        db.apply_changes(dir.path()).unwrap();
+        let main_rs = dir.path().join("main.rs").to_string_lossy().into_owned();
+        db.conn
+            .execute(
+                "INSERT INTO content_fts (path, body) VALUES (?1, 'duplicated')",
+                [&main_rs],
+            )
+            .unwrap();
+
+        fs::remove_file(dir.path().join("main.rs")).unwrap();
+        db.apply_changes(dir.path()).unwrap();
+
+        assert_eq!(db.content_fts_count().unwrap(), 2);
+        assert!(db.content_fts_search("duplicated", 10).unwrap().is_empty());
     }
 
     #[test]
