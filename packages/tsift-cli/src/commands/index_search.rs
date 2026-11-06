@@ -743,6 +743,7 @@ pub(crate) fn cmd_search_with_budget(
             &effective_strategy,
             fts_index_fresh,
             &degraded_labels,
+            &facet_filters.languages,
         )?
     } else {
         run_search_with_timeout(
@@ -754,6 +755,7 @@ pub(crate) fn cmd_search_with_budget(
             &effective_strategy,
             &search_targets,
             fts_index_fresh,
+            &facet_filters.languages,
         )?
     };
 
@@ -1122,6 +1124,7 @@ pub(crate) fn cmd_search_worker(
     output: &Path,
     fts_index_fresh: Option<bool>,
     target: SearchTargetPaths<'_>,
+    languages: &[String],
 ) -> Result<()> {
     maybe_apply_search_worker_test_hooks()?;
     let response = run_sift_search(
@@ -1132,6 +1135,7 @@ pub(crate) fn cmd_search_worker(
         strategy,
         fts_index_fresh,
         target,
+        languages,
     )?;
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;

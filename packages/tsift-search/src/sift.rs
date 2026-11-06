@@ -136,6 +136,7 @@ pub struct SearchOptions {
     limit: usize,
     strategy: String,
     excluded_roots: Vec<PathBuf>,
+    languages: Vec<String>,
 }
 
 impl Default for SearchOptions {
@@ -144,6 +145,7 @@ impl Default for SearchOptions {
             limit: 10,
             strategy: "lexical".to_string(),
             excluded_roots: Vec::new(),
+            languages: Vec::new(),
         }
     }
 }
@@ -164,6 +166,14 @@ impl SearchOptions {
     /// for hits the caller would have dropped.
     pub fn with_excluded_roots(mut self, excluded_roots: Vec<PathBuf>) -> Self {
         self.excluded_roots = excluded_roots;
+        self
+    }
+
+    /// Indexer language names (`markdown`, `javascript`, …). Empty keeps every
+    /// file. Matching is ASCII case-insensitive; files with no indexer
+    /// language, including extensionless files, are dropped.
+    pub fn with_languages(mut self, languages: Vec<String>) -> Self {
+        self.languages = languages;
         self
     }
 }
@@ -325,6 +335,15 @@ impl Sift {
         // cache). The generic `cache_dir` hook above is retained for a future,
         // properly-invalidated cache but no longer backs the token index.
         let excluded_roots = &input.options.excluded_roots;
+        let languages = normalized_language_filters(&input.options.languages);
+        let language_map = if languages.is_empty() {
+            None
+        } else {
+            Some(
+                tsift_index::config::LanguageMap::for_root(&input.root)
+                    .unwrap_or_else(|_| tsift_index::config::LanguageMap::builtin()),
+            )
+        };
         let token_index = TokenIndex::build_excluding(&input.root, excluded_roots)?;
 
         let filtered_files = if query_tokens.is_empty() {
@@ -341,6 +360,11 @@ impl Sift {
         let mut indexed_artifacts = 0usize;
         let mut skipped_artifacts = 0usize;
         for path in filtered_files {
+            if let Some(map) = &language_map
+                && !path_matches_languages(&path, &languages, map)
+            {
+                continue;
+            }
             let Ok(contents) = fs::read_to_string(&path) else {
                 skipped_artifacts += 1;
                 continue;
@@ -376,7 +400,6 @@ impl Sift {
             strategy: input.options.strategy,
         })
     }
-
 }
 
 #[derive(Debug)]
@@ -422,6 +445,29 @@ fn sealed_coverage(indexed_artifacts: usize) -> SearchCoverageSnapshot {
         reused_sector_count: 0,
         total_sector_count: indexed_artifacts,
     }
+}
+
+fn normalized_language_filters(languages: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for language in languages {
+        let language = language.trim().to_ascii_lowercase();
+        if !language.is_empty() && !normalized.iter().any(|existing| existing == &language) {
+            normalized.push(language);
+        }
+    }
+    normalized
+}
+
+fn path_matches_languages(
+    path: &Path,
+    languages: &[String],
+    map: &tsift_index::config::LanguageMap,
+) -> bool {
+    if languages.is_empty() {
+        return true;
+    }
+    map.resolve(path)
+        .is_some_and(|lang| languages.iter().any(|filter| filter == lang.name()))
 }
 
 fn candidate_files(root: &Path, excluded_roots: &[PathBuf]) -> Result<Vec<PathBuf>> {
@@ -507,6 +553,21 @@ pub fn fts_search(
     query: &str,
     limit: usize,
 ) -> Result<SearchResponse> {
+    fts_search_in_languages(db_path, root, query, limit, &[])
+}
+
+/// [`fts_search`] limited to files indexed as one of `languages`.
+///
+/// The filter is applied inside the FTS query, before `LIMIT`. An empty slice
+/// is the unfiltered search. Names are indexer language names (`markdown`),
+/// matched ASCII case-insensitively.
+pub fn fts_search_in_languages(
+    db_path: &Path,
+    root: &Path,
+    query: &str,
+    limit: usize,
+    languages: &[String],
+) -> Result<SearchResponse> {
     let empty = |indexed: usize| SearchResponse {
         coverage: sealed_coverage(indexed),
         hits: Vec::new(),
@@ -525,7 +586,7 @@ pub fn fts_search(
 
     let db = tsift_index::index::IndexDb::open_read_only_resilient(db_path)
         .with_context(|| format!("opening index db for FTS search: {}", db_path.display()))?;
-    let raw_hits = db.content_fts_search_with_body(&fts_query, limit)?;
+    let raw_hits = db.content_fts_search_with_body_in_languages(&fts_query, limit, languages)?;
     let query_tokens = tokenize(query);
     let indexed_artifacts = raw_hits.len();
 
@@ -1016,5 +1077,64 @@ mod tests {
 
         let zero_limit = fts_search(&db_path, root, "alpha", 0).unwrap();
         assert!(zero_limit.hits.is_empty());
+    }
+
+    #[test]
+    fn fts_search_language_filter_keeps_markdown_when_javascript_ranks_higher() {
+        use tsift_index::index::IndexDb;
+
+        let src = tempfile::tempdir().unwrap();
+        let root = src.path();
+        fs::write(root.join("notes.md"), "needlephrase once\n").unwrap();
+        fs::write(root.join("app.js"), "needlephrase\n".repeat(30)).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("index.db");
+        IndexDb::open(&db_path)
+            .unwrap()
+            .apply_changes(root)
+            .unwrap();
+
+        let unfiltered = fts_search(&db_path, root, "needlephrase", 1).unwrap();
+        assert!(unfiltered.hits[0].path.ends_with("app.js"));
+
+        let filtered =
+            fts_search_in_languages(&db_path, root, "needlephrase", 1, &["markdown".to_string()])
+                .unwrap();
+        assert_eq!(filtered.hits.len(), 1);
+        assert!(filtered.hits[0].path.ends_with("notes.md"));
+    }
+
+    #[test]
+    fn lexical_fallback_language_filter_drops_other_languages_and_extensionless_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("notes.md"), "needlephrase in markdown\n").unwrap();
+        fs::write(root.join("app.js"), "needlephrase in javascript\n").unwrap();
+        fs::write(
+            root.join("LICENSE"),
+            "needlephrase in an extensionless file\n",
+        )
+        .unwrap();
+
+        let response = Sift::builder()
+            .build()
+            .search(
+                SearchInput::new(root, "needlephrase").with_options(
+                    SearchOptions::default()
+                        .with_limit(10)
+                        .with_languages(vec!["Markdown".to_string()]),
+                ),
+            )
+            .unwrap();
+
+        assert!(
+            response
+                .hits
+                .iter()
+                .all(|hit| hit.path.ends_with("notes.md")),
+            "{:?}",
+            response.hits
+        );
+        assert_eq!(response.hits.len(), 1);
     }
 }

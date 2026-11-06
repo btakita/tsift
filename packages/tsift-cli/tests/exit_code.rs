@@ -7439,6 +7439,127 @@ fn workspace_path_refuses_endpoints_in_different_scopes() {
     }
 }
 
+#[test]
+fn search_lang_filters_lexical_hits_before_the_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    fs::write(root.join("notes.md"), "needlephrase once\n").unwrap();
+    fs::write(root.join("app.js"), "needlephrase\n".repeat(30)).unwrap();
+    fs::write(
+        root.join("LICENSE"),
+        "needlephrase in an extensionless file\n",
+    )
+    .unwrap();
+    let root_arg = root.to_str().unwrap();
+
+    let indexed = tsift_bin().args(["index", root_arg]).output().unwrap();
+    assert!(
+        indexed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+
+    let unfiltered = tsift_bin()
+        .args([
+            "search",
+            "needlephrase",
+            "--path",
+            root_arg,
+            "--strategy",
+            "lexical",
+            "--limit",
+            "1",
+            "--json",
+            "--timeout",
+            "30",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        unfiltered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unfiltered.stderr)
+    );
+    let unfiltered_json: serde_json::Value = serde_json::from_slice(&unfiltered.stdout).unwrap();
+    let unfiltered_path = unfiltered_json["hits"][0]["path"].as_str().unwrap();
+    assert!(
+        unfiltered_path.ends_with("app.js"),
+        "unfiltered limit must be the denser javascript hit, got {unfiltered_json}"
+    );
+
+    let filtered = tsift_bin()
+        .args([
+            "--envelope",
+            "search",
+            "needlephrase",
+            "--path",
+            root_arg,
+            "--strategy",
+            "hybrid",
+            "--absolute",
+            "--budget",
+            "normal",
+            "--lang",
+            "markdown",
+            "--limit",
+            "1",
+            "--timeout",
+            "30",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        filtered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&filtered.stderr)
+    );
+    let filtered_json: serde_json::Value = serde_json::from_slice(&filtered.stdout).unwrap();
+    let ranked = filtered_json["report"]["ranked"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing ranked rows: {filtered_json}"));
+    assert!(!ranked.is_empty(), "{filtered_json}");
+    assert!(
+        ranked
+            .iter()
+            .all(|row| row["path"].as_str().unwrap_or("").ends_with("notes.md")),
+        "{filtered_json}"
+    );
+
+    let fallback = tsift_bin()
+        .env("TSIFT_FTS_SEARCH", "0")
+        .args([
+            "search",
+            "needlephrase",
+            "--path",
+            root_arg,
+            "--strategy",
+            "lexical",
+            "--lang",
+            "markdown",
+            "--limit",
+            "10",
+            "--json",
+            "--timeout",
+            "30",
+            "--no-autoindex",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        fallback.status.success(),
+        "{}",
+        String::from_utf8_lossy(&fallback.stderr)
+    );
+    let fallback_json: serde_json::Value = serde_json::from_slice(&fallback.stdout).unwrap();
+    let hits = fallback_json["hits"].as_array().unwrap();
+    assert!(
+        hits.iter()
+            .all(|hit| hit["path"].as_str().unwrap_or("").ends_with("notes.md")),
+        "live fallback must drop .js and extensionless hits: {fallback_json}"
+    );
+    assert_eq!(hits.len(), 1, "{fallback_json}");
+}
+
 // A scope's index lives under the workspace root. The timed search worker used
 // to look for `<scope>/.tsift/index.db`, miss, and re-read the whole scope on
 // every search. FTS rows exist only for indexed languages, so a `.txt` hit can

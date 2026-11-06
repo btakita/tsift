@@ -496,6 +496,17 @@ fn current_extractor_version(language: &str) -> String {
     graph::extractor_version(language)
 }
 
+fn normalized_fts_languages(languages: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for language in languages {
+        let language = language.trim().to_ascii_lowercase();
+        if !language.is_empty() && !normalized.iter().any(|existing| existing == &language) {
+            normalized.push(language);
+        }
+    }
+    normalized
+}
+
 fn system_time_to_pair(t: SystemTime) -> (i64, u32) {
     let d = t.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
     (d.as_secs() as i64, d.subsec_nanos())
@@ -1576,11 +1587,58 @@ impl IndexDb {
         query: &str,
         limit: usize,
     ) -> Result<Vec<(String, f64, String)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT path, bm25(content_fts) AS score, body FROM content_fts \
-             WHERE content_fts MATCH ?1 ORDER BY score LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(rusqlite::params![query, limit as i64], |row| {
+        self.content_fts_search_with_body_in_languages(query, limit, &[])
+    }
+
+    /// [`content_fts_search_with_body`] restricted to `file_state.language`.
+    ///
+    /// An empty `languages` slice is the unfiltered search. Otherwise the
+    /// predicate runs before `LIMIT`, so a small limit cannot be filled by
+    /// other languages. Names match ASCII case-insensitively. Blank entries
+    /// are ignored; if every entry is blank the search stays unfiltered.
+    pub fn content_fts_search_with_body_in_languages(
+        &self,
+        query: &str,
+        limit: usize,
+        languages: &[String],
+    ) -> Result<Vec<(String, f64, String)>> {
+        let languages = normalized_fts_languages(languages);
+        if languages.is_empty() {
+            let mut stmt = self.conn.prepare(
+                "SELECT path, bm25(content_fts) AS score, body FROM content_fts \
+                 WHERE content_fts MATCH ?1 ORDER BY score LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![query, limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            return rows
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into);
+        }
+
+        let placeholders = (0..languages.len())
+            .map(|idx| format!("?{}", idx + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let limit_param = languages.len() + 2;
+        let sql = format!(
+            "SELECT content_fts.path, bm25(content_fts) AS score, content_fts.body \
+             FROM content_fts \
+             JOIN file_state ON file_state.path = content_fts.path \
+             WHERE content_fts MATCH ?1 \
+               AND lower(file_state.language) IN ({placeholders}) \
+             ORDER BY score LIMIT ?{limit_param}"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(languages.len() + 2);
+        params.push(rusqlite::types::Value::Text(query.to_string()));
+        params.extend(languages.into_iter().map(rusqlite::types::Value::Text));
+        params.push((limit as i64).into());
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, f64>(1)?,
@@ -2756,6 +2814,54 @@ mod tests {
         // readme.txt body ("not code") is not indexed.
         let hits = db.content_fts_search("code", 10).unwrap();
         assert!(!hits.iter().any(|(path, _)| path.ends_with("readme.txt")));
+    }
+
+    #[test]
+    fn content_fts_language_filter_applies_before_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("notes.md"), "needlephrase once\n").unwrap();
+        fs::write(root.join("app.js"), "needlephrase\n".repeat(30)).unwrap();
+        fs::write(root.join("main.rs"), "fn needlephrase() {}\n").unwrap();
+        let db = db_in(root);
+        db.apply_changes(root).unwrap();
+
+        let query = "\"needlephrase\"";
+        let unfiltered = db.content_fts_search_with_body(query, 1).unwrap();
+        assert!(
+            unfiltered[0].0.ends_with("app.js"),
+            "dense javascript should win the unfiltered limit, got {}",
+            unfiltered[0].0
+        );
+
+        let markdown = db
+            .content_fts_search_with_body_in_languages(query, 1, &["Markdown".to_string()])
+            .unwrap();
+        assert_eq!(markdown.len(), 1);
+        assert!(markdown[0].0.ends_with("notes.md"), "{}", markdown[0].0);
+
+        let both = db
+            .content_fts_search_with_body_in_languages(
+                query,
+                10,
+                &["markdown".to_string(), "rust".to_string()],
+            )
+            .unwrap();
+        let paths = both
+            .iter()
+            .map(|(path, _, _)| path.clone())
+            .collect::<Vec<_>>();
+        assert!(paths.iter().any(|path| path.ends_with("notes.md")));
+        assert!(paths.iter().any(|path| path.ends_with("main.rs")));
+        assert!(!paths.iter().any(|path| path.ends_with("app.js")));
+
+        let blank = db
+            .content_fts_search_with_body_in_languages(query, 10, &["  ".to_string()])
+            .unwrap();
+        assert_eq!(
+            blank.len(),
+            db.content_fts_search_with_body(query, 10).unwrap().len()
+        );
     }
 
     #[test]

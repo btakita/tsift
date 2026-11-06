@@ -161,6 +161,8 @@ The default lexical/non-exact path is the native FTS5 `content_fts` table inside
 
 A workspace scope's FTS index is its own `.tsift/indexes/<scope>/index.db`, not `<scope>/.tsift/index.db`: scoped and federated search hand the worker the database the precheck resolved (`--fts-db`), so every scope is served by FTS. Federated search rescores each hit by its line match (phrase plus token coverage), because BM25 and rank restart at every scope. Under federation a concurrent writer degrades only the scope it holds: that scope alone falls back to the live rebuild, which skips the scopes nested under it (`--exclude-root`).
 
+`--lang` restricts both indexed symbol rows and file-level lexical hits (`#tsiftlangfilterlexicalhits`). The language predicate is the indexer language name (`markdown`, `javascript`, …), ASCII case-insensitive, and repeatable values are OR'd. It is applied inside the FTS query and inside the live `TokenIndex` fallback before `LIMIT`, and the timed `__search-worker` receives the same `--lang` values, so a federated `--lang markdown` query cannot fill its limit with `.js` or extensionless files that a Markdown-only caller would then drop. Files with no indexer language do not match. `--exact` is unchanged. Other facet flags (`--kind`, `--section`, and the rest) still leave lexical file hits in place as a broader fallback.
+
 `tsift explain` keeps the full JSON/tabular edge list, but the default human-readable caller/callee sections now collapse dense same-file edge sets into grouped file rows with counts. That reduces token volume for highly-connected symbols while preserving the concrete caller/callee names in the grouped summary.
 
 ## Bounded Source-File Reads

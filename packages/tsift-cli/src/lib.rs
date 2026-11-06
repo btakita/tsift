@@ -507,6 +507,7 @@ pub fn run() -> Result<()> {
             fts_index_fresh,
             fts_db,
             excluded_roots,
+            lang,
         }) => cmd_search_worker(
             &path,
             &cache_dir,
@@ -519,6 +520,7 @@ pub fn run() -> Result<()> {
                 fts_db: fts_db.as_deref(),
                 excluded_roots: &excluded_roots,
             },
+            &lang,
         ),
         Some(Commands::DigestRunner {
             kind,
@@ -29097,6 +29099,7 @@ tier = "isolated"
             "lexical",
             None,
             &HashSet::new(),
+            &[],
         )
         .unwrap();
 
@@ -29149,6 +29152,7 @@ tier = "isolated"
             "lexical",
             Some(degraded_labels.is_empty()),
             degraded_labels,
+            &[],
         )
         .unwrap()
     }
@@ -29237,6 +29241,7 @@ tier = "private"
             "lexical",
             None,
             &HashSet::new(),
+            &[],
         )
         .unwrap();
 
@@ -31393,7 +31398,16 @@ tier = "private"
         let search_dir = dir.path().to_path_buf();
         let cache_dir = search_dir.join(".tsift/search-cache");
         std::fs::write(search_dir.join("test.rs"), "fn main() {}").unwrap();
-        let result = run_sift_search(&search_dir, &cache_dir, "main", 1, "lexical", None, SearchTargetPaths::default());
+        let result = run_sift_search(
+            &search_dir,
+            &cache_dir,
+            "main",
+            1,
+            "lexical",
+            None,
+            SearchTargetPaths::default(),
+            &[],
+        );
         assert!(result.is_ok(), "direct search should succeed");
         assert!(
             cache_dir.exists(),
@@ -31407,8 +31421,17 @@ tier = "private"
         let search_dir = dir.path().to_path_buf();
         let cache_dir = search_dir.join(".tsift/search-cache");
         std::fs::write(search_dir.join("test.rs"), "fn main() {}").unwrap();
-        let result =
-            run_search_with_timeout(&search_dir, &cache_dir, "main", 1, 0, "lexical", &[], None);
+        let result = run_search_with_timeout(
+            &search_dir,
+            &cache_dir,
+            "main",
+            1,
+            0,
+            "lexical",
+            &[],
+            None,
+            &[],
+        );
         assert!(result.is_ok(), "timeout=0 should still work (no timeout)");
         assert!(
             cache_dir.exists(),
@@ -31496,8 +31519,17 @@ tier = "private"
         if fts_search_forced_off() {
             return;
         }
-        let response =
-            run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical", None, SearchTargetPaths::default()).unwrap();
+        let response = run_sift_search(
+            root,
+            &cache_dir,
+            "alpha_handler",
+            5,
+            "lexical",
+            None,
+            SearchTargetPaths::default(),
+            &[],
+        )
+        .unwrap();
         assert_eq!(response.strategy, "fts");
         assert!(response.hits.iter().any(|h| h.path.ends_with("alpha.rs")));
     }
@@ -31511,8 +31543,17 @@ tier = "private"
         std::fs::write(root.join("alpha.rs"), "fn alpha_handler() {}\n").unwrap();
         let cache_dir = root.join(".tsift/search-cache");
 
-        let response =
-            run_sift_search(root, &cache_dir, "alpha_handler", 5, "lexical", None, SearchTargetPaths::default()).unwrap();
+        let response = run_sift_search(
+            root,
+            &cache_dir,
+            "alpha_handler",
+            5,
+            "lexical",
+            None,
+            SearchTargetPaths::default(),
+            &[],
+        )
+        .unwrap();
         assert_eq!(response.strategy, "lexical");
     }
 
@@ -31541,6 +31582,7 @@ tier = "private"
             "lexical",
             Some(true),
             SearchTargetPaths::default(),
+            &[],
         )
         .unwrap();
         assert_eq!(fresh.strategy, "fts");
@@ -31553,9 +31595,131 @@ tier = "private"
             "lexical",
             Some(false),
             SearchTargetPaths::default(),
+            &[],
         )
         .unwrap();
         assert_eq!(stale.strategy, "lexical");
+    }
+
+    #[test]
+    fn run_sift_search_lang_filter_keeps_markdown_on_fts_and_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("notes.md"), "needlephrase once\n").unwrap();
+        std::fs::write(root.join("app.js"), "needlephrase\n".repeat(30)).unwrap();
+        std::fs::write(
+            root.join("LICENSE"),
+            "needlephrase in an extensionless file\n",
+        )
+        .unwrap();
+        index::IndexDb::open(&root.join(".tsift/index.db"))
+            .unwrap()
+            .apply_changes(root)
+            .unwrap();
+        let cache_dir = root.join(".tsift/search-cache");
+        let markdown = vec!["markdown".to_string()];
+
+        if !fts_search_forced_off() {
+            let unfiltered = run_sift_search(
+                root,
+                &cache_dir,
+                "needlephrase",
+                1,
+                "lexical",
+                Some(true),
+                SearchTargetPaths::default(),
+                &[],
+            )
+            .unwrap();
+            assert!(
+                unfiltered.hits[0].path.ends_with("app.js"),
+                "{:?}",
+                unfiltered.hits
+            );
+
+            let filtered = run_sift_search(
+                root,
+                &cache_dir,
+                "needlephrase",
+                1,
+                "lexical",
+                Some(true),
+                SearchTargetPaths::default(),
+                &markdown,
+            )
+            .unwrap();
+            assert_eq!(filtered.strategy, "fts");
+            assert_eq!(filtered.hits.len(), 1);
+            assert!(
+                filtered.hits[0].path.ends_with("notes.md"),
+                "{:?}",
+                filtered.hits
+            );
+        }
+
+        let fallback = run_sift_search(
+            root,
+            &cache_dir,
+            "needlephrase",
+            10,
+            "lexical",
+            Some(false),
+            SearchTargetPaths::default(),
+            &markdown,
+        )
+        .unwrap();
+        assert_eq!(fallback.strategy, "lexical");
+        assert!(
+            fallback
+                .hits
+                .iter()
+                .all(|hit| hit.path.ends_with("notes.md")),
+            "{:?}",
+            fallback.hits
+        );
+        assert_eq!(fallback.hits.len(), 1);
+    }
+
+    #[test]
+    fn federated_lexical_lang_filter_drops_other_languages() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join(".gitmodules"),
+            "[submodule \"src/alpha\"]\n\tpath = src/alpha\n\turl = https://example.com/alpha\n[submodule \"src/beta\"]\n\tpath = src/beta\n\turl = https://example.com/beta\n",
+        )
+        .unwrap();
+        let alpha = root.join("src/alpha");
+        let beta = root.join("src/beta");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::create_dir_all(&beta).unwrap();
+        std::fs::write(alpha.join("app.js"), "needlephrase\n".repeat(20)).unwrap();
+        std::fs::write(beta.join("notes.md"), "needlephrase once\n").unwrap();
+        std::fs::write(root.join("LICENSE"), "needlephrase at the workspace root\n").unwrap();
+        index_workspace(root);
+
+        let response = federated_sift_search(
+            root,
+            &root.join(".tsift/search-cache"),
+            "needlephrase",
+            10,
+            0,
+            "lexical",
+            Some(true),
+            &HashSet::new(),
+            &["markdown".to_string()],
+        )
+        .unwrap();
+
+        assert!(
+            response
+                .hits
+                .iter()
+                .all(|hit| hit.path.ends_with("notes.md")),
+            "{:?}",
+            response.hits
+        );
+        assert_eq!(response.hits.len(), 1);
     }
 
     // --- index quiet mode ---
@@ -37175,6 +37339,7 @@ pub(crate) fn federated_sift_search(
     // Labels of the targets a concurrent writer held stale. Only those fall
     // back to the live rebuild; the rest stay on their own fresh FTS indexes.
     degraded_labels: &HashSet<String>,
+    languages: &[String],
 ) -> Result<sift::SearchResponse> {
     let targets = resolve_search_index_targets(root, root, None, true)?;
     if targets.is_empty() {
@@ -37188,6 +37353,7 @@ pub(crate) fn federated_sift_search(
                 strategy,
                 &[],
                 fts_index_fresh,
+                languages,
             );
         }
         return Ok(empty_search_response(root, strategy));
@@ -37209,6 +37375,7 @@ pub(crate) fn federated_sift_search(
             strategy,
             std::slice::from_ref(target),
             target_fresh,
+            languages,
         )?;
         // Rank-derived FTS scores restart at every scope; the line-match score
         // is the one that means the same thing across them.
@@ -37342,6 +37509,7 @@ pub(crate) struct SearchTargetPaths<'a> {
     pub(crate) excluded_roots: &'a [PathBuf],
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_sift_search(
     search_path: &Path,
     cache_dir: &Path,
@@ -37358,6 +37526,7 @@ pub(crate) fn run_sift_search(
     // where `precheck_search_indexes` already established freshness.
     fts_index_fresh: Option<bool>,
     target: SearchTargetPaths<'_>,
+    languages: &[String],
 ) -> Result<sift::SearchResponse> {
     // #015t Phase 4 cutover: the `index.db` FTS5 path is now the DEFAULT for
     // lexical search. The normal search flow runs `precheck_search_indexes` with
@@ -37385,7 +37554,7 @@ pub(crate) fn run_sift_search(
             None => db_path.exists() && index_db_is_fresh_for_fts(&db_path, search_path),
         };
         if use_fts {
-            return sift::fts_search(&db_path, search_path, query, limit)
+            return sift::fts_search_in_languages(&db_path, search_path, query, limit, languages)
                 .context("index.db FTS5 search failed");
         }
     }
@@ -37394,7 +37563,8 @@ pub(crate) fn run_sift_search(
     let options = SearchOptions::default()
         .with_limit(limit)
         .with_strategy(strategy.to_string())
-        .with_excluded_roots(target.excluded_roots.to_vec());
+        .with_excluded_roots(target.excluded_roots.to_vec())
+        .with_languages(languages.to_vec());
     let input = SearchInput::new(search_path, query).with_options(options);
     engine.search(input).context("sift search failed")
 }
@@ -37640,6 +37810,7 @@ pub(crate) fn run_search_with_timeout(
     // #015t Phase 4b — FTS index freshness verdict forwarded to the worker so it
     // skips the redundant `inspect_read_only` walk (see `run_sift_search`).
     fts_index_fresh: Option<bool>,
+    languages: &[String],
 ) -> Result<sift::SearchResponse> {
     let target = search_targets
         .iter()
@@ -37658,6 +37829,7 @@ pub(crate) fn run_search_with_timeout(
             strategy,
             fts_index_fresh,
             target,
+            languages,
         );
     }
 
@@ -37687,6 +37859,9 @@ pub(crate) fn run_search_with_timeout(
     }
     for excluded in target.excluded_roots {
         command.arg("--exclude-root").arg(excluded);
+    }
+    for language in languages {
+        command.arg("--lang").arg(language);
     }
     let mut child = command
         .stdin(Stdio::null())

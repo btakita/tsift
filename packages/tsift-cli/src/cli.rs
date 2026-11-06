@@ -94,7 +94,8 @@ pub enum Commands {
         /// Search all federated submodule indexes
         #[arg(long)]
         federated: bool,
-        /// Restrict indexed symbol results to one or more languages (repeatable)
+        /// Restrict symbol results and file-level lexical hits to one or more
+        /// indexer languages (repeatable; `markdown`, `javascript`, …)
         #[arg(long = "lang")]
         lang: Vec<String>,
         /// Restrict indexed symbol results to one or more symbol kinds (repeatable)
@@ -177,6 +178,9 @@ pub enum Commands {
         /// Scope roots nested under `--path` that the live fallback must skip.
         #[arg(long = "exclude-root")]
         excluded_roots: Vec<PathBuf>,
+        /// Indexer languages the lexical hits must match. Absent ⇒ no filter.
+        #[arg(long = "lang")]
+        lang: Vec<String>,
     },
     /// Run a shell command and emit a bounded, artifact-backed test/log digest envelope
     #[command(name = "digest-runner", alias = "__digest-runner")]
