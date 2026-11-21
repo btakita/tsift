@@ -1044,10 +1044,13 @@ impl Lang {
     /// (`#docsym`).
     pub fn is_document(&self) -> bool {
         #[cfg(feature = "lang-markdown")]
-        if *self == Self::Markdown {
-            return true;
+        {
+            matches!(self, Self::Markdown)
         }
-        false
+        #[cfg(not(feature = "lang-markdown"))]
+        {
+            false
+        }
     }
 }
 

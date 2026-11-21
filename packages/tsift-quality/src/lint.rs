@@ -125,11 +125,7 @@ fn is_already_annotated(line: &str, pos: usize, len: usize) -> bool {
     }
     // inside inline code span
     let backtick_count_before = before.chars().filter(|&c| c == '`').count();
-    if backtick_count_before % 2 == 1 {
-        return true;
-    }
-
-    false
+    backtick_count_before % 2 == 1
 }
 
 fn is_word_boundary(line: &str, pos: usize, len: usize) -> bool {
