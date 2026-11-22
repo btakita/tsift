@@ -1,4 +1,4 @@
-<!-- tsift:opencode-command v=0.1.110 name=tsift-rewrite-run -->
+<!-- tsift:opencode-command v=0.1.111 name=tsift-rewrite-run -->
 ---
 description: Run a shell command through tsift rewrite
 ---

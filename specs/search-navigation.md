@@ -382,9 +382,9 @@ name: tsift
 description: "Use tsift for token-efficient repository navigation... TRIGGER: ... SKIP: ... VERSION CHECK: ..."
 user-invocable: true
 argument-hint: "[query or symbol]"
-tsift-version: "0.1.110"
+tsift-version: "0.1.111"
 ---
-<!-- tsift:skill v=0.1.110 -->
+<!-- tsift:skill v=0.1.111 -->
 # tsift
 
 **Load the current package instructions first.** Run `tsift skill` once per session and follow its output. The rest of this file is a complete versioned fallback.
@@ -412,7 +412,7 @@ The compact command surface names topics rather than restating the reference's c
 `.agents/skills/tsift/references/code-navigation.md` holds the detail the skill defers to, under its own marker pair so generated content can be refreshed while preserving hand-written text outside the markers:
 
 ```markdown
-<!-- tsift:code-navigation-runbook v=0.1.110 -->
+<!-- tsift:code-navigation-runbook v=0.1.111 -->
 # Code Navigation
 
 Managed by `tsift init` (versioned markers) — do not hand-edit between the markers; re-run `tsift init` to refresh. Text outside the markers is preserved.
